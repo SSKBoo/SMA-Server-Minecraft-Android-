@@ -5,18 +5,23 @@ import android.content.Context
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.bedrockdroid.rs.model.AndroidLauncherConfig
@@ -80,6 +85,51 @@ fun SettingsScreen(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+                var portInput by remember(config.bedrockPort) { mutableStateOf(config.bedrockPort.toString()) }
+                LaunchedEffect(config.bedrockPort) {
+                    if (portInput != config.bedrockPort.toString()) {
+                        portInput = config.bedrockPort.toString()
+                    }
+                }
+                OutlinedTextField(
+                    value = portInput,
+                    onValueChange = { raw ->
+                        val digits = raw.filter { it.isDigit() }.take(5)
+                        portInput = digits
+                        val parsed = digits.toIntOrNull()
+                        if (parsed != null && parsed in 1024..65535) {
+                            onUpdateConfig(config.copy(bedrockPort = parsed))
+                        }
+                    },
+                    label = { Text("Puerto UDP Bedrock (19132 / 19133 / 25566)") },
+                    supportingText = {
+                        Text("Si tu ROM bloquea el 19132, prueba 19133 o 25566 y reinicia el servidor.")
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(19132, 19133, 25566).forEach { presetPort ->
+                        FilterChip(
+                            selected = config.bedrockPort == presetPort,
+                            onClick = {
+                                portInput = presetPort.toString()
+                                onUpdateConfig(config.copy(bedrockPort = presetPort))
+                            },
+                            label = {
+                                Text(
+                                    text = if (presetPort == 19132) "19132 (Std)" else presetPort.toString(),
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        )
+                    }
+                }
                 SettingSwitch("Fast-Path Local (<1 ms en 127.0.0.1/LAN)", config.localFastPath) {
                     onUpdateConfig(config.copy(localFastPath = it))
                 }

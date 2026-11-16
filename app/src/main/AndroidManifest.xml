@@ -16,8 +16,9 @@
         android:allowBackup="true"
         android:largeHeap="true"
         android:label="BedrockDroid RS"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true"
-        android:usesCleartextTraffic="false"
+        android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
         <activity

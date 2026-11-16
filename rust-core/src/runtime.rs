@@ -369,6 +369,8 @@ pub fn start_async_engine(
                 HashMap::new();
             let mut proxy_to_real: HashMap<SocketAddr, SocketAddr> = HashMap::new();
 
+            log::info!("[Relay] Esperando paquetes en {}...", actual_addr);
+
             loop {
                 let incoming: Option<(usize, SocketAddr, Arc<UdpSocket>, bool)> = tokio::select! {
                     _ = task_cancel.cancelled() => {

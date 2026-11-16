@@ -107,6 +107,12 @@ class ServerForegroundService : Service() {
                                     "[mDNS] Anunciando _minecraft._udp en puerto ${cfg.bedrockPort}"
                                 )
                             }
+                            .onFailure { err ->
+                                ServerRuntimeState.appendLog(
+                                    LogStream.WARN,
+                                    "[mDNS] No se pudo iniciar anuncio NsdManager: ${err.message}"
+                                )
+                            }
                     }
                 }
 
@@ -181,6 +187,12 @@ class ServerForegroundService : Service() {
                                 ServerRuntimeState.appendLog(
                                     LogStream.NET,
                                     "[mDNS] Anunciando _minecraft._udp en puerto ${cfg.bedrockPort}"
+                                )
+                            }
+                            .onFailure { err ->
+                                ServerRuntimeState.appendLog(
+                                    LogStream.WARN,
+                                    "[mDNS] No se pudo iniciar anuncio NsdManager: ${err.message}"
                                 )
                             }
                     }
