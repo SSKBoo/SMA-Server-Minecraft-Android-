@@ -80,14 +80,18 @@ object EngineLaunchPlanner {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memInfo = ActivityManager.MemoryInfo()
         am.getMemoryInfo(memInfo)
-        val totalMb = (memInfo.totalMem / (1024 * 1024)).toInt()
-        val availMb = (memInfo.availMem / (1024 * 1024)).toInt()
+        val totalMb = (memInfo.totalMem / (1024L * 1024L)).toInt()
+        val availMb = (memInfo.availMem / (1024L * 1024L)).toInt()
+        val largeHeapMb = am.largeMemoryClass.coerceAtLeast(256)
 
         val stat = StatFs(context.filesDir.absolutePath)
         val freeGb = stat.availableBytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
 
-        val safeMaxXmx = (availMb * 0.55).toInt().coerceIn(768, 4096)
-        val recXms = (safeMaxXmx / 3).coerceIn(512, 1024)
+        // La JVM dentro del proceso Android está estrictamente limitada por getLargeMemoryClass()
+        val safeMaxXmx = largeHeapMb
+        val recXms = (safeMaxXmx / 2).coerceIn(128, safeMaxXmx)
+        val maxRustBudget = (((totalMb * 0.85).toInt() / 512) * 512).coerceAtLeast(1024)
+        val recRustMb = (((totalMb * 0.75).toInt() / 512) * 512).coerceIn(1024, maxRustBudget)
         val recMtu = if (totalMb >= 8000) 1400 else 1360
 
         val report = HardwareScanReport(
@@ -96,9 +100,11 @@ object EngineLaunchPlanner {
             primeMaxMhz = primeMhz,
             ramTotalMb = totalMb,
             ramAvailMb = availMb,
+            largeHeapClassMb = largeHeapMb,
             storageFreeGb = freeGb,
             recommendedXmsMb = recXms,
             recommendedXmxMb = safeMaxXmx,
+            recommendedRustRamMb = recRustMb,
             recommendedMtu = recMtu
         )
         ServerRuntimeState.updateHardwareReport(report)
@@ -221,9 +227,10 @@ object EngineLaunchPlanner {
             }
             lower == "soc" -> {
                 val hw = scanDeviceHardware(context)
+                val totalGb = ((hw.ramTotalMb + 512) / 1024).coerceAtLeast(1)
                 ServerRuntimeState.appendLog(
                     LogStream.STDOUT,
-                    "[SoC] ${hw.detectedCores} núcleos · Prime ${hw.primeMaxMhz} MHz · RAM libre ${hw.ramAvailMb}/${hw.ramTotalMb} MB"
+                    "[SoC] ${hw.detectedCores} núcleos · Prime ${hw.primeMaxMhz} MHz · RAM física $totalGb GB totales (${hw.ramTotalMb} MB · libre ${hw.ramAvailMb} MB) · largeHeap ${hw.largeHeapClassMb} MB"
                 )
             }
             lower == "convert hybrid" -> {

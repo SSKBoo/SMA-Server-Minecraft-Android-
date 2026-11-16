@@ -200,8 +200,9 @@ fun StatusCard(
 
                 val hwSnapshot = effectiveHardware
                 if (hwSnapshot != null) {
+                    val totalGb = ((hwSnapshot.ramTotalMb + 512) / 1024).coerceAtLeast(1)
                     Text(
-                        text = "${hwSnapshot.detectedCores} núcleos · ${hwSnapshot.ramAvailMb}MB",
+                        text = "${hwSnapshot.detectedCores} núcleos · $totalGb GB totales",
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
                         color = Color(0xFF047857),

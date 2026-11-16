@@ -62,6 +62,7 @@ class ServerForegroundService : Service() {
             startForeground(NOTIF_ID, notification)
         }
 
+        ServerRuntimeState.setRunning(true)
         ServerRuntimeState.setLocksAcquired(false)
         val locksOk = acquireSurvivalLocks(cfg)
         ServerRuntimeState.setLocksAcquired(locksOk)
@@ -132,6 +133,7 @@ class ServerForegroundService : Service() {
                     cfg.serverName,
                     cfg.activeLane.name,
                     cfg.bedrockPort,
+                    cfg.rustMaxRamMb,
                     cfg.localFastPath,
                     cfg.tcpNoDelay,
                     cfg.ipTosLowDelay,
@@ -207,6 +209,7 @@ class ServerForegroundService : Service() {
                     cfg.serverName,
                     cfg.activeLane.name,
                     cfg.bedrockPort,
+                    cfg.rustMaxRamMb,
                     cfg.localFastPath,
                     cfg.tcpNoDelay,
                     cfg.ipTosLowDelay,
@@ -223,6 +226,7 @@ class ServerForegroundService : Service() {
         }
 
         ServerRuntimeState.setRunning(true)
+        ServerRuntimeState.refreshChecklist(applicationContext)
         ServerRuntimeState.appendLog(
             LogStream.STDOUT,
             "[Servicio 24/7] Carril ${cfg.activeLane.label} iniciado en ${laneDir.absolutePath}"
@@ -322,6 +326,7 @@ class ServerForegroundService : Service() {
         }
         ServerRuntimeState.setLocksAcquired(false)
         ServerRuntimeState.setRunning(false)
+        ServerRuntimeState.refreshChecklist(applicationContext)
         ServerRuntimeState.appendLog(LogStream.WARN, "[Servicio 24/7] Servidor detenido y locks liberados.")
         LogBuffer.stopProcessLogcatCollector()
         super.onDestroy()

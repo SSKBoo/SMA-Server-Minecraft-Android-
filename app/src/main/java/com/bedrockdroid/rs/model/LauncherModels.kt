@@ -1,6 +1,13 @@
 package com.bedrockdroid.rs.model
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.os.Build
+import android.os.PowerManager
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -59,9 +66,11 @@ data class HardwareScanReport(
     val primeMaxMhz: Int,
     val ramTotalMb: Int,
     val ramAvailMb: Int,
+    val largeHeapClassMb: Int = 512,
     val storageFreeGb: Double,
     val recommendedXmsMb: Int,
     val recommendedXmxMb: Int,
+    val recommendedRustRamMb: Int = 8192,
     val recommendedMtu: Int
 )
 
@@ -73,6 +82,27 @@ data class NetworkProbeReport(
     val isLikelyCgnat: Boolean,
     val guidance: String
 )
+
+data class SurvivalChecklistState(
+    val notificationsEnabled: Boolean = false,
+    val batteryOptimizationIgnored: Boolean = false,
+    val backgroundDataUnrestricted: Boolean = false,
+    val wakeLocksHeld: Boolean = false,
+    val oemRuleConfirmed: Boolean = false,
+    val lastCheckEpochMs: Long = 0L
+) {
+    val passedCount: Int
+        get() = listOf(
+            notificationsEnabled,
+            batteryOptimizationIgnored,
+            backgroundDataUnrestricted,
+            wakeLocksHeld,
+            oemRuleConfirmed
+        ).count { it }
+
+    val allPassed: Boolean
+        get() = passedCount == 5
+}
 
 data class AndroidLauncherConfig(
     val serverName: String,
@@ -87,6 +117,7 @@ data class AndroidLauncherConfig(
     val viaVersionEnabled: Boolean,
     val jvmXmsMb: Int,
     val jvmXmxMb: Int,
+    val rustMaxRamMb: Int,
     val eulaAccepted: Boolean,
     val localFastPath: Boolean,
     val tcpNoDelay: Boolean,
@@ -122,6 +153,7 @@ object LauncherPrefs {
         viaVersionEnabled = true,
         jvmXmsMb = 1024,
         jvmXmxMb = 3072,
+        rustMaxRamMb = 12288,
         eulaAccepted = true,
         localFastPath = true,
         tcpNoDelay = true,
@@ -165,6 +197,7 @@ object LauncherPrefs {
             viaVersionEnabled = prefs.getBoolean("viaVersionEnabled", def.viaVersionEnabled),
             jvmXmsMb = prefs.getInt("jvmXmsMb", def.jvmXmsMb),
             jvmXmxMb = prefs.getInt("jvmXmxMb", def.jvmXmxMb),
+            rustMaxRamMb = prefs.getInt("rustMaxRamMb", def.rustMaxRamMb),
             eulaAccepted = prefs.getBoolean("eulaAccepted", def.eulaAccepted),
             localFastPath = prefs.getBoolean("localFastPath", def.localFastPath),
             tcpNoDelay = prefs.getBoolean("tcpNoDelay", def.tcpNoDelay),
@@ -199,6 +232,7 @@ object LauncherPrefs {
             .putBoolean("viaVersionEnabled", cfg.viaVersionEnabled)
             .putInt("jvmXmsMb", cfg.jvmXmsMb)
             .putInt("jvmXmxMb", cfg.jvmXmxMb)
+            .putInt("rustMaxRamMb", cfg.rustMaxRamMb)
             .putBoolean("eulaAccepted", cfg.eulaAccepted)
             .putBoolean("localFastPath", cfg.localFastPath)
             .putBoolean("tcpNoDelay", cfg.tcpNoDelay)
@@ -235,6 +269,13 @@ object ServerRuntimeState {
     private val _locksAcquired = MutableStateFlow(false)
     val locksAcquired: StateFlow<Boolean> = _locksAcquired.asStateFlow()
 
+    // Todos los ítems inicializan en PENDIENTE (false) hasta evaluar APIs reales de Android
+    private val _checklistStatus = MutableStateFlow(SurvivalChecklistState())
+    val checklistStatus: StateFlow<SurvivalChecklistState> = _checklistStatus.asStateFlow()
+
+    private val _checklistRefreshTick = MutableStateFlow(0L)
+    val checklistRefreshTick: StateFlow<Long> = _checklistRefreshTick.asStateFlow()
+
     private val _hardwareReport = MutableStateFlow<HardwareScanReport?>(null)
     val hardwareReport: StateFlow<HardwareScanReport?> = _hardwareReport.asStateFlow()
 
@@ -258,11 +299,91 @@ object ServerRuntimeState {
             isRunning = running,
             locksAcquired = nextLocks
         )
+        _checklistStatus.update { current ->
+            current.copy(
+                wakeLocksHeld = running && nextLocks,
+                lastCheckEpochMs = System.currentTimeMillis()
+            )
+        }
+        _checklistRefreshTick.value += 1L
     }
 
     fun setLocksAcquired(acquired: Boolean) {
-        _locksAcquired.value = acquired
-        _serverStatus.value = _serverStatus.value.copy(locksAcquired = acquired)
+        val effectiveAcquired = if (_isRunning.value || _serverStatus.value.isRunning) acquired else false
+        _locksAcquired.value = effectiveAcquired
+        val running = _isRunning.value && _serverStatus.value.isRunning
+        _serverStatus.value = _serverStatus.value.copy(locksAcquired = effectiveAcquired)
+        _checklistStatus.update { current ->
+            current.copy(
+                wakeLocksHeld = running && effectiveAcquired,
+                lastCheckEpochMs = System.currentTimeMillis()
+            )
+        }
+        _checklistRefreshTick.value += 1L
+    }
+
+    fun setOemRuleConfirmed(confirmed: Boolean) {
+        _checklistStatus.update { current ->
+            current.copy(
+                oemRuleConfirmed = confirmed,
+                lastCheckEpochMs = System.currentTimeMillis()
+            )
+        }
+        _checklistRefreshTick.value += 1L
+    }
+
+    /**
+     * Evalúa siempre en vivo las APIs reales del sistema Android sin leer SharedPreferences cacheadas
+     * y fuerza la emisión de todos los StateFlow para refrescar la UI de inmediato.
+     */
+    fun refreshChecklist(context: Context) {
+        val notifManagerOk = runCatching {
+            NotificationManagerCompat.from(context).areNotificationsEnabled()
+        }.getOrDefault(false)
+        val notifPermOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+        val notifOk = notifManagerOk && notifPermOk
+
+        val batteryOk = runCatching {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+        }.getOrDefault(false)
+
+        val bgDataOk = runCatching {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            cm != null && cm.restrictBackgroundStatus != ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED
+        }.getOrDefault(false)
+
+        // Datos en segundo plano solo pasa si notificaciones y exención Doze también están concedidas
+        val backgroundDataUnrestricted = notifOk && batteryOk && bgDataOk
+
+        val runningNow = _isRunning.value && _serverStatus.value.isRunning
+        val locksNow = if (runningNow) {
+            _locksAcquired.value && _serverStatus.value.locksAcquired
+        } else {
+            false
+        }
+
+        _isRunning.value = runningNow
+        _locksAcquired.value = locksNow
+        _serverStatus.value = ServerStatusSnapshot(
+            isRunning = runningNow,
+            locksAcquired = locksNow
+        )
+
+        _checklistStatus.value = SurvivalChecklistState(
+            notificationsEnabled = notifOk,
+            batteryOptimizationIgnored = batteryOk,
+            backgroundDataUnrestricted = backgroundDataUnrestricted,
+            wakeLocksHeld = runningNow && locksNow,
+            oemRuleConfirmed = _checklistStatus.value.oemRuleConfirmed,
+            lastCheckEpochMs = System.currentTimeMillis()
+        )
+        _checklistRefreshTick.value += 1L
     }
 
     fun setScanningHardware(scanning: Boolean) {

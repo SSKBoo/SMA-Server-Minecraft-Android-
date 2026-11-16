@@ -4,11 +4,10 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Build
-import android.os.PowerManager
 import android.provider.Settings
+import androidx.core.content.ContextCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -25,7 +24,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
@@ -66,15 +64,25 @@ fun SurvivalNetworkScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var refreshTrigger by remember { mutableIntStateOf(0) }
+    val isRunningState by ServerRuntimeState.isRunning.collectAsState()
     val serverStatus by ServerRuntimeState.serverStatus.collectAsState()
     val locksAcquired by ServerRuntimeState.locksAcquired.collectAsState()
+    val checklistState by ServerRuntimeState.checklistStatus.collectAsState()
+    val checklistRefreshTick by ServerRuntimeState.checklistRefreshTick.collectAsState()
+
+    LaunchedEffect(Unit) {
+        ServerRuntimeState.refreshChecklist(context)
+    }
+
+    LaunchedEffect(isRunning, isRunningState, serverStatus.isRunning, locksAcquired, serverStatus.locksAcquired) {
+        ServerRuntimeState.refreshChecklist(context)
+    }
 
     val lifecycleOwner = context as? LifecycleOwner
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                refreshTrigger++
+                ServerRuntimeState.refreshChecklist(context)
             }
         }
         lifecycleOwner?.lifecycle?.addObserver(observer)
@@ -85,30 +93,17 @@ fun SurvivalNetworkScreen(
 
     val notifLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { refreshTrigger++ }
-
-    val notifGranted = remember(refreshTrigger) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
-                PackageManager.PERMISSION_GRANTED
-        } else {
-            true
-        }
+    ) {
+        ServerRuntimeState.refreshChecklist(context)
     }
 
-    val dozeExempt = remember(refreshTrigger) {
-        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-        pm.isIgnoringBatteryOptimizations(context.packageName)
-    }
-
-    val bgDataUnrestricted = remember(refreshTrigger) {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        cm.restrictBackgroundStatus != ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED
-    }
-
-    // Solo PASS (verde) cuando el servidor está activo Y los tres locks fueron adquiridos
-    val wakeLocksPass = serverStatus.isRunning && serverStatus.locksAcquired && locksAcquired
-    val oemGranted = config.oemAutostartConfirmed
+    val notifGranted = checklistState.notificationsEnabled
+    val dozeExempt = checklistState.batteryOptimizationIgnored
+    val bgDataUnrestricted = checklistState.backgroundDataUnrestricted
+    // Solo PASS (verde) cuando el servidor está corriendo Y todos los locks están activos
+    val isServerRunning = isRunning && isRunningState && serverStatus.isRunning
+    val wakeLocksPass = isServerRunning && locksAcquired && serverStatus.locksAcquired && checklistState.wakeLocksHeld
+    val oemGranted = checklistState.oemRuleConfirmed
     val passCount = listOf(notifGranted, dozeExempt, bgDataUnrestricted, wakeLocksPass, oemGranted).count { it }
     val checklistBadge = if (passCount == 5) "$passCount/5 PASS" else "$passCount/5 PENDIENTE"
 
@@ -127,7 +122,7 @@ fun SurvivalNetworkScreen(
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("1. Escaneo Consentido Snapdragon / ARM64", fontWeight = FontWeight.Bold)
                 Text(
-                    "Analiza frecuencia máxima de núcleos, RAM disponible y almacenamiento para calcular parámetros óptimos.",
+                    "Analiza frecuencia máxima de núcleos, RAM física total (ActivityManager.MemoryInfo) y almacenamiento para calcular parámetros óptimos.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color(0xFF475569)
                 )
@@ -136,9 +131,10 @@ fun SurvivalNetworkScreen(
                         onClick = {
                             val report = EngineLaunchPlanner.scanDeviceHardware(context)
                             onScanComplete(report, true)
+                            val totalGb = ((report.ramTotalMb + 512) / 1024).coerceAtLeast(1)
                             ServerRuntimeState.appendLog(
                                 LogStream.STDOUT,
-                                "[Escaneo] ${report.detectedCores} núcleos (${report.primeMaxMhz} MHz) · Xmx recomendado ${report.recommendedXmxMb}M"
+                                "[Escaneo] ${report.detectedCores} núcleos (${report.primeMaxMhz} MHz) · $totalGb GB totales (${report.ramAvailMb} MB libres) · JVM Xmx ${report.recommendedXmxMb}M · Rust ${report.recommendedRustRamMb}M"
                             )
                         },
                         modifier = Modifier.weight(1f)
@@ -148,10 +144,11 @@ fun SurvivalNetworkScreen(
                 }
                 hardwareReport?.let { hw ->
                     val freeGbText = String.format(Locale.US, "%.1f", hw.storageFreeGb)
+                    val totalGb = ((hw.ramTotalMb + 512) / 1024).coerceAtLeast(1)
                     HorizontalDivider(color = Color(0xFFE2E8F0))
                     Text(hw.socLabel, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                     Text(
-                        "CPU: ${hw.detectedCores} núcleos (Prime ${hw.primeMaxMhz} MHz)\nRAM libre: ${hw.ramAvailMb} / ${hw.ramTotalMb} MB · Disco libre: $freeGbText GB\nÓptimo aplicado: Xms ${hw.recommendedXmsMb}M / Xmx ${hw.recommendedXmxMb}M · MTU ${hw.recommendedMtu}",
+                        "CPU: ${hw.detectedCores} núcleos (Prime ${hw.primeMaxMhz} MHz)\nRAM Física: $totalGb GB totales (${hw.ramTotalMb} MB) · Libre: ${hw.ramAvailMb} MB\nDalvik largeHeap App: ${hw.largeHeapClassMb} MB · Disco libre: $freeGbText GB\nÓptimo aplicado: JVM Xmx ${hw.recommendedXmxMb}M · Rust Nativo ${hw.recommendedRustRamMb}M · MTU ${hw.recommendedMtu}",
                         fontFamily = FontFamily.Monospace,
                         fontSize = 12.sp,
                         color = Color(0xFF047857)
@@ -187,13 +184,27 @@ fun SurvivalNetworkScreen(
                 )
 
                 ChecklistRow("Notificaciones persistentes", notifGranted) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
                         notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    } else {
+                        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                            putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                        }
+                        runCatching { context.startActivity(intent) }.onFailure {
+                            val fallback = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                data = Uri.parse("package:${context.packageName}")
+                            }
+                            runCatching { context.startActivity(fallback) }
+                        }
                     }
+                    ServerRuntimeState.refreshChecklist(context)
                 }
                 ChecklistRow("Exención batería (Doze)", dozeExempt) {
                     solicitarExencionBateria(context)
-                    refreshTrigger++
+                    ServerRuntimeState.refreshChecklist(context)
                 }
                 ChecklistRow("Datos segundo plano sin límite", bgDataUnrestricted) {
                     val intent = Intent(Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS).apply {
@@ -205,24 +216,38 @@ fun SurvivalNetworkScreen(
                         }
                         runCatching { context.startActivity(fallback) }
                     }
+                    ServerRuntimeState.refreshChecklist(context)
                 }
                 ChecklistRow("WakeLock + WifiLock + Multicast (al iniciar)", wakeLocksPass) {
                     solicitarExencionBateria(context)
-                    refreshTrigger++
+                    ServerRuntimeState.refreshChecklist(context)
                 }
                 ChecklistRow("Regla OEM (Xiaomi/OneUI/ColorOS)", oemGranted) {
                     val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                         data = Uri.parse("package:${context.packageName}")
                     }
                     runCatching { context.startActivity(intent) }
+                    ServerRuntimeState.setOemRuleConfirmed(true)
                     onConfirmOemRule(true)
+                    ServerRuntimeState.refreshChecklist(context)
                 }
 
                 OutlinedButton(
-                    onClick = { refreshTrigger++ },
+                    onClick = {
+                        ServerRuntimeState.refreshChecklist(context)
+                    },
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text("Comprobar estado nuevamente")
+                }
+
+                if (checklistRefreshTick > 0L) {
+                    Text(
+                        text = if (isServerRunning) "Estado en vivo verificado (servidor activo)" else "Servidor detenido: locks 24/7 en espera (PENDIENTE)",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color(0xFF64748B)
+                    )
                 }
             }
         }

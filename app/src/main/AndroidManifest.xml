@@ -14,6 +14,7 @@
     <application
         android:name=".BedrockDroidApp"
         android:allowBackup="true"
+        android:largeHeap="true"
         android:label="BedrockDroid RS"
         android:supportsRtl="true"
         android:usesCleartextTraffic="false"

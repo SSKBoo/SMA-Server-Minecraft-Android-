@@ -1,19 +1,26 @@
 package com.bedrockdroid.rs.ui
 
+import android.app.ActivityManager
+import android.content.Context
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.bedrockdroid.rs.model.AndroidLauncherConfig
+import com.bedrockdroid.rs.model.ServerRuntimeState
 
 @Composable
 fun SettingsScreen(
@@ -21,6 +28,32 @@ fun SettingsScreen(
     onUpdateConfig: (AndroidLauncherConfig) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val hardwareReport by ServerRuntimeState.hardwareReport.collectAsState()
+
+    val (totalRamMb, largeHeapMb) = remember(hardwareReport) {
+        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        val largeClass = hardwareReport?.largeHeapClassMb
+            ?: runCatching { am?.largeMemoryClass ?: 512 }.getOrDefault(512).coerceAtLeast(256)
+        val totalMb = hardwareReport?.ramTotalMb ?: runCatching {
+            val memInfo = ActivityManager.MemoryInfo()
+            am?.getMemoryInfo(memInfo)
+            (memInfo.totalMem / (1024L * 1024L)).toInt()
+        }.getOrDefault(8192).coerceAtLeast(2048)
+        totalMb to largeClass
+    }
+
+    val totalRamGb = ((totalRamMb + 512) / 1024).coerceAtLeast(1)
+    // Límite estricto Dalvik/ART: la JVM no debe superar ActivityManager.getLargeMemoryClass()
+    val jvmSliderMaxMb = largeHeapMb.coerceAtLeast(256)
+    val jvmSliderMinMb = 256.coerceAtMost(jvmSliderMaxMb)
+    val effectiveJvmXmx = config.jvmXmxMb.coerceIn(jvmSliderMinMb, jvmSliderMaxMb)
+    val effectiveJvmXms = config.jvmXmsMb.coerceIn(128.coerceAtMost(effectiveJvmXmx), effectiveJvmXmx)
+
+    // El motor Rust nativo no está sujeto a Dalvik y puede usar hasta el 85% de la RAM física real
+    val rustSliderMaxMb = (((totalRamMb * 0.85).toInt() / 512) * 512).coerceAtLeast(1024)
+    val effectiveRustRamMb = config.rustMaxRamMb.coerceIn(1024, rustSliderMaxMb)
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -70,20 +103,52 @@ fun SettingsScreen(
             shape = RoundedCornerShape(16.dp)
         ) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("JVM ARM64 y Snapdragon", fontWeight = FontWeight.Bold)
+                Text("Memoria RAM (JVM ARM64 vs Rust Nativo)", fontWeight = FontWeight.Bold)
                 Text(
-                    "Heap: Xms ${config.jvmXmsMb} MB · Xmx ${config.jvmXmxMb} MB",
+                    "RAM Física: $totalRamGb GB totales ($totalRamMb MB) · Límite Dalvik (getLargeMemoryClass): $jvmSliderMaxMb MB",
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp
+                    fontSize = 12.sp,
+                    color = Color(0xFF047857)
+                )
+                Text(
+                    "La JVM (Java) tiene un límite estricto impuesto por Android (Dalvik/ART) y no puede superar getLargeMemoryClass() ($jvmSliderMaxMb MB) sin riesgo de cierre. El motor Rust (Bedrock Nativo) corre fuera de Dalvik y puede usar hasta el 85% de tu RAM física ($rustSliderMaxMb MB).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF475569)
+                )
+
+                HorizontalDivider(color = Color(0xFFE2E8F0))
+
+                Text(
+                    "JVM Java / Híbrido — Xms $effectiveJvmXms MB · Xmx $effectiveJvmXmx MB (máx. estricto $jvmSliderMaxMb MB)",
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp
                 )
                 Slider(
-                    value = config.jvmXmxMb.toFloat(),
+                    value = effectiveJvmXmx.toFloat(),
                     onValueChange = {
-                        val nextXmx = ((it.toInt() / 256) * 256).coerceIn(768, 4096)
-                        onUpdateConfig(config.copy(jvmXmxMb = nextXmx))
+                        val nextXmx = ((it.toInt() / 64) * 64).coerceIn(jvmSliderMinMb, jvmSliderMaxMb)
+                        val nextXms = config.jvmXmsMb.coerceAtMost(nextXmx)
+                        onUpdateConfig(config.copy(jvmXmxMb = nextXmx, jvmXmsMb = nextXms))
                     },
-                    valueRange = 768f..4096f
+                    valueRange = jvmSliderMinMb.toFloat()..jvmSliderMaxMb.toFloat()
                 )
+
+                val rustGbText = String.format(java.util.Locale.US, "%.1f", effectiveRustRamMb / 1024.0)
+                val rustMaxGbText = String.format(java.util.Locale.US, "%.1f", rustSliderMaxMb / 1024.0)
+                Text(
+                    "Motor Rust (Bedrock Nativo) — Límite $effectiveRustRamMb MB (~$rustGbText GB · máx. 85% = $rustMaxGbText GB)",
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp
+                )
+                Slider(
+                    value = effectiveRustRamMb.toFloat(),
+                    onValueChange = {
+                        val nextRustMb = ((it.toInt() / 512) * 512).coerceIn(1024, rustSliderMaxMb)
+                        onUpdateConfig(config.copy(rustMaxRamMb = nextRustMb))
+                    },
+                    valueRange = 1024f..rustSliderMaxMb.toFloat()
+                )
+
                 SettingSwitch("Aceptar EULA automáticamente", config.eulaAccepted) {
                     onUpdateConfig(config.copy(eulaAccepted = it))
                 }

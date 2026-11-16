@@ -2,6 +2,7 @@ use crate::net::low_latency::LowLatencyConfig;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -24,6 +25,53 @@ struct ServerHandle {
 static LOGGING_INIT: OnceLock<()> = OnceLock::new();
 static SERVER_HANDLE: OnceLock<Mutex<Option<ServerHandle>>> = OnceLock::new();
 static SERVER_GUID: OnceLock<u64> = OnceLock::new();
+static MAX_RUST_RAM_BYTES: AtomicU64 = AtomicU64::new(4096 * 1024 * 1024);
+
+pub fn configured_max_ram_bytes() -> u64 {
+    MAX_RUST_RAM_BYTES.load(Ordering::Relaxed)
+}
+
+fn current_process_rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    #[cfg(unix)]
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE).max(4096) as u64 };
+    #[cfg(not(unix))]
+    let page_size = 4096u64;
+    Some(rss_pages.saturating_mul(page_size))
+}
+
+fn decode_varuint32(input: &[u8]) -> Option<(u32, usize)> {
+    let mut value: u32 = 0;
+    let mut shift: u32 = 0;
+    for (idx, &byte) in input.iter().enumerate() {
+        value |= ((byte & 0x7F) as u32) << shift;
+        if (byte & 0x80) == 0 {
+            return Some((value, idx + 1));
+        }
+        shift += 7;
+        if shift >= 35 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Decodifica el primer ID de subpaquete dentro de un wrapper Batch de Bedrock (0xFE).
+pub fn decode_bedrock_batch_packet_id(payload: &[u8]) -> Option<u32> {
+    if payload.first().copied() != Some(0xfe) || payload.len() < 2 {
+        return None;
+    }
+    let body = &payload[1..];
+    if let Some((_subpkt_len, len_bytes)) = decode_varuint32(body) {
+        if let Some(subpkt) = body.get(len_bytes..) {
+            if let Some((header, _)) = decode_varuint32(subpkt) {
+                return Some(header & 0x3FF);
+            }
+        }
+    }
+    Some(body[0] as u32)
+}
 
 fn handle_slot() -> &'static Mutex<Option<ServerHandle>> {
     SERVER_HANDLE.get_or_init(|| Mutex::new(None))
@@ -113,6 +161,7 @@ pub fn start_async_engine(
     server_name: &str,
     lane_name: &str,
     bedrock_port: u16,
+    max_ram_mb: u32,
     net_cfg: LowLatencyConfig,
 ) -> Result<String, String> {
     init_android_logging();
@@ -125,8 +174,16 @@ pub fn start_async_engine(
         return Ok("engine=already_running".to_string());
     }
 
+    let budget_mb = max_ram_mb.max(512);
+    let budget_bytes = (budget_mb as u64).saturating_mul(1024 * 1024);
+    MAX_RUST_RAM_BYTES.store(budget_bytes, Ordering::Relaxed);
+
+    let max_blocking = ((budget_mb / 1024).clamp(4, 32)) as usize;
+    let max_peer_relays = ((budget_mb / 64) as usize).clamp(32, 512);
+
     let rt = Builder::new_multi_thread()
         .worker_threads(4)
+        .max_blocking_threads(max_blocking)
         .thread_name("bdr-tokio-worker")
         .enable_all()
         .build()
@@ -182,14 +239,40 @@ pub fn start_async_engine(
 
         rt.spawn(async move {
             log::info!(
-                "BedrockDroid RS Fase 2 listo: dir={} lane={} target={} motd_ver={} proto={} fast_path={}",
+                "BedrockDroid RS Fase 2 listo: dir={} lane={} target={} motd_ver={} proto={} max_ram={}MB (blocking_threads={}, max_peers={}) fast_path={}",
                 dir_owned,
                 lane_owned,
                 TARGET_BEDROCK_VERSION,
                 MOTD_ADVERTISED_VERSION,
                 TARGET_BEDROCK_PROTOCOL,
+                budget_mb,
+                max_blocking,
+                max_peer_relays,
                 net_cfg.local_fast_path
             );
+
+            // Watchdog de memoria nativa (OOM Guard): evita que el motor supere el límite configurado en Android
+            let mem_guard_cancel = task_cancel.child_token();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(15));
+                loop {
+                    tokio::select! {
+                        _ = mem_guard_cancel.cancelled() => break,
+                        _ = ticker.tick() => {
+                            if let Some(rss) = current_process_rss_bytes() {
+                                let limit = configured_max_ram_bytes();
+                                if limit > 0 && rss >= (limit * 85) / 100 {
+                                    log::warn!(
+                                        "[MemoryGuard] RSS={} MB acerca al límite nativo {} MB (>=85%), restringiendo nuevos buffers",
+                                        rss / (1024 * 1024),
+                                        limit / (1024 * 1024)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
 
             #[cfg(feature = "protocol-core")]
             {
@@ -241,7 +324,18 @@ pub fn start_async_engine(
                                 }
 
                                 if !peer_relays.contains_key(&peer) {
-                                    if peer_relays.len() >= 128 {
+                                    if let Some(rss) = current_process_rss_bytes() {
+                                        if rss >= (budget_bytes * 95) / 100 {
+                                            log::warn!(
+                                                "[MemoryGuard] RSS={} MB >= 95% del límite ({} MB); rechazando nuevo relay para {}",
+                                                rss / (1024 * 1024),
+                                                budget_mb,
+                                                peer
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    if peer_relays.len() >= max_peer_relays {
                                         for (_, (_, old_cancel)) in peer_relays.drain() {
                                             old_cancel.cancel();
                                         }
@@ -317,18 +411,59 @@ pub fn start_async_engine(
                     }
                     maybe_stream = listener.accept() => {
                         match maybe_stream {
-                            Some(stream) => {
+                            Some(mut stream) => {
                                 let proxy_peer = stream.peer_addr();
                                 let real_peer = proxy_to_real
                                     .get(&proxy_peer)
                                     .copied()
                                     .unwrap_or(proxy_peer);
-                                // Fase 2: Solo Ping/Pong y conexión RakNet base; aún no se procesa Login Handshake de Bedrock.
                                 log::info!(
                                     "Cliente RakNet conectado (handshake UDP completado) desde {} (proxy={})",
                                     real_peer,
                                     proxy_peer
                                 );
+                                // Preparación Fase 3: registrar conexión sin procesar aún el handshake de Login Bedrock.
+                                log::info!("[Bedrock RX] Nuevo cliente conectado. Esperando RequestNetworkSettings...");
+
+                                let stream_cancel = task_cancel.child_token();
+                                tokio::spawn(async move {
+                                    loop {
+                                        tokio::select! {
+                                            _ = stream_cancel.cancelled() => {
+                                                log::info!("[Bedrock RX] Sesión con {} cerrada por apagado del motor", real_peer);
+                                                break;
+                                            }
+                                            maybe_pkt = stream.recv() => {
+                                                match maybe_pkt {
+                                                    Some(Ok(payload)) => {
+                                                        if payload.first().copied() == Some(0xfe) {
+                                                            let pkt_id = decode_bedrock_batch_packet_id(&payload).unwrap_or(0);
+                                                            log::info!("[Bedrock Protocol] Recibido paquete de Minecraft: 0x{:02x}", pkt_id);
+                                                            if pkt_id == 0xc1 || pkt_id == 0x0b {
+                                                                log::info!(
+                                                                    "[Bedrock Protocol] RequestNetworkSettings recibido de {} ({} bytes). TODO Fase 3: responder NetworkSettings (0x8f, Zlib, umbral 256)",
+                                                                    real_peer,
+                                                                    payload.len()
+                                                                );
+                                                            }
+                                                        } else {
+                                                            let raw_id = payload.first().copied().unwrap_or(0);
+                                                            log::info!("[Bedrock Protocol] Recibido paquete de Minecraft: 0x{:02x}", raw_id);
+                                                        }
+                                                    }
+                                                    Some(Err(err)) => {
+                                                        log::warn!("[Bedrock RX] Error leyendo stream RakNet de {}: {:?}", real_peer, err);
+                                                        break;
+                                                    }
+                                                    None => {
+                                                        log::info!("[Bedrock RX] Cliente {} desconectado", real_peer);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
                             }
                             None => {
                                 log::warn!("Listener RakNet cerrado inesperadamente");
@@ -348,8 +483,9 @@ pub fn start_async_engine(
         let _ = is_bedrock_profile;
         rt.spawn(async move {
             log::info!(
-                "BedrockDroid RS listo (sin feature transport-raknet): dir={} proto={}",
+                "BedrockDroid RS listo (sin feature transport-raknet): dir={} max_ram={}MB proto={}",
                 dir_owned,
+                max_ram_mb,
                 TARGET_BEDROCK_PROTOCOL
             );
             task_cancel.cancelled().await;
@@ -474,6 +610,14 @@ mod tests {
     }
 
     #[test]
+    fn decodes_bedrock_batch_request_network_settings() {
+        // 0xFE (Bedrock Game Packet Batch) + varint len (5) + varint pkt_id (0xc1 = RequestNetworkSettings) + proto 2225
+        let sample = [0xfe, 0x05, 0xc1, 0x01, 0x00, 0x00, 0x08, 0xb1];
+        assert_eq!(decode_bedrock_batch_packet_id(&sample), Some(0xc1));
+        assert_eq!(decode_bedrock_batch_packet_id(&[0x01, 0x02]), None);
+    }
+
+    #[test]
     fn runtime_engine_starts_and_stops_cleanly() {
         let cfg = LowLatencyConfig {
             local_fast_path: true,
@@ -482,7 +626,7 @@ mod tests {
             local_jitter_ms: 0,
             wan_mtu_bytes: 1400,
         };
-        let status = start_async_engine("/tmp/bedrock_test", "BedrockDroid RS", "BEDROCK", 0, cfg)
+        let status = start_async_engine("/tmp/bedrock_test", "BedrockDroid RS", "BEDROCK", 0, 8192, cfg)
             .expect("start failed");
         assert!(status.starts_with("engine=running raknet=127.0.0.1:"));
         assert!(is_engine_running());

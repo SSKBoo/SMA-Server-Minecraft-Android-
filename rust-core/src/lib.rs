@@ -22,6 +22,7 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
     server_name: JString,
     lane_name: JString,
     bedrock_port: jint,
+    max_ram_mb: jint,
     local_fast_path: jboolean,
     tcp_no_delay: jboolean,
     ip_tos_low_delay: jboolean,
@@ -57,6 +58,12 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
         bedrock_port as u16
     };
 
+    let rust_ram_mb = if max_ram_mb <= 0 {
+        4096u32
+    } else {
+        max_ram_mb as u32
+    };
+
     let net_cfg = net::low_latency::LowLatencyConfig {
         local_fast_path: local_fast_path == JNI_TRUE,
         tcp_no_delay: tcp_no_delay == JNI_TRUE,
@@ -71,17 +78,18 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
         thermal_guard_c,
     );
 
-    let engine_state = match runtime::start_async_engine(&dir, &motd_name, &lane, udp_port, net_cfg) {
+    let engine_state = match runtime::start_async_engine(&dir, &motd_name, &lane, udp_port, rust_ram_mb, net_cfg) {
         Ok(summary) => summary,
         Err(err) => format!("engine_err={}", err),
     };
 
     let msg = format!(
-        "OK bedrock={} motd={} proto={} {} dir={} fast_path={} nodelay={} jitter={}ms mtu={} {}",
+        "OK bedrock={} motd={} proto={} {} max_ram={}MB dir={} fast_path={} nodelay={} jitter={}ms mtu={} {}",
         runtime::TARGET_BEDROCK_VERSION,
         runtime::MOTD_ADVERTISED_VERSION,
         runtime::TARGET_BEDROCK_PROTOCOL,
         engine_state,
+        rust_ram_mb,
         dir,
         net_cfg.local_fast_path,
         net_cfg.tcp_no_delay,

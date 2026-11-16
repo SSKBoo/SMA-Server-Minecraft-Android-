@@ -234,6 +234,7 @@ class MainActivity : ComponentActivity() {
                                         config.copy(
                                             jvmXmsMb = hw.recommendedXmsMb,
                                             jvmXmxMb = hw.recommendedXmxMb,
+                                            rustMaxRamMb = hw.recommendedRustRamMb,
                                             wanMtuBytes = hw.recommendedMtu
                                         )
                                     )
@@ -241,6 +242,8 @@ class MainActivity : ComponentActivity() {
                             },
                             onConfirmOemRule = { confirmed ->
                                 updateConfig(config.copy(oemAutostartConfirmed = confirmed))
+                                ServerRuntimeState.setOemRuleConfirmed(confirmed)
+                                ServerRuntimeState.refreshChecklist(this@MainActivity)
                             },
                             onNetworkProbeComplete = { ServerRuntimeState.updateNetworkReport(it) },
                             modifier = contentModifier
