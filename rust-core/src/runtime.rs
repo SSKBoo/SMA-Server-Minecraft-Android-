@@ -1,20 +1,62 @@
 use crate::net::low_latency::LowLatencyConfig;
-use std::net::SocketAddr;
+use acacia_nethernet::{
+    http,
+    lan::{DISCOVERY_PORT, LanPacket, ServerData},
+    signaling, Connection, Event as RtcEvent, Signal, SignalKind, PROBE_PATH, join_path,
+};
+use acacia_session::proto::{
+    self, encode_packet, packet_name,
+    packets::{
+        ClientToServerHandshake, Login, NetworkSettings, NetworkSettingsCompressionAlgorithm,
+        PlayStatus, PlayStatusStatus, RequestNetworkSettings, ServerToClientHandshake,
+    },
+    RawPacket,
+};
+use acacia_session::server::{read_login, ServerConnection};
+use bytes::{Bytes, BytesMut};
+use p384::ecdsa::SigningKey;
+use rand_core::OsRng;
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
-
-#[cfg(feature = "transport-raknet")]
-use tokio_raknet::protocol::reliability::Reliability;
-#[cfg(feature = "transport-raknet")]
-use tokio_raknet::transport::{Message, RaknetListener, RaknetListenerConfig};
 
 pub const TARGET_BEDROCK_VERSION: &str = "26.60";
 pub const TARGET_BEDROCK_PROTOCOL: u32 = 2225;
 /// Versión semántica interna que espera bedrock-rs (V2225::GAME_VERSION) y clientes Android 26.60/26.62 en el MOTD.
 pub const MOTD_ADVERTISED_VERSION: &str = "1.26.60";
+
+/// Eventos de alto nivel de una conexión WebRTC NetherNet (acacia-nethernet).
+#[derive(Debug, Clone)]
+pub enum Event {
+    Connected,
+    Data(Bytes),
+    Disconnected(String),
+}
+
+/// Extrae el siguiente evento de ciclo de vida o paquete de datos SCTP desde `acacia_nethernet::Connection`.
+pub fn poll_connection_event(conn: &mut Connection) -> Option<Event> {
+    if let Some(rtc_ev) = conn.poll_event() {
+        return Some(match rtc_ev {
+            RtcEvent::Open => Event::Connected,
+            RtcEvent::Closed(reason) => Event::Disconnected(reason),
+        });
+    }
+    conn.poll_message().map(Event::Data)
+}
+
+struct PeerSession {
+    conn: Connection,
+    session: ServerConnection,
+    remote_addr: SocketAddr,
+    has_sent_network_settings: bool,
+}
 
 struct ServerHandle {
     rt: Runtime,
@@ -70,36 +112,41 @@ fn encode_varuint32(mut value: u32, out: &mut Vec<u8>) {
     }
 }
 
-/// Decodifica el primer ID de subpaquete dentro de un wrapper Batch de Bedrock (0xFE).
+/// Decodifica el primer ID de subpaquete dentro de un wrapper Batch de Bedrock (con o sin cabecera 0xFE).
 pub fn decode_bedrock_batch_packet_id(payload: &[u8]) -> Option<u32> {
-    if payload.first().copied() != Some(0xfe) || payload.len() < 2 {
+    if payload.is_empty() {
         return None;
     }
-    let body = &payload[1..];
-    if let Some((_subpkt_len, len_bytes)) = decode_varuint32(body) {
-        if let Some(subpkt) = body.get(len_bytes..) {
-            if let Some((header, _)) = decode_varuint32(subpkt) {
-                return Some(header & 0x3FF);
+    let body = if payload.first().copied() == Some(0xfe) {
+        if payload.len() < 2 {
+            return None;
+        }
+        &payload[1..]
+    } else {
+        payload
+    };
+    if let Some((subpkt_len, len_bytes)) = decode_varuint32(body) {
+        if subpkt_len > 0 && body.len() >= len_bytes.saturating_add(subpkt_len as usize) {
+            if let Some(subpkt) = body.get(len_bytes..) {
+                if let Some((header, _)) = decode_varuint32(subpkt) {
+                    return Some(header & 0x3FF);
+                }
             }
         }
     }
-    Some(body[0] as u32)
+    None
 }
 
-/// Construye el paquete NetworkSettings (ID 0x8F) con compresión Zlib (0x0000) y umbral 256,
-/// envuelto en un Batch de Bedrock sin compresión previa (0xFE + longitud varuint32).
+/// Construye el paquete NetworkSettings (ID 0x8F) con compresión Zlib/Deflate (0x0000) y umbral 256,
+/// envuelto en un Batch de Bedrock compatible con 0xFE.
 pub fn build_network_settings_batch(compression_threshold: u16) -> Vec<u8> {
     let mut subpkt = Vec::with_capacity(14);
-    // Packet ID 0x8F (143) en VarUInt32 ([0x8F, 0x01])
     encode_varuint32(0x8F, &mut subpkt);
-    // Compression Threshold (u16 LE según el wire format de Bedrock, p.ej. 256)
     subpkt.extend_from_slice(&compression_threshold.to_le_bytes());
-    // Compression Algorithm = Zlib (0x0000)
     subpkt.extend_from_slice(&0x0000u16.to_le_bytes());
-    // Campos finales obligatorios en Bedrock >= 1.19.30 / 26.60 (client_throttle)
-    subpkt.push(0x00); // client_throttle_enabled = false
-    subpkt.push(0x00); // client_throttle_threshold = 0
-    subpkt.extend_from_slice(&0.0f32.to_le_bytes()); // client_throttle_scalar = 0.0
+    subpkt.push(0x00);
+    subpkt.push(0x00);
+    subpkt.extend_from_slice(&0.0f32.to_le_bytes());
 
     let mut batch = Vec::with_capacity(2 + subpkt.len());
     batch.push(0xFE);
@@ -127,8 +174,7 @@ pub fn server_id() -> u64 {
     })
 }
 
-/// Construye el string MOTD estándar de Minecraft Bedrock para Unconnected Pong (0x1c),
-/// sin comillas extra ni caracteres nulos.
+/// Construye el string MOTD estándar de Minecraft Bedrock, sin comillas extra ni caracteres nulos.
 pub fn build_bedrock_advertisement(motd_name: &str, ipv4_port: u16) -> String {
     let clean_name: String = motd_name
         .chars()
@@ -151,6 +197,341 @@ pub fn build_bedrock_advertisement(motd_name: &str, ipv4_port: u16) -> String {
         effective_port,
         ipv6_port
     )
+}
+
+/// Resuelve una IP local concreta (no 0.0.0.0) para que `str0m::Candidate::host` dentro de
+/// `Connection::answer` pueda incluir el candidato ICE UDP válido en el SDP answer.
+fn resolve_local_candidate_addr(preferred_ip: Option<IpAddr>, udp_port: u16) -> SocketAddr {
+    if let Some(ip) = preferred_ip {
+        if !ip.is_unspecified() {
+            return SocketAddr::new(ip, udp_port);
+        }
+    }
+    if let Ok(probe) = StdUdpSocket::bind("0.0.0.0:0") {
+        if probe.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local) = probe.local_addr() {
+                if !local.ip().is_unspecified() {
+                    return SocketAddr::new(local.ip(), udp_port);
+                }
+            }
+        }
+    }
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), udp_port)
+}
+
+/// Procesa un lote de datos de sesión de Minecraft Bedrock recibido por el canal SCTP de WebRTC
+/// utilizando `acacia_session::server::ServerConnection` y `acacia_session::proto`.
+pub fn handle_bedrock_session_data(
+    conn: &mut Connection,
+    session: &mut ServerConnection,
+    has_sent_network_settings: &mut bool,
+    peer_addr: SocketAddr,
+    payload: &[u8],
+    now: Instant,
+) {
+    // 1. Decodificar el batch de Bedrock con acacia-session (soporta paquetes sin cabecera 0xFE o con 0xFE)
+    let normalized = if payload.first().copied() == Some(0xfe) && payload.len() > 1 {
+        &payload[1..]
+    } else {
+        payload
+    };
+
+    let packets = match session.decode(normalized) {
+        Ok(pkts) => pkts,
+        Err(err) => {
+            log::warn!(
+                "[Bedrock Session] Error decodificando batch de {} ({} bytes): {}",
+                peer_addr,
+                payload.len(),
+                err
+            );
+            return;
+        }
+    };
+
+    for raw_bytes in packets {
+        let pkt = match RawPacket::parse(raw_bytes) {
+            Ok(p) => p,
+            Err(err) => {
+                log::warn!(
+                    "[Bedrock Session] Error parseando cabecera de subpaquete de {}: {}",
+                    peer_addr,
+                    err
+                );
+                continue;
+            }
+        };
+
+        let name = packet_name(pkt.id).unwrap_or("UnknownPacket");
+        log::info!(
+            "Paquete de Bedrock recibido (ID: 0x{:02x} / {}) desde {} ({} bytes)",
+            pkt.id,
+            name,
+            peer_addr,
+            pkt.body.len()
+        );
+        log::info!("[Bedrock Protocol] Recibido paquete de Minecraft: 0x{:02x}", pkt.id);
+
+        match pkt.id {
+            // TAREA 3.1: RequestNetworkSettings (0xC1 / 193 o 0x0B) -> NetworkSettings (0x8F)
+            id if id == RequestNetworkSettings::ID || id == 0x0b => {
+                if let Ok(req) = pkt.decode::<RequestNetworkSettings>() {
+                    log::info!(
+                        "[Bedrock Protocol] RequestNetworkSettings recibido de {} (client_protocol={})",
+                        peer_addr,
+                        req.client_protocol
+                    );
+                }
+
+                let settings = NetworkSettings {
+                    compression_threshold: 256,
+                    compression_algorithm: NetworkSettingsCompressionAlgorithm::Deflate,
+                    client_throttle_enabled: false,
+                    client_throttle_threshold: 0,
+                    client_throttle_scalar: 0.0,
+                };
+
+                let mut encoded = BytesMut::new();
+                encode_packet(&settings, &mut encoded);
+                // El paquete NetworkSettings se envía sin comprimir antes de activar Deflate
+                let batch = session.encode(&[encoded.freeze()]);
+                conn.send(batch, now);
+
+                if let Err(err) = session.start_compression(&settings) {
+                    log::warn!(
+                        "[Bedrock Protocol] Error activando compresión Deflate para {}: {}",
+                        peer_addr,
+                        err
+                    );
+                } else {
+                    *has_sent_network_settings = true;
+                    log::info!(
+                        "[Bedrock Protocol] NetworkSettings enviado a {} (Deflate, threshold=256)",
+                        peer_addr
+                    );
+                }
+            }
+
+            // TAREA 3.2: Login (0x01) -> ServerToClientHandshake (0x03) + PlayStatus::LoginSuccess (0x02)
+            id if id == Login::ID => {
+                if !*has_sent_network_settings {
+                    log::warn!(
+                        "[Bedrock Login] Login (0x01) recibido antes de NetworkSettings desde {}",
+                        peer_addr
+                    );
+                }
+
+                match read_login(&pkt.body) {
+                    Ok((protocol_version, _skin_jwt, client_key)) => {
+                        log::info!(
+                            "[Bedrock Login] Paquete Login (0x01) validado desde {} (proto={})",
+                            peer_addr,
+                            protocol_version
+                        );
+                        let _ = client_key;
+                        // En NetherNet el transporte WebRTC/DTLS ya cifra el canal; usamos plaintext_handshake()
+                        // (o start_encryption(&client_key) si se requiere cifrado de capa de sesión).
+                        let handshake_pkt = session.plaintext_handshake();
+                        let hs_batch = session.encode(&[handshake_pkt]);
+                        conn.send(hs_batch, now);
+                        log::info!(
+                            "[Bedrock Login] ServerToClientHandshake (0x03) enviado a {}",
+                            peer_addr
+                        );
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "[Bedrock Login] Login JWT/clave en modo offline o formato alternativo ({}): enviando ServerToClientHandshake y LoginSuccess",
+                            err
+                        );
+                        let handshake_pkt = session.plaintext_handshake();
+                        let hs_batch = session.encode(&[handshake_pkt]);
+                        conn.send(hs_batch, now);
+                    }
+                }
+
+                let play_status = PlayStatus {
+                    status: PlayStatusStatus::LoginSuccess,
+                };
+                let mut status_buf = BytesMut::new();
+                encode_packet(&play_status, &mut status_buf);
+                let status_batch = session.encode(&[status_buf.freeze()]);
+                conn.send(status_batch, now);
+                log::info!(
+                    "[Bedrock Login] PlayStatus (0x02 LoginSuccess) enviado a {}",
+                    peer_addr
+                );
+            }
+
+            // Respuesta del cliente al ServerToClientHandshake (0x04 ClientToServerHandshake)
+            id if id == ClientToServerHandshake::ID => {
+                let _ = pkt.decode::<ClientToServerHandshake>();
+                let _ = ServerToClientHandshake::ID;
+                let play_status = PlayStatus {
+                    status: PlayStatusStatus::LoginSuccess,
+                };
+                let mut status_buf = BytesMut::new();
+                encode_packet(&play_status, &mut status_buf);
+                let status_batch = session.encode(&[status_buf.freeze()]);
+                conn.send(status_batch, now);
+                log::info!(
+                    "[Bedrock Login] ClientToServerHandshake (0x04) completado con {} -> PlayStatus::LoginSuccess (0x02) confirmado",
+                    peer_addr
+                );
+            }
+
+            other => {
+                let _ = proto::packets::Packet::ID;
+                log::info!(
+                    "[Bedrock Session] Paquete 0x{:02x} ({}) procesado en sesión activa con {}",
+                    other,
+                    name,
+                    peer_addr
+                );
+            }
+        }
+    }
+}
+
+/// Atiende una conexión TCP entrante del servidor de señalización HTTP NetherNet (`/v1/join`).
+async fn handle_http_signaling_stream(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    udp_port: u16,
+    network_id: u64,
+    motd_string: String,
+    host_key: SigningKey,
+    peers: Arc<Mutex<HashMap<u64, PeerSession>>>,
+    udp_socket: Arc<UdpSocket>,
+) {
+    let local_tcp_ip = stream.local_addr().ok().map(|a| a.ip());
+    let mut buf = Vec::with_capacity(4096);
+    let mut temp = [0u8; 4096];
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut temp)).await {
+            Ok(Ok(0)) => return,
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&temp[..n]);
+                // Los clientes Bedrock 26.60+ intentan primero un ClientHello TLS (0x16 0x03 ...).
+                // Respondemos con http::TLS_REFUSAL para que reintenten de inmediato en HTTP plano.
+                if http::is_tls(&buf) {
+                    log::info!(
+                        "Señalización HTTP recibida: ClientHello TLS desde {} -> enviando TLS_REFUSAL para downgrade a HTTP",
+                        peer_addr
+                    );
+                    let _ = stream.write_all(&http::TLS_REFUSAL).await;
+                    return;
+                }
+                if http::request_complete(&buf) {
+                    break;
+                }
+                if buf.len() > http::MAX_MESSAGE {
+                    log::warn!("Señalización HTTP excedió MAX_MESSAGE desde {}", peer_addr);
+                    return;
+                }
+            }
+            Ok(Err(err)) => {
+                log::warn!("Error leyendo señalización HTTP desde {}: {}", peer_addr, err);
+                return;
+            }
+            Err(_) => {
+                log::warn!("Timeout leyendo señalización HTTP desde {}", peer_addr);
+                return;
+            }
+        }
+    }
+
+    let req = match http::parse_request(&buf) {
+        Ok(r) => r,
+        Err(err) => {
+            log::warn!("Error parseando petición HTTP NetherNet de {}: {}", peer_addr, err);
+            let resp = http::response(400, "text/plain", "Bad Request");
+            let _ = stream.write_all(&resp).await;
+            return;
+        }
+    };
+
+    log::info!(
+        "Señalización HTTP recibida: {} {} desde {} ({} bytes body)",
+        req.method,
+        req.path,
+        peer_addr,
+        req.body.len()
+    );
+
+    let expected_join_prefix = format!("{}/", PROBE_PATH);
+    if req.method.eq_ignore_ascii_case("GET") && req.path == PROBE_PATH {
+        let probe_json = format!(
+            r#"{{"network_id":{},"protocol":{},"version":"{}","motd":"{}"}}"#,
+            network_id, TARGET_BEDROCK_PROTOCOL, MOTD_ADVERTISED_VERSION, motd_string
+        );
+        let resp = http::response(200, "application/json", &probe_json);
+        let _ = stream.write_all(&resp).await;
+    } else if req.method.eq_ignore_ascii_case("POST")
+        && (req.path == PROBE_PATH
+            || req.path == join_path(network_id)
+            || req.path.starts_with(&expected_join_prefix))
+    {
+        let offer_sdp = match std::str::from_utf8(req.body) {
+            Ok(s) => s,
+            Err(_) => {
+                let resp = http::response(400, "text/plain", "Invalid UTF-8 SDP offer");
+                let _ = stream.write_all(&resp).await;
+                return;
+            }
+        };
+
+        let local_candidate = resolve_local_candidate_addr(local_tcp_ip, udp_port);
+        let now = Instant::now();
+        match Connection::answer(offer_sdp, local_candidate, &host_key, now) {
+            Ok((mut conn, answer_sdp)) => {
+                log::info!(
+                    "Señalización HTTP recibida: SDP offer procesado para {} (candidato ICE local={})",
+                    peer_addr,
+                    local_candidate
+                );
+
+                while let Some(tx) = conn.poll_transmit() {
+                    let _ = udp_socket.send_to(&tx.contents, tx.destination).await;
+                }
+
+                let session_id = req
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| (peer_addr.port() as u64) ^ network_id);
+
+                if let Ok(mut guard) = peers.lock() {
+                    guard.insert(
+                        session_id,
+                        PeerSession {
+                            conn,
+                            session: ServerConnection::nethernet(host_key.clone()),
+                            remote_addr: peer_addr,
+                            has_sent_network_settings: false,
+                        },
+                    );
+                }
+
+                let resp = http::response(200, "application/sdp", &answer_sdp);
+                let _ = stream.write_all(&resp).await;
+            }
+            Err(err) => {
+                log::warn!(
+                    "Error en Connection::answer para oferta WebRTC de {}: {}",
+                    peer_addr,
+                    err
+                );
+                let resp = http::response(500, "text/plain", &err.to_string());
+                let _ = stream.write_all(&resp).await;
+            }
+        }
+    } else {
+        let resp = http::response(404, "text/plain", "Not Found");
+        let _ = stream.write_all(&resp).await;
+    }
 }
 
 /// Inicializa logcat nativo y registra panic_hook exactamente una sola vez.
@@ -198,6 +579,7 @@ pub fn start_async_engine(
     let rt = Builder::new_multi_thread()
         .worker_threads(4)
         .max_blocking_threads(max_blocking)
+        .thread_stack_size(8 * 1024 * 1024)
         .thread_name("bdr-tokio-worker")
         .enable_all()
         .build()
@@ -206,220 +588,356 @@ pub fn start_async_engine(
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let dir_owned = data_dir.to_string();
-    let motd_string = build_bedrock_advertisement(server_name, bedrock_port);
+    let server_name_owned = server_name.to_string();
+    let lane_owned = lane_name.to_string();
     let is_bedrock_profile = lane_name.trim().eq_ignore_ascii_case("bedrock");
+    let _ = is_bedrock_profile;
 
-    #[cfg(feature = "transport-raknet")]
-    let bound_summary: String = {
-        let _ = is_bedrock_profile;
-        // Bind directo de RaknetListener sin relay UDP intermedio:
-        // 0.0.0.0 acepta tanto 127.0.0.1 (Fast-Path local) como la IP Wi-Fi LAN (ej. 192.168.1.84).
-        // Si en algún dispositivo Android 0.0.0.0 no recibe desde wlan0, cambiar bind_ip a "[::]" (dual-stack).
-        let bind_addr: SocketAddr = format!("0.0.0.0:{}", bedrock_port)
-            .parse()
-            .map_err(|e| format!("invalid bind addr: {}", e))?;
+    let bind_addr: SocketAddr = format!("0.0.0.0:{}", bedrock_port)
+        .parse()
+        .map_err(|e| format!("invalid bind addr: {}", e))?;
 
-        let adv_bytes = motd_string.as_bytes().to_vec();
-        let adv_len = adv_bytes.len();
+    // Bind coordinado de TCP (señalización HTTP /v1/join) y UDP (transporte WebRTC ICE/DTLS/SCTP) en el mismo puerto
+    let (tcp_listener, udp_socket, actual_addr) = rt.block_on(async move {
+        let tcp = TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| format!("nethernet tcp bind {} error: {}", bind_addr, e))?;
+        let local_tcp_addr = tcp
+            .local_addr()
+            .map_err(|e| format!("nethernet tcp local_addr error: {}", e))?;
+        let udp_bind = SocketAddr::new(bind_addr.ip(), local_tcp_addr.port());
+        let udp = UdpSocket::bind(udp_bind)
+            .await
+            .map_err(|e| format!("nethernet udp bind {} error: {}", udp_bind, e))?;
+        Ok::<(TcpListener, UdpSocket, SocketAddr), String>((tcp, udp, local_tcp_addr))
+    })?;
 
-        let raknet_cfg = RaknetListenerConfig {
-            max_mtu: net_cfg.wan_mtu_bytes.clamp(576, 1492),
-            advertisement: adv_bytes,
-            ..RaknetListenerConfig::default()
-        };
+    let effective_port = actual_addr.port();
+    let motd_string = build_bedrock_advertisement(&server_name_owned, effective_port);
+    let adv_len = motd_string.len();
+    let net_id = server_id();
+    let host_key = SigningKey::random(&mut OsRng);
+    let peers: Arc<Mutex<HashMap<u64, PeerSession>>> = Arc::new(Mutex::new(HashMap::new()));
+    let udp_shared = Arc::new(udp_socket);
 
-        let mut listener = rt.block_on(async move {
-            RaknetListener::bind_with_config(bind_addr, raknet_cfg)
-                .await
-                .map_err(|e| format!("raknet listener bind {} error: {}", bind_addr, e))
-        })?;
+    rt.spawn(async move {
+        log::info!(
+            "BedrockDroid RS Fase 3 NetherNet listo: dir={} lane={} target={} motd_ver={} proto={} max_ram={}MB (blocking_threads={}) fast_path={}",
+            dir_owned,
+            lane_owned,
+            TARGET_BEDROCK_VERSION,
+            MOTD_ADVERTISED_VERSION,
+            TARGET_BEDROCK_PROTOCOL,
+            budget_mb,
+            max_blocking,
+            net_cfg.local_fast_path
+        );
 
-        let actual_addr = listener.local_addr();
-        let advertised_motd = motd_string.clone();
-        let lane_owned = lane_name.to_string();
+        // Watchdog de memoria nativa (OOM Guard)
+        let mem_guard_cancel = task_cancel.child_token();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    _ = mem_guard_cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        if let Some(rss) = current_process_rss_bytes() {
+                            let limit = configured_max_ram_bytes();
+                            if limit > 0 && rss >= (limit * 85) / 100 {
+                                log::warn!(
+                                    "[MemoryGuard] RSS={} MB acerca al límite nativo {} MB (>=85%), restringiendo nuevos buffers",
+                                    rss / (1024 * 1024),
+                                    limit / (1024 * 1024)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
-        rt.spawn(async move {
+        #[cfg(feature = "protocol-core")]
+        {
+            use bedrock::protocol::{ProtoVersion, V2225};
             log::info!(
-                "BedrockDroid RS Fase 2/3 listo (bind directo): dir={} lane={} target={} motd_ver={} proto={} max_ram={}MB (blocking_threads={}) fast_path={}",
-                dir_owned,
-                lane_owned,
-                TARGET_BEDROCK_VERSION,
-                MOTD_ADVERTISED_VERSION,
-                TARGET_BEDROCK_PROTOCOL,
-                budget_mb,
-                max_blocking,
-                net_cfg.local_fast_path
+                "Feature activa: protocol-core (bedrock-rs V2225 proto={} game={})",
+                V2225::PROTOCOL_VERSION,
+                V2225::GAME_VERSION
             );
+        }
 
-            // Watchdog de memoria nativa (OOM Guard): evita que el motor supere el límite configurado en Android
-            let mem_guard_cancel = task_cancel.child_token();
+        log::info!(
+            "Servidor NetherNet (acacia-nethernet) escuchando señalización HTTP en TCP {} y WebRTC en UDP {}",
+            actual_addr,
+            actual_addr
+        );
+        log::info!(
+            "Advertisement configurado ({} bytes, ServerID={}): {}",
+            adv_len,
+            net_id,
+            motd_string
+        );
+
+        // Listener opcional de descubrimiento LAN NetherNet en UDP 7551 (acacia_nethernet::lan)
+        let lan_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DISCOVERY_PORT);
+        if let Ok(lan_sock) = UdpSocket::bind(lan_bind).await {
+            let lan_cancel = task_cancel.child_token();
+            let lan_peers = Arc::clone(&peers);
+            let lan_udp = Arc::clone(&udp_shared);
+            let lan_key = host_key.clone();
+            let lan_server_name = server_name_owned.clone();
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(15));
+                log::info!(
+                    "[NetherNet LAN] Discovery y señalización LAN activos en UDP {}",
+                    lan_bind
+                );
+                let mut lan_buf = [0u8; 4096];
                 loop {
                     tokio::select! {
-                        _ = mem_guard_cancel.cancelled() => break,
-                        _ = ticker.tick() => {
-                            if let Some(rss) = current_process_rss_bytes() {
-                                let limit = configured_max_ram_bytes();
-                                if limit > 0 && rss >= (limit * 85) / 100 {
-                                    log::warn!(
-                                        "[MemoryGuard] RSS={} MB acerca al límite nativo {} MB (>=85%), restringiendo nuevos buffers",
-                                        rss / (1024 * 1024),
-                                        limit / (1024 * 1024)
-                                    );
+                        _ = lan_cancel.cancelled() => break,
+                        res = lan_sock.recv_from(&mut lan_buf) => {
+                            if let Ok((len, from)) = res {
+                                if let Ok((pkt, sender_id)) = LanPacket::decode(&lan_buf[..len]) {
+                                    match pkt {
+                                        LanPacket::Request => {
+                                            let server_data = ServerData {
+                                                server_name: lan_server_name.clone(),
+                                                level_name: "Bedrock World".to_string(),
+                                                protocol: TARGET_BEDROCK_PROTOCOL as i32,
+                                                version: MOTD_ADVERTISED_VERSION.to_string(),
+                                                player_count: 0,
+                                                max_player_count: 10,
+                                                game_type: 0,
+                                                editor_world: false,
+                                                hardcore: false,
+                                                accepts_online_auth: true,
+                                                accepts_self_signed_auth: true,
+                                                nonce: format!("{:016X}", net_id),
+                                                connection_type: 4,
+                                            };
+                                            let resp = LanPacket::Response(server_data.encode()).encode(net_id);
+                                            let _ = lan_sock.send_to(&resp, from).await;
+                                        }
+                                        LanPacket::Message { recipient, data } if recipient == net_id => {
+                                            if let Ok(sig) = Signal::parse(&data) {
+                                                let _ = signaling::PROTOCOL_VERSION;
+                                                match sig.kind {
+                                                    SignalKind::ConnectRequest => {
+                                                        let local_cand = resolve_local_candidate_addr(None, effective_port);
+                                                        let now = Instant::now();
+                                                        if let Ok((mut conn, answer_sdp)) = Connection::answer(&sig.data, local_cand, &lan_key, now) {
+                                                            log::info!("Señalización LAN recibida: ConnectRequest desde {} (session={})", from, sig.session_id);
+                                                            while let Some(tx) = conn.poll_transmit() {
+                                                                let _ = lan_udp.send_to(&tx.contents, tx.destination).await;
+                                                            }
+                                                            if let Ok(mut guard) = lan_peers.lock() {
+                                                                guard.insert(
+                                                                    sig.session_id,
+                                                                    PeerSession {
+                                                                        conn,
+                                                                        session: ServerConnection::nethernet(lan_key.clone()),
+                                                                        remote_addr: from,
+                                                                        has_sent_network_settings: false,
+                                                                    },
+                                                                );
+                                                            }
+                                                            let answer_sig = Signal {
+                                                                kind: SignalKind::ConnectResponse,
+                                                                session_id: sig.session_id,
+                                                                data: answer_sdp,
+                                                            };
+                                                            let msg = LanPacket::Message {
+                                                                recipient: sender_id,
+                                                                data: answer_sig.to_string(),
+                                                            }.encode(net_id);
+                                                            let _ = lan_sock.send_to(&msg, from).await;
+                                                        }
+                                                    }
+                                                    SignalKind::CandidateAdd => {
+                                                        let now = Instant::now();
+                                                        if let Ok(mut guard) = lan_peers.lock() {
+                                                            if let Some(peer) = guard.get_mut(&sig.session_id) {
+                                                                let _ = peer.conn.add_remote_candidate(&sig.data, now);
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
                     }
                 }
             });
+        }
 
-            #[cfg(feature = "protocol-core")]
-            {
-                use bedrock::protocol::{ProtoVersion, V2225};
-                log::info!(
-                    "Feature activa: protocol-core (bedrock-rs V2225 proto={} game={})",
-                    V2225::PROTOCOL_VERSION,
-                    V2225::GAME_VERSION
-                );
-            }
+        // Bucle principal: acepta señalización HTTP (/v1/join), recibe datagramas UDP WebRTC y despacha Event
+        let mut udp_buf = [0u8; 65535];
+        let mut rtc_tick = tokio::time::interval(Duration::from_millis(20));
 
-            log::info!("Servidor RakNet escuchando directamente en {}", actual_addr);
-            log::info!(
-                "Advertisement configurado ({} bytes, ServerID={}): {}",
-                adv_len,
-                server_id(),
-                advertised_motd
-            );
-            log::info!("[RakNet] Esperando conexiones y pings UDP en {}...", actual_addr);
+        const RAKNET_MAGIC: [u8; 16] = [
+            0x00, 0xFF, 0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFE, 0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34,
+            0x56, 0x78,
+        ];
 
-            loop {
-                tokio::select! {
-                    _ = task_cancel.cancelled() => {
-                        log::info!("Listener RakNet cancelado por CancellationToken");
-                        break;
-                    }
-                    maybe_stream = listener.accept() => {
-                        match maybe_stream {
-                            Some(mut stream) => {
-                                let peer_addr = stream.peer_addr();
-                                log::info!(
-                                    "[Bedrock RX] Cliente RakNet conectado (handshake UDP completado) desde {}",
-                                    peer_addr
-                                );
-                                log::info!("[Bedrock RX] Nuevo cliente conectado. Esperando RequestNetworkSettings...");
-
-                                let stream_cancel = task_cancel.child_token();
-                                tokio::spawn(async move {
-                                    let mut has_sent_network_settings = false;
-                                    loop {
-                                        tokio::select! {
-                                            _ = stream_cancel.cancelled() => {
-                                                log::info!("[Bedrock RX] Sesión con {} cerrada por apagado del motor", peer_addr);
-                                                break;
-                                            }
-                                            maybe_pkt = stream.recv() => {
-                                                match maybe_pkt {
-                                                    Some(Ok(payload)) => {
-                                                        let len = payload.len();
-                                                        log::info!(
-                                                            "[Bedrock RX] Paquete UDP recibido desde {} ({} bytes)",
-                                                            peer_addr,
-                                                            len
-                                                        );
-                                                        if payload.first().copied() == Some(0xfe) {
-                                                            if !has_sent_network_settings {
-                                                                let pkt_id = decode_bedrock_batch_packet_id(&payload).unwrap_or(0);
-                                                                log::info!("[Bedrock Protocol] Recibido paquete de Minecraft: 0x{:02x}", pkt_id);
-                                                                if pkt_id == 0xc1 || pkt_id == 0x0b {
-                                                                    let batch = build_network_settings_batch(256);
-                                                                    let msg = Message::new(batch)
-                                                                        .reliability(Reliability::ReliableOrdered)
-                                                                        .channel(0);
-                                                                    match stream.send(msg).await {
-                                                                        Ok(()) => {
-                                                                            has_sent_network_settings = true;
-                                                                            log::info!("[Bedrock Protocol] NetworkSettings enviado a {}", peer_addr);
-                                                                        }
-                                                                        Err(err) => {
-                                                                            log::warn!("[Bedrock Protocol] Error enviando NetworkSettings a {}: {:?}", peer_addr, err);
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    log::warn!(
-                                                                        "[Bedrock Protocol] Paquete 0x{:02x} ignorado de {}: NetworkSettings aún no enviado",
-                                                                        pkt_id,
-                                                                        peer_addr
-                                                                    );
-                                                                }
-                                                            } else {
-                                                                let comp_hdr = payload.get(1).copied().unwrap_or(0);
-                                                                log::info!(
-                                                                    "[Bedrock Protocol] Paquete post-NetworkSettings recibido de {} ({} bytes, comp_hdr=0x{:02x})",
-                                                                    peer_addr,
-                                                                    len,
-                                                                    comp_hdr
-                                                                );
-                                                            }
-                                                        } else {
-                                                            let raw_id = payload.first().copied().unwrap_or(0);
-                                                            if !has_sent_network_settings {
-                                                                log::warn!(
-                                                                    "[Bedrock Protocol] Paquete 0x{:02x} ignorado de {}: NetworkSettings aún no enviado",
-                                                                    raw_id,
-                                                                    peer_addr
-                                                                );
-                                                            } else {
-                                                                log::info!("[Bedrock Protocol] Recibido paquete de Minecraft: 0x{:02x}", raw_id);
-                                                            }
-                                                        }
-                                                    }
-                                                    Some(Err(err)) => {
-                                                        log::warn!("[Bedrock RX] Error leyendo stream RakNet de {}: {:?}", peer_addr, err);
-                                                        break;
-                                                    }
-                                                    None => {
-                                                        log::info!("[Bedrock RX] Cliente {} desconectado", peer_addr);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                            None => {
-                                log::warn!("Listener RakNet cerrado inesperadamente");
-                                break;
-                            }
+        loop {
+            tokio::select! {
+                _ = task_cancel.cancelled() => {
+                    log::info!("Servidor NetherNet cancelado por CancellationToken");
+                    break;
+                }
+                accept_res = tcp_listener.accept() => {
+                    match accept_res {
+                        Ok((stream, peer_addr)) => {
+                            let peers_clone = Arc::clone(&peers);
+                            let udp_clone = Arc::clone(&udp_shared);
+                            let key_clone = host_key.clone();
+                            let motd_clone = motd_string.clone();
+                            tokio::spawn(async move {
+                                handle_http_signaling_stream(
+                                    stream,
+                                    peer_addr,
+                                    effective_port,
+                                    net_id,
+                                    motd_clone,
+                                    key_clone,
+                                    peers_clone,
+                                    udp_clone,
+                                ).await;
+                            });
+                        }
+                        Err(err) => {
+                            log::warn!("Error aceptando conexión TCP de señalización HTTP: {}", err);
                         }
                     }
                 }
+                recv_res = udp_shared.recv_from(&mut udp_buf) => {
+                    if let Ok((len, src_addr)) = recv_res {
+                        let pkt = &udp_buf[..len];
+                        // Compatibilidad diagnóstica con Unconnected Ping UDP (0x01) para el escáner pinglan
+                        if len >= 25 && (pkt[0] == 0x01 || pkt[0] == 0x02) && pkt[9..25] == RAKNET_MAGIC {
+                            let motd_bytes = motd_string.as_bytes();
+                            let mut pong = Vec::with_capacity(35 + motd_bytes.len());
+                            pong.push(0x1c);
+                            pong.extend_from_slice(&pkt[1..9]);
+                            pong.extend_from_slice(&net_id.to_be_bytes());
+                            pong.extend_from_slice(&RAKNET_MAGIC);
+                            pong.extend_from_slice(&(motd_bytes.len() as u16).to_be_bytes());
+                            pong.extend_from_slice(motd_bytes);
+                            let _ = udp_shared.send_to(&pong, src_addr).await;
+                            continue;
+                        }
+
+                        // Encaminar datagrama WebRTC (STUN / ICE / DTLS / SCTP) a las conexiones activas
+                        let now = Instant::now();
+                        let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+                        if let Ok(mut guard) = peers.lock() {
+                            let mut closed_ids = Vec::new();
+                            for (&sid, peer) in guard.iter_mut() {
+                                peer.conn.handle_datagram(now, src_addr, pkt);
+                                while let Some(ev) = poll_connection_event(&mut peer.conn) {
+                                    match ev {
+                                        Event::Connected => {
+                                            peer.remote_addr = src_addr;
+                                            log::info!(
+                                                "Conexión WebRTC establecida con {} (session={}). Esperando RequestNetworkSettings...",
+                                                src_addr,
+                                                sid
+                                            );
+                                        }
+                                        Event::Data(payload) => {
+                                            handle_bedrock_session_data(
+                                                &mut peer.conn,
+                                                &mut peer.session,
+                                                &mut peer.has_sent_network_settings,
+                                                peer.remote_addr,
+                                                &payload,
+                                                now,
+                                            );
+                                        }
+                                        Event::Disconnected(reason) => {
+                                            log::info!(
+                                                "Conexión WebRTC cerrada con {} (session={}): {}",
+                                                peer.remote_addr,
+                                                sid,
+                                                reason
+                                            );
+                                            closed_ids.push(sid);
+                                        }
+                                    }
+                                }
+                                while let Some(tx) = peer.conn.poll_transmit() {
+                                    outbound.push((tx.destination, tx.contents));
+                                }
+                            }
+                            for sid in closed_ids {
+                                guard.remove(&sid);
+                            }
+                        }
+                        for (dest, data) in outbound {
+                            let _ = udp_shared.send_to(&data, dest).await;
+                        }
+                    }
+                }
+                _ = rtc_tick.tick() => {
+                    let now = Instant::now();
+                    let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+                    if let Ok(mut guard) = peers.lock() {
+                        let mut closed_ids = Vec::new();
+                        for (&sid, peer) in guard.iter_mut() {
+                            peer.conn.handle_timeout(now);
+                            while let Some(ev) = poll_connection_event(&mut peer.conn) {
+                                match ev {
+                                    Event::Connected => {
+                                        log::info!(
+                                            "Conexión WebRTC establecida con {} (session={})",
+                                            peer.remote_addr,
+                                            sid
+                                        );
+                                    }
+                                    Event::Data(payload) => {
+                                        handle_bedrock_session_data(
+                                            &mut peer.conn,
+                                            &mut peer.session,
+                                            &mut peer.has_sent_network_settings,
+                                            peer.remote_addr,
+                                            &payload,
+                                            now,
+                                        );
+                                    }
+                                    Event::Disconnected(reason) => {
+                                        log::info!(
+                                            "Conexión WebRTC cerrada con {} (session={}): {}",
+                                            peer.remote_addr,
+                                            sid,
+                                            reason
+                                        );
+                                        closed_ids.push(sid);
+                                    }
+                                }
+                            }
+                            while let Some(tx) = peer.conn.poll_transmit() {
+                                outbound.push((tx.destination, tx.contents));
+                            }
+                        }
+                        for sid in closed_ids {
+                            guard.remove(&sid);
+                        }
+                    }
+                    for (dest, data) in outbound {
+                        let _ = udp_shared.send_to(&data, dest).await;
+                    }
+                }
             }
-        });
-
-        format!("engine=running raknet={}", actual_addr)
-    };
-
-    #[cfg(not(feature = "transport-raknet"))]
-    let bound_summary: String = {
-        let _ = is_bedrock_profile;
-        rt.spawn(async move {
-            log::info!(
-                "BedrockDroid RS listo (sin feature transport-raknet): dir={} max_ram={}MB proto={}",
-                dir_owned,
-                max_ram_mb,
-                TARGET_BEDROCK_PROTOCOL
-            );
-            task_cancel.cancelled().await;
-            log::info!("Runtime Tokio cancelado ordenadamente");
-        });
-        "engine=running raknet=disabled".to_string()
-    };
+        }
+    });
 
     *guard = Some(ServerHandle { rt, cancel });
-    Ok(bound_summary)
+    Ok(format!("engine=running nethernet={}", actual_addr))
 }
 
 pub fn stop_async_engine() {
@@ -430,9 +948,9 @@ pub fn stop_async_engine() {
 
     if let Some(handle) = taken {
         handle.cancel.cancel();
-        // Límite de 2 segundos para asegurar liberación completa del socket UDP entre reinicios rápidos.
+        // Límite de 2 segundos para asegurar liberación completa de los sockets TCP/UDP entre reinicios rápidos.
         handle.rt.shutdown_timeout(Duration::from_secs(2));
-        log::info!("bedrock_android_core runtime detenido y socket RakNet liberado");
+        log::info!("bedrock_android_core runtime detenido y sockets NetherNet liberados");
     }
 }
 
@@ -443,66 +961,70 @@ pub fn is_engine_running() -> bool {
         .unwrap_or(false)
 }
 
-/// Envía un paquete UDP Unconnected Ping (0x01) a 127.0.0.1:<port> con el Magic Number de RakNet
-/// y un Client GUID aleatorio, esperando Unconnected Pong (0x1c) con un timeout de 2 segundos.
+/// Verifica que el servidor de señalización HTTP NetherNet responde en `127.0.0.1:<port>` (TCP `GET /v1/join`).
 pub fn send_ping_command(bedrock_port: u16) -> String {
-    use std::hash::BuildHasher;
-    use std::net::UdpSocket as StdUdpSocket;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-    const RAKNET_MAGIC: [u8; 16] = [
-        0x00, 0xFF, 0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFE, 0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34, 0x56,
-        0x78,
-    ];
-
     let target_port = if bedrock_port == 0 { 19132 } else { bedrock_port };
-    let target_addr = format!("127.0.0.1:{}", target_port);
+    let target_addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), target_port);
+    let host_header = format!("127.0.0.1:{}", target_port);
 
-    let socket = match StdUdpSocket::bind("127.0.0.1:0") {
+    let started = Instant::now();
+    let mut stream = match StdTcpStream::connect_timeout(&target_addr, Duration::from_secs(2)) {
         Ok(s) => s,
         Err(e) => {
-            let msg = format!("[PING] Error creando socket UDP local: {}", e);
+            let msg = format!(
+                "[PING] Sin respuesta del servidor (timeout) en TCP {}: {}",
+                target_addr, e
+            );
             log::warn!("{}", msg);
             return msg;
         }
     };
 
-    let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
-    let ping_time: u64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(1);
-
-    let raw_guid = std::collections::hash_map::RandomState::new().hash_one(ping_time) as u64;
-    let client_guid: u64 = (raw_guid & (i64::MAX as u64)).max(1);
-
-    let mut packet = Vec::with_capacity(33);
-    packet.push(0x01u8); // Unconnected Ping
-    packet.extend_from_slice(&ping_time.to_be_bytes());
-    packet.extend_from_slice(&RAKNET_MAGIC);
-    packet.extend_from_slice(&client_guid.to_be_bytes());
-
-    let started = Instant::now();
-    if let Err(e) = socket.send_to(&packet, &target_addr) {
-        let msg = format!("[PING] Error enviando Unconnected Ping a {}: {}", target_addr, e);
+    let req_bytes = http::probe_request(&host_header);
+    if let Err(e) = stream.write_all(&req_bytes) {
+        let msg = format!(
+            "[PING] Error enviando petición HTTP GET {} a {}: {}",
+            PROBE_PATH, target_addr, e
+        );
         log::warn!("{}", msg);
         return msg;
     }
 
-    let mut resp = [0u8; 2048];
-    match socket.recv_from(&mut resp) {
-        Ok((n, _from)) if n > 35 && resp[0] == 0x1c && resp[17..33] == RAKNET_MAGIC => {
-            let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
-            let motd_len = u16::from_be_bytes([resp[33], resp[34]]) as usize;
-            let end = 35usize.saturating_add(motd_len).min(n);
-            let motd = String::from_utf8_lossy(&resp[35..end]).to_string();
-            log::info!("[PING] Servidor responde ({:.2} ms): {}", rtt_ms, motd);
-            format!("[PING] Servidor responde ({:.2} ms): {}", rtt_ms, motd)
+    let mut resp_buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 512];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                resp_buf.extend_from_slice(&chunk[..n]);
+                if http::response_complete(&resp_buf) {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
-        Ok((n, from)) => {
-            log::warn!("[PING] Respuesta inesperada desde {} ({} bytes, id=0x{:02x})", from, n, resp[0]);
+    }
+
+    match http::parse_response(&resp_buf) {
+        Ok((200, body)) => {
+            let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let body_str = String::from_utf8_lossy(body).to_string();
+            log::info!(
+                "[PING] Servidor responde ({:.2} ms, NetherNet HTTP /v1/join): {}",
+                rtt_ms,
+                body_str
+            );
+            format!("[PING] Servidor responde ({:.2} ms): {}", rtt_ms, body_str)
+        }
+        Ok((status, _)) => {
+            let msg = format!(
+                "[PING] Respuesta HTTP inesperada (status={}) en {}",
+                status, target_addr
+            );
+            log::warn!("{}", msg);
             "[PING] Sin respuesta del servidor (timeout).".to_string()
         }
         Err(_) => {
@@ -515,7 +1037,6 @@ pub fn send_ping_command(bedrock_port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::UdpSocket as StdUdpSocket;
 
     #[test]
     fn motd_advertisement_matches_minecraft_bedrock_format() {
@@ -535,7 +1056,6 @@ mod tests {
 
     #[test]
     fn decodes_bedrock_batch_request_network_settings() {
-        // 0xFE (Bedrock Game Packet Batch) + varint len (5) + varint pkt_id (0xc1 = RequestNetworkSettings) + proto 2225
         let sample = [0xfe, 0x05, 0xc1, 0x01, 0x00, 0x00, 0x08, 0xb1];
         assert_eq!(decode_bedrock_batch_packet_id(&sample), Some(0xc1));
         assert_eq!(decode_bedrock_batch_packet_id(&[0x01, 0x02]), None);
@@ -553,6 +1073,32 @@ mod tests {
     }
 
     #[test]
+    fn acacia_session_encodes_network_settings_and_login_handshake() {
+        let key = SigningKey::random(&mut OsRng);
+        let mut session = ServerConnection::nethernet(key);
+
+        let settings = NetworkSettings {
+            compression_threshold: 256,
+            compression_algorithm: NetworkSettingsCompressionAlgorithm::Deflate,
+            client_throttle_enabled: false,
+            client_throttle_threshold: 0,
+            client_throttle_scalar: 0.0,
+        };
+        let mut out = BytesMut::new();
+        encode_packet(&settings, &mut out);
+        let batch = session.encode(&[out.freeze()]);
+        assert!(!batch.is_empty());
+
+        session
+            .start_compression(&settings)
+            .expect("start_compression should succeed");
+
+        let hs = session.plaintext_handshake();
+        let hs_batch = session.encode(&[hs]);
+        assert!(!hs_batch.is_empty());
+    }
+
+    #[test]
     fn runtime_engine_starts_and_stops_cleanly() {
         let cfg = LowLatencyConfig {
             local_fast_path: true,
@@ -563,41 +1109,20 @@ mod tests {
         };
         let status = start_async_engine("/tmp/bedrock_test", "BedrockDroid RS", "BEDROCK", 0, 8192, cfg)
             .expect("start failed");
-        assert!(status.starts_with("engine=running raknet=0.0.0.0:"));
+        assert!(status.starts_with("engine=running nethernet=0.0.0.0:"));
         assert!(is_engine_running());
 
-        if let Some(addr_str) = status.split("raknet=").nth(1) {
+        if let Some(addr_str) = status.split("nethernet=").nth(1) {
             let port: u16 = addr_str
                 .rsplit(':')
                 .next()
                 .and_then(|p| p.parse().ok())
                 .expect("valid bound port");
+
+            // Verificar que el servidor de señalización HTTP NetherNet responde en TCP /v1/join
             let ping_res = send_ping_command(port);
             assert!(ping_res.contains("[PING] Servidor responde"));
             assert!(ping_res.contains("MCPE;BedrockDroid RS;"));
-
-            let client = StdUdpSocket::bind("127.0.0.1:0").expect("client bind");
-            client
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("set_read_timeout");
-            let mut ping = Vec::with_capacity(33);
-            ping.push(0x01u8);
-            ping.extend_from_slice(&12345678u64.to_be_bytes());
-            ping.extend_from_slice(&[
-                0x00, 0xFF, 0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFE, 0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34,
-                0x56, 0x78,
-            ]);
-            ping.extend_from_slice(&999u64.to_be_bytes());
-            let target_local = format!("127.0.0.1:{}", port);
-            client.send_to(&ping, &target_local).expect("send ping");
-
-            let mut resp = [0u8; 2048];
-            let (n, _) = client.recv_from(&mut resp).expect("recv pong");
-            assert_eq!(resp[0], 0x1c);
-            assert!(n > 35);
-            let motd_len = u16::from_be_bytes([resp[33], resp[34]]) as usize;
-            let motd = std::str::from_utf8(&resp[35..35 + motd_len]).expect("utf8 motd");
-            assert!(motd.starts_with("MCPE;BedrockDroid RS;"));
         }
 
         stop_async_engine();

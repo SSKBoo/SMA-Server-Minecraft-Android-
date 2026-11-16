@@ -2,15 +2,15 @@
 name = "bedrock_android_core"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.98"
 
 [lib]
 name = "bedrock_android_core"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Fase 2: protocol-core + transport-raknet (tokio-raknet 0.2) activos por defecto sin arrastrar OpenSSL/C
-default = ["protocol-core", "transport-raknet"]
+# Fase 3: protocol-core + transport-nethernet (acacia-nethernet 0.1.0 + acacia-session 0.1.0) activos por defecto
+default = ["protocol-core", "transport-nethernet"]
 protocol-core = [
     "dep:bedrock",
     "bedrock/protocol",
@@ -20,18 +20,23 @@ protocol-core = [
 ]
 auth-xbl = ["protocol-core", "bedrock/auth-ureq"]
 world-level = ["protocol-core", "bedrock/level"]
-transport-raknet = ["dep:tokio-raknet"]
-full-server = ["protocol-core", "auth-xbl", "world-level", "transport-raknet"]
+transport-nethernet = []
+full-server = ["protocol-core", "auth-xbl", "world-level", "transport-nethernet"]
 
 [dependencies]
 # Protocolo y tipos core de Minecraft Bedrock (rev fijado para reproducibilidad CI)
 bedrock = { git = "https://github.com/bedrock-crustaceans/bedrock-rs.git", rev = "a730b6bbf28c80dee37ff82d2275f1db9078c03e", default-features = false, optional = true }
 
-# Runtime asíncrono multi-hilo para RakNet y Game Loop
-tokio = { version = "1.45", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+# Transporte NetherNet (WebRTC ICE/DTLS/SCTP + señalización HTTP /v1/join) y capa de sesión Bedrock 26.60+
+acacia-nethernet = "0.1.0"
+acacia-session = "0.1.0"
+p384 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Runtime asíncrono multi-hilo para NetherNet, señalización HTTP y Game Loop
+tokio = { version = "1.45", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 bytes = "1.8"
-tokio-raknet = { version = "0.2", optional = true }
 
 # Puente JNI, red nativa, serialización y logging Android
 jni = "0.21"
@@ -46,6 +51,17 @@ flate2 = { version = "1.0", default-features = false, features = ["rust_backend"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.14"
+
+# Optimización de criptografía P-384 / AES en modo debug para que cargo test ejecute WebRTC/DTLS sin demoras
+[profile.dev.package]
+p384 = { opt-level = 3 }
+primeorder = { opt-level = 3 }
+elliptic-curve = { opt-level = 3 }
+ecdsa = { opt-level = 3 }
+crypto-bigint = { opt-level = 3 }
+sha2 = { opt-level = 3 }
+aes = { opt-level = 3 }
+ctr = { opt-level = 3 }
 
 [profile.release]
 opt-level = 3
