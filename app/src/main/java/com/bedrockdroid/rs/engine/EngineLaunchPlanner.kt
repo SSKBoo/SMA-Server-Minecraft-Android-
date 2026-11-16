@@ -3,7 +3,9 @@ package com.bedrockdroid.rs.engine
 import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
+import android.net.TrafficStats
 import android.os.Build
+import android.os.Process
 import android.os.StatFs
 import androidx.core.content.ContextCompat
 import com.bedrockdroid.rs.model.AndroidLauncherConfig
@@ -18,8 +20,11 @@ import com.bedrockdroid.rs.nativebridge.RustCoreBridge
 import com.bedrockdroid.rs.service.ServerForegroundService
 import org.json.JSONObject
 import java.io.File
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.HttpURLConnection
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.URL
 
@@ -201,6 +206,8 @@ object EngineLaunchPlanner {
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  ./launch bedrock | java | hybrid -> Inicia el carril elegido")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  stop                             -> Detiene ForegroundService")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  ping | test                      -> Envía Unconnected Ping RakNet a 127.0.0.1")
+                ServerRuntimeState.appendLog(LogStream.STDOUT, "  pinglan                          -> Ping UDP Kotlin (sin JNI) a 127.0.0.1, LAN y ::1")
+                ServerRuntimeState.appendLog(LogStream.STDOUT, "  sockets | ss | netstat           -> Inspecciona sockets UDP/UID sin JNI")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  netcheck | upnp status           -> Prueba LAN, loopback y UPnP")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  versions                         -> Lista rutas en /files/engines")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  convert hybrid                   -> Crea perfil Híbrido aparte")
@@ -215,6 +222,12 @@ object EngineLaunchPlanner {
                     LogStream.WARN
                 }
                 ServerRuntimeState.appendLog(stream, pingResponse, "RustPing")
+            }
+            lower == "pinglan" -> {
+                inspectUdpTargetsFromKotlin(cfg.bedrockPort)
+            }
+            lower == "sockets" || lower == "ss" || lower == "netstat" -> {
+                inspectAndroidUdpSockets(cfg.bedrockPort)
             }
             lower == "stop" -> {
                 context.stopService(Intent(context, ServerForegroundService::class.java))
@@ -277,6 +290,119 @@ object EngineLaunchPlanner {
                 ServerRuntimeState.appendLog(
                     LogStream.ERR,
                     "Comando no reconocido: '$cmd'. Escribe 'help'."
+                )
+            }
+        }
+    }
+
+    private fun inspectAndroidUdpSockets(bedrockPort: Int) {
+        val port = if (bedrockPort <= 0) 19132 else bedrockPort
+        val hexPort = port.toString(16).uppercase().padStart(4, '0')
+        val uid = Process.myUid()
+        val rxPackets = TrafficStats.getUidRxPackets(uid)
+        val rxBytes = TrafficStats.getUidRxBytes(uid)
+        val txPackets = TrafficStats.getUidTxPackets(uid)
+        val txBytes = TrafficStats.getUidTxBytes(uid)
+        ServerRuntimeState.appendLog(
+            LogStream.NET,
+            "[Sockets UID=$uid] TrafficStats Rx=${rxPackets} pkts (${rxBytes} B) · Tx=${txPackets} pkts (${txBytes} B)"
+        )
+
+        listOf("/proc/self/net/udp", "/proc/self/net/udp6").forEach { path ->
+            runCatching {
+                val lines = File(path).readLines()
+                val matches = lines.filter { it.contains(":$hexPort ", ignoreCase = true) }
+                if (matches.isEmpty()) {
+                    ServerRuntimeState.appendLog(LogStream.WARN, "[$path] Sin entradas para puerto :$port (0x$hexPort)")
+                } else {
+                    matches.forEach { line ->
+                        ServerRuntimeState.appendLog(LogStream.NET, "[$path] ${line.trim()}")
+                    }
+                }
+            }.onFailure { err ->
+                ServerRuntimeState.appendLog(
+                    LogStream.WARN,
+                    "[$path] Bloqueado por SELinux/permisos (${err.javaClass.simpleName}): ${err.message}"
+                )
+            }
+        }
+
+        runCatching {
+            val snmp = File("/proc/self/net/snmp").readLines()
+            snmp.filter { it.startsWith("Udp:") }.forEach { line ->
+                ServerRuntimeState.appendLog(LogStream.STDOUT, "[/proc/self/net/snmp] $line")
+            }
+        }
+
+        listOf(arrayOf("ss", "-anu"), arrayOf("netstat", "-anu")).forEach { cmd ->
+            runCatching {
+                val proc = ProcessBuilder(*cmd).redirectErrorStream(true).start()
+                val out = proc.inputStream.bufferedReader().readLines()
+                val filtered = out.filter { it.contains(":$port") || it.contains("Local") || it.contains("State") }
+                if (filtered.isNotEmpty()) {
+                    filtered.take(10).forEach { line ->
+                        ServerRuntimeState.appendLog(LogStream.NET, "[${cmd[0]}] $line")
+                    }
+                } else {
+                    ServerRuntimeState.appendLog(
+                        LogStream.WARN,
+                        "[${cmd[0]}] Sin filas visibles para :$port (Android 10+ suele restringir netlink/proc_net a apps no-root)"
+                    )
+                }
+            }.onFailure { err ->
+                ServerRuntimeState.appendLog(
+                    LogStream.WARN,
+                    "[${cmd[0]}] No disponible (${err.javaClass.simpleName})"
+                )
+            }
+        }
+    }
+
+    private fun inspectUdpTargetsFromKotlin(bedrockPort: Int) {
+        val port = if (bedrockPort <= 0) 19132 else bedrockPort
+        val lanIp = findLocalLanIpv4()
+        val targets = buildList {
+            add("127.0.0.1")
+            if (lanIp != null && lanIp != "127.0.0.1") add(lanIp)
+            add("::1")
+        }
+        val magic = byteArrayOf(
+            0x00, 0xFF.toByte(), 0xFF.toByte(), 0x00,
+            0xFE.toByte(), 0xFE.toByte(), 0xFE.toByte(), 0xFE.toByte(),
+            0xFD.toByte(), 0xFD.toByte(), 0xFD.toByte(), 0xFD.toByte(),
+            0x12, 0x34, 0x56, 0x78
+        )
+        val ping = ByteArray(33).apply {
+            this[0] = 0x01
+            val ts = System.currentTimeMillis()
+            for (i in 0 until 8) this[1 + i] = ((ts ushr (56 - i * 8)) and 0xFF).toByte()
+            System.arraycopy(magic, 0, this, 9, 16)
+            for (i in 0 until 8) this[25 + i] = ((0x4B4F544C494E01L ushr (56 - i * 8)) and 0xFF).toByte()
+        }
+
+        targets.forEach { host ->
+            runCatching {
+                DatagramSocket().use { sock ->
+                    sock.soTimeout = 1500
+                    val addr = InetAddress.getByName(host)
+                    val startNs = System.nanoTime()
+                    sock.send(DatagramPacket(ping, ping.size, addr, port))
+                    val recvBuf = ByteArray(2048)
+                    val resp = DatagramPacket(recvBuf, recvBuf.size)
+                    sock.receive(resp)
+                    val ms = (System.nanoTime() - startNs) / 1_000_000.0
+                    val motdLen = if (resp.length > 35) ((recvBuf[33].toInt() and 0xFF) shl 8) or (recvBuf[34].toInt() and 0xFF) else 0
+                    val end = (35 + motdLen).coerceAtMost(resp.length)
+                    val motd = if (end > 35) String(recvBuf, 35, end - 35, Charsets.UTF_8) else "id=0x${(recvBuf[0].toInt() and 0xFF).toString(16)}"
+                    ServerRuntimeState.appendLog(
+                        LogStream.NET,
+                        "[PingKotlin -> $host:$port] OK en ${"%.2f".format(ms)} ms · $motd"
+                    )
+                }
+            }.onFailure { err ->
+                ServerRuntimeState.appendLog(
+                    LogStream.WARN,
+                    "[PingKotlin -> $host:$port] Sin respuesta (${err.javaClass.simpleName}: ${err.message})"
                 )
             }
         }

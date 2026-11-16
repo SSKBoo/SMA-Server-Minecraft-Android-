@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
@@ -84,6 +85,29 @@ fun StatusCard(
 
     val effectiveHardware = liveHardware ?: hardwareReport
     val effectiveNetwork = liveNetwork ?: networkReport
+    var showLoopbackInfoDialog by remember { mutableStateOf(false) }
+
+    if (showLoopbackInfoDialog) {
+        AlertDialog(
+            onDismissRequest = { showLoopbackInfoDialog = false },
+            title = {
+                Text(
+                    text = "Conexión en el mismo teléfono (Android)",
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Text(
+                    "Si estás usando Minecraft en este mismo teléfono y no aparece el servidor, es una limitación de red de Android. Prueba a conectarte desde otro dispositivo en la misma red Wi-Fi usando la IP LAN (ej. 192.168.1.84:19132)."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showLoopbackInfoDialog = false }) {
+                    Text("Entendido")
+                }
+            }
+        )
+    }
 
     ElevatedCard(
         modifier = modifier,
@@ -190,13 +214,25 @@ fun StatusCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "127.0.0.1:$port",
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFF0F172A)
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.clickable { showLoopbackInfoDialog = true }
+                ) {
+                    Text(
+                        text = "127.0.0.1:$port",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF0F172A)
+                    )
+                    Icon(
+                        imageVector = Icons.Default.Info,
+                        contentDescription = "Aviso sobre loopback en Android",
+                        tint = Color(0xFF0284C7),
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
 
                 val hwSnapshot = effectiveHardware
                 if (hwSnapshot != null) {
@@ -667,7 +703,7 @@ fun ConsoleScreen(
             }
 
             if (!isMaximized) {
-                val quickCmds = listOf("./launch bedrock", "./launch java", "./launch hybrid", "ping", "netcheck", "soc", "stop", "help")
+                val quickCmds = listOf("./launch bedrock", "./launch java", "./launch hybrid", "ping", "netcheck", "pinglan", "sockets", "soc", "stop", "help")
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
