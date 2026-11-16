@@ -178,12 +178,13 @@ pub fn start_async_engine(
             .local_addr()
             .map_err(|e| format!("public_sock local_addr error: {}", e))?;
         let advertised_motd = motd_string.clone();
+        let lane_owned = lane_name.to_string();
 
         rt.spawn(async move {
             log::info!(
                 "BedrockDroid RS Fase 2 listo: dir={} lane={} target={} motd_ver={} proto={} fast_path={}",
                 dir_owned,
-                lane_name,
+                lane_owned,
                 TARGET_BEDROCK_VERSION,
                 MOTD_ADVERTISED_VERSION,
                 TARGET_BEDROCK_PROTOCOL,
