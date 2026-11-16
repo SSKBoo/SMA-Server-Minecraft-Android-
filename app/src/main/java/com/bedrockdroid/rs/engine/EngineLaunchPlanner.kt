@@ -194,11 +194,21 @@ object EngineLaunchPlanner {
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "Comandos disponibles:")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  ./launch bedrock | java | hybrid -> Inicia el carril elegido")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  stop                             -> Detiene ForegroundService")
+                ServerRuntimeState.appendLog(LogStream.STDOUT, "  ping | test                      -> Envía Unconnected Ping RakNet a 127.0.0.1")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  netcheck | upnp status           -> Prueba LAN, loopback y UPnP")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  versions                         -> Lista rutas en /files/engines")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  convert hybrid                   -> Crea perfil Híbrido aparte")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  soc                              -> Lee topología ARM64 vía JNI")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  clear                            -> Limpia la consola")
+            }
+            lower == "ping" || lower == "test" -> {
+                val pingResponse = RustCoreBridge.sendPingCommandSafe(cfg.bedrockPort)
+                val stream = if (pingResponse.contains("responde", ignoreCase = true)) {
+                    LogStream.NET
+                } else {
+                    LogStream.WARN
+                }
+                ServerRuntimeState.appendLog(stream, pingResponse, "RustPing")
             }
             lower == "stop" -> {
                 context.stopService(Intent(context, ServerForegroundService::class.java))

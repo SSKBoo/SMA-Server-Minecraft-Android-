@@ -120,6 +120,22 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_read
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_sendPingCommand(
+    env: JNIEnv,
+    _class: JClass,
+    bedrock_port: jint,
+) -> jstring {
+    runtime::init_android_logging();
+    let udp_port = if bedrock_port <= 0 || bedrock_port > 65535 {
+        19132
+    } else {
+        bedrock_port as u16
+    };
+    let result = runtime::send_ping_command(udp_port);
+    into_jstring_or_null(&env, result)
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_shutdownRuntime(
     _env: JNIEnv,
     _class: JClass,

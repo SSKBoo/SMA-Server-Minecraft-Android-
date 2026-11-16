@@ -666,7 +666,7 @@ fun ConsoleScreen(
             }
 
             if (!isMaximized) {
-                val quickCmds = listOf("./launch bedrock", "./launch java", "./launch hybrid", "netcheck", "soc", "stop", "help")
+                val quickCmds = listOf("./launch bedrock", "./launch java", "./launch hybrid", "ping", "netcheck", "soc", "stop", "help")
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()

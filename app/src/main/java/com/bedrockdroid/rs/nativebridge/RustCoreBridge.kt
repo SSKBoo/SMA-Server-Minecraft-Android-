@@ -81,6 +81,17 @@ object RustCoreBridge {
         }
     }
 
+    fun sendPingCommandSafe(bedrockPort: Int = 19132): String {
+        if (!nativeLoaded) {
+            return "[PING] JNI no disponible (${loadError ?: "librería nativa no cargada"})"
+        }
+        return try {
+            sendPingCommand(bedrockPort)
+        } catch (t: Throwable) {
+            "[PING] Error JNI sendPingCommand: ${t.javaClass.simpleName}: ${t.message}"
+        }
+    }
+
     fun shutdownRuntimeSafe() {
         if (!nativeLoaded) return
         try {
@@ -113,6 +124,8 @@ object RustCoreBridge {
     ): String
 
     external fun readSoCTopologyJson(): String
+
+    external fun sendPingCommand(bedrockPort: Int): String
 
     external fun shutdownRuntime()
 }

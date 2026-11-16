@@ -383,6 +383,75 @@ pub fn is_engine_running() -> bool {
         .unwrap_or(false)
 }
 
+/// Envía un paquete UDP Unconnected Ping (0x01) a 127.0.0.1:<port> con el Magic Number de RakNet
+/// y un Client GUID aleatorio, esperando Unconnected Pong (0x1c) con un timeout de 2 segundos.
+pub fn send_ping_command(bedrock_port: u16) -> String {
+    use std::hash::BuildHasher;
+    use std::net::UdpSocket as StdUdpSocket;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    const RAKNET_MAGIC: [u8; 16] = [
+        0x00, 0xFF, 0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFE, 0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34, 0x56,
+        0x78,
+    ];
+
+    let target_port = if bedrock_port == 0 { 19132 } else { bedrock_port };
+    let target_addr = format!("127.0.0.1:{}", target_port);
+
+    let socket = match StdUdpSocket::bind("127.0.0.1:0") {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("[PING] Error creando socket UDP local: {}", e);
+            log::warn!("{}", msg);
+            return msg;
+        }
+    };
+
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
+
+    let ping_time: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1);
+
+    let raw_guid = std::collections::hash_map::RandomState::new().hash_one(ping_time) as u64;
+    let client_guid: u64 = (raw_guid & (i64::MAX as u64)).max(1);
+
+    let mut packet = Vec::with_capacity(33);
+    packet.push(0x01u8); // Unconnected Ping
+    packet.extend_from_slice(&ping_time.to_be_bytes());
+    packet.extend_from_slice(&RAKNET_MAGIC);
+    packet.extend_from_slice(&client_guid.to_be_bytes());
+
+    let started = Instant::now();
+    if let Err(e) = socket.send_to(&packet, &target_addr) {
+        let msg = format!("[PING] Error enviando Unconnected Ping a {}: {}", target_addr, e);
+        log::warn!("{}", msg);
+        return msg;
+    }
+
+    let mut resp = [0u8; 2048];
+    match socket.recv_from(&mut resp) {
+        Ok((n, _from)) if n > 35 && resp[0] == 0x1c && resp[17..33] == RAKNET_MAGIC => {
+            let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let motd_len = u16::from_be_bytes([resp[33], resp[34]]) as usize;
+            let end = 35usize.saturating_add(motd_len).min(n);
+            let motd = String::from_utf8_lossy(&resp[35..end]).to_string();
+            log::info!("[PING] Servidor responde ({:.2} ms): {}", rtt_ms, motd);
+            format!("[PING] Servidor responde ({:.2} ms): {}", rtt_ms, motd)
+        }
+        Ok((n, from)) => {
+            log::warn!("[PING] Respuesta inesperada desde {} ({} bytes, id=0x{:02x})", from, n, resp[0]);
+            "[PING] Sin respuesta del servidor (timeout).".to_string()
+        }
+        Err(_) => {
+            log::warn!("[PING] Sin respuesta del servidor (timeout).");
+            "[PING] Sin respuesta del servidor (timeout).".to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +488,15 @@ mod tests {
         assert!(is_engine_running());
 
         if let Some(addr_str) = status.split("raknet=").nth(1) {
+            let port: u16 = addr_str
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .expect("valid bound port");
+            let ping_res = send_ping_command(port);
+            assert!(ping_res.contains("[PING] Servidor responde"));
+            assert!(ping_res.contains("MCPE;BedrockDroid RS;"));
+
             let client = StdUdpSocket::bind("127.0.0.1:0").expect("client bind");
             client
                 .set_read_timeout(Some(Duration::from_secs(2)))
