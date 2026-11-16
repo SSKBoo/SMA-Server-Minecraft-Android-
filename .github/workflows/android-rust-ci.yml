@@ -1,0 +1,78 @@
+name: BedrockDroid RS Android + Rust CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-android-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Configurar Android SDK y NDK 27.2.12479018
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018'
+
+      - name: Unificar variables NDK (27.2.12479018)
+        run: |
+          NDK_PATH="${{ env.ANDROID_HOME }}/ndk/27.2.12479018"
+          echo "ANDROID_NDK_HOME=${NDK_PATH}" >> $GITHUB_ENV
+          echo "ANDROID_NDK=${NDK_PATH}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=${NDK_PATH}" >> $GITHUB_ENV
+          echo "NDK_HOME=${NDK_PATH}" >> $GITHUB_ENV
+
+      - name: Configurar Rust Toolchain ARM64/ARMv7
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Cache de dependencias Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-core -> target
+
+      - name: Instalar cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Ejecutar tests unitarios del núcleo Rust
+        working-directory: rust-core
+        run: cargo test --lib
+
+      - name: Compilar librerías nativas .so con cargo-ndk
+        working-directory: rust-core
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: |
+          mkdir -p ../app/src/main/jniLibs
+          cargo ndk -t arm64-v8a -t armeabi-v7a -o ../app/src/main/jniLibs build --release
+
+      - name: Configurar Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Compilar APK (assembleDebug)
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publicar APK como artefacto descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: bedrockdroid-rs-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

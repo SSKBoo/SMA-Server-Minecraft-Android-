@@ -1,0 +1,54 @@
+[package]
+name = "bedrock_android_core"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.89"
+
+[lib]
+name = "bedrock_android_core"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Fase 1: Compilación modular sin inflar el binario .so en Android ni arrastrar auth-reqwest/OpenSSL
+default = ["protocol-core"]
+protocol-core = [
+    "dep:bedrock",
+    "bedrock/protocol",
+    "bedrock/protocol-v2225",
+    "bedrock/network",
+    "bedrock/network-tokio",
+]
+auth-xbl = ["protocol-core", "bedrock/auth-ureq"]
+world-level = ["protocol-core", "bedrock/level"]
+transport-raknet = ["dep:tokio-raknet"]
+full-server = ["protocol-core", "auth-xbl", "world-level", "transport-raknet"]
+
+[dependencies]
+# Protocolo y tipos core de Minecraft Bedrock (rev fijado para reproducibilidad CI)
+bedrock = { git = "https://github.com/bedrock-crustaceans/bedrock-rs.git", rev = "a730b6bbf28c80dee37ff82d2275f1db9078c03e", default-features = false, optional = true }
+
+# Runtime asíncrono multi-hilo para RakNet y Game Loop
+tokio = { version = "1.45", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+bytes = "1.8"
+tokio-raknet = { version = "0.2", optional = true }
+
+# Puente JNI, red nativa, serialización y logging Android
+jni = "0.21"
+socket2 = { version = "0.5", features = ["all"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+libc = "0.2"
+log = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
