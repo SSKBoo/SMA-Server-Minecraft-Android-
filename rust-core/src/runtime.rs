@@ -1,11 +1,8 @@
 use crate::net::low_latency::LowLatencyConfig;
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::collections::HashMap;
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 
@@ -174,41 +171,6 @@ pub fn init_android_logging() {
     });
 }
 
-fn bind_reusable_std_udp(addr: SocketAddr, only_v6: bool) -> Result<std::net::UdpSocket, String> {
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
-        .map_err(|e| format!("udp socket create error: {}", e))?;
-    if addr.is_ipv6() && only_v6 {
-        let _ = socket.set_only_v6(true);
-    }
-    socket
-        .set_reuse_address(true)
-        .map_err(|e| format!("udp SO_REUSEADDR error: {}", e))?;
-    let _ = socket.set_broadcast(true);
-    socket
-        .set_nonblocking(true)
-        .map_err(|e| format!("udp set_nonblocking error: {}", e))?;
-    socket
-        .bind(&SockAddr::from(addr))
-        .map_err(|e| format!("raknet bind {} error: {}", addr, e))?;
-    Ok(socket.into())
-}
-
-#[cfg(feature = "transport-raknet")]
-async fn recv_optional_v6(
-    sock: &Option<Arc<UdpSocket>>,
-    buf: &mut [u8],
-) -> std::io::Result<(usize, SocketAddr)> {
-    match sock {
-        Some(s) => s.recv_from(buf).await,
-        None => std::future::pending().await,
-    }
-}
-
 pub fn start_async_engine(
     data_dir: &str,
     server_name: &str,
@@ -232,7 +194,6 @@ pub fn start_async_engine(
     MAX_RUST_RAM_BYTES.store(budget_bytes, Ordering::Relaxed);
 
     let max_blocking = ((budget_mb / 1024).clamp(4, 32)) as usize;
-    let max_peer_relays = ((budget_mb / 64) as usize).clamp(32, 512);
 
     let rt = Builder::new_multi_thread()
         .worker_threads(4)
@@ -251,9 +212,10 @@ pub fn start_async_engine(
     #[cfg(feature = "transport-raknet")]
     let bound_summary: String = {
         let _ = is_bedrock_profile;
-        // En Android siempre escuchamos en 0.0.0.0 para aceptar tanto 127.0.0.1 como la IP LAN Wi-Fi (ej. 192.168.1.84)
-        let bind_ip = "0.0.0.0";
-        let bind_addr: SocketAddr = format!("{}:{}", bind_ip, bedrock_port)
+        // Bind directo de RaknetListener sin relay UDP intermedio:
+        // 0.0.0.0 acepta tanto 127.0.0.1 (Fast-Path local) como la IP Wi-Fi LAN (ej. 192.168.1.84).
+        // Si en algún dispositivo Android 0.0.0.0 no recibe desde wlan0, cambiar bind_ip a "[::]" (dual-stack).
+        let bind_addr: SocketAddr = format!("0.0.0.0:{}", bedrock_port)
             .parse()
             .map_err(|e| format!("invalid bind addr: {}", e))?;
 
@@ -266,46 +228,19 @@ pub fn start_async_engine(
             ..RaknetListenerConfig::default()
         };
 
-        let std_public_udp = bind_reusable_std_udp(bind_addr, false)?;
-        let (public_sock, public_sock_v6, mut listener, internal_addr) = rt.block_on(async move {
-            let public_sock = Arc::new(
-                UdpSocket::from_std(std_public_udp)
-                    .map_err(|e| format!("tokio UdpSocket::from_std error: {}", e))?,
-            );
-            let actual_port = public_sock
-                .local_addr()
-                .map(|a| a.port())
-                .unwrap_or(bedrock_port);
-            let v6_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, actual_port, 0, 0));
-            let public_sock_v6 = bind_reusable_std_udp(v6_addr, true)
-                .ok()
-                .and_then(|std_v6| UdpSocket::from_std(std_v6).ok())
-                .map(Arc::new);
-
-            let internal_bind: SocketAddr = "127.0.0.1:0"
-                .parse()
-                .map_err(|e| format!("invalid internal bind addr: {}", e))?;
-            let listener = RaknetListener::bind_with_config(internal_bind, raknet_cfg)
+        let mut listener = rt.block_on(async move {
+            RaknetListener::bind_with_config(bind_addr, raknet_cfg)
                 .await
-                .map_err(|e| format!("raknet listener bind error: {}", e))?;
-            let internal_addr = listener.local_addr();
-            Ok::<_, String>((public_sock, public_sock_v6, listener, internal_addr))
+                .map_err(|e| format!("raknet listener bind {} error: {}", bind_addr, e))
         })?;
 
-        let actual_addr = public_sock
-            .local_addr()
-            .map_err(|e| format!("public_sock local_addr error: {}", e))?;
-        let v6_bound_label = public_sock_v6
-            .as_ref()
-            .and_then(|s| s.local_addr().ok())
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "disabled".to_string());
+        let actual_addr = listener.local_addr();
         let advertised_motd = motd_string.clone();
         let lane_owned = lane_name.to_string();
 
         rt.spawn(async move {
             log::info!(
-                "BedrockDroid RS Fase 2 listo: dir={} lane={} target={} motd_ver={} proto={} max_ram={}MB (blocking_threads={}, max_peers={}) fast_path={}",
+                "BedrockDroid RS Fase 2/3 listo (bind directo): dir={} lane={} target={} motd_ver={} proto={} max_ram={}MB (blocking_threads={}) fast_path={}",
                 dir_owned,
                 lane_owned,
                 TARGET_BEDROCK_VERSION,
@@ -313,7 +248,6 @@ pub fn start_async_engine(
                 TARGET_BEDROCK_PROTOCOL,
                 budget_mb,
                 max_blocking,
-                max_peer_relays,
                 net_cfg.local_fast_path
             );
 
@@ -350,78 +284,29 @@ pub fn start_async_engine(
                 );
             }
 
-            log::info!(
-                "Servidor RakNet escuchando en {} (IPv6={}, muxer interno={})",
-                actual_addr,
-                v6_bound_label,
-                internal_addr
-            );
+            log::info!("Servidor RakNet escuchando directamente en {}", actual_addr);
             log::info!(
                 "Advertisement configurado ({} bytes, ServerID={}): {}",
                 adv_len,
                 server_id(),
                 advertised_motd
             );
-
-            let mut buf = vec![0u8; 4096];
-            let mut buf_v6 = vec![0u8; 4096];
-            let mut peer_relays: HashMap<SocketAddr, (Arc<UdpSocket>, CancellationToken)> =
-                HashMap::new();
-            let mut proxy_to_real: HashMap<SocketAddr, SocketAddr> = HashMap::new();
-
-            log::info!("[Relay] Esperando paquetes en {}...", actual_addr);
+            log::info!("[RakNet] Esperando conexiones y pings UDP en {}...", actual_addr);
 
             loop {
-                let incoming: Option<(usize, SocketAddr, Arc<UdpSocket>, bool)> = tokio::select! {
+                tokio::select! {
                     _ = task_cancel.cancelled() => {
                         log::info!("Listener RakNet cancelado por CancellationToken");
-                        for (_, (_, peer_cancel)) in peer_relays.drain() {
-                            peer_cancel.cancel();
-                        }
                         break;
-                    }
-                    recv_res = public_sock.recv_from(&mut buf) => {
-                        match recv_res {
-                            Ok((len, peer)) if len > 0 => {
-                                Some((len, peer, Arc::clone(&public_sock), false))
-                            }
-                            Ok(_) => None,
-                            Err(e) => {
-                                log::warn!("[RakNet RX] Error en recv_from UDP IPv4: {}", e);
-                                None
-                            }
-                        }
-                    }
-                    recv_v6_res = recv_optional_v6(&public_sock_v6, &mut buf_v6) => {
-                        match recv_v6_res {
-                            Ok((len, peer)) if len > 0 => {
-                                if let Some(v6_sock) = &public_sock_v6 {
-                                    Some((len, peer, Arc::clone(v6_sock), true))
-                                } else {
-                                    None
-                                }
-                            }
-                            Ok(_) => None,
-                            Err(e) => {
-                                log::warn!("[RakNet RX] Error en recv_from UDP IPv6: {}", e);
-                                None
-                            }
-                        }
                     }
                     maybe_stream = listener.accept() => {
                         match maybe_stream {
                             Some(mut stream) => {
-                                let proxy_peer = stream.peer_addr();
-                                let real_peer = proxy_to_real
-                                    .get(&proxy_peer)
-                                    .copied()
-                                    .unwrap_or(proxy_peer);
+                                let peer_addr = stream.peer_addr();
                                 log::info!(
-                                    "Cliente RakNet conectado (handshake UDP completado) desde {} (proxy={})",
-                                    real_peer,
-                                    proxy_peer
+                                    "[Bedrock RX] Cliente RakNet conectado (handshake UDP completado) desde {}",
+                                    peer_addr
                                 );
-                                // Preparación Fase 3: registrar conexión sin procesar aún el handshake de Login Bedrock.
                                 log::info!("[Bedrock RX] Nuevo cliente conectado. Esperando RequestNetworkSettings...");
 
                                 let stream_cancel = task_cancel.child_token();
@@ -430,12 +315,18 @@ pub fn start_async_engine(
                                     loop {
                                         tokio::select! {
                                             _ = stream_cancel.cancelled() => {
-                                                log::info!("[Bedrock RX] Sesión con {} cerrada por apagado del motor", real_peer);
+                                                log::info!("[Bedrock RX] Sesión con {} cerrada por apagado del motor", peer_addr);
                                                 break;
                                             }
                                             maybe_pkt = stream.recv() => {
                                                 match maybe_pkt {
                                                     Some(Ok(payload)) => {
+                                                        let len = payload.len();
+                                                        log::info!(
+                                                            "[Bedrock RX] Paquete UDP recibido desde {} ({} bytes)",
+                                                            peer_addr,
+                                                            len
+                                                        );
                                                         if payload.first().copied() == Some(0xfe) {
                                                             if !has_sent_network_settings {
                                                                 let pkt_id = decode_bedrock_batch_packet_id(&payload).unwrap_or(0);
@@ -448,10 +339,10 @@ pub fn start_async_engine(
                                                                     match stream.send(msg).await {
                                                                         Ok(()) => {
                                                                             has_sent_network_settings = true;
-                                                                            log::info!("[Bedrock Protocol] NetworkSettings enviado a {}", real_peer);
+                                                                            log::info!("[Bedrock Protocol] NetworkSettings enviado a {}", peer_addr);
                                                                         }
                                                                         Err(err) => {
-                                                                            log::warn!("[Bedrock Protocol] Error enviando NetworkSettings a {}: {:?}", real_peer, err);
+                                                                            log::warn!("[Bedrock Protocol] Error enviando NetworkSettings a {}: {:?}", peer_addr, err);
                                                                             break;
                                                                         }
                                                                     }
@@ -459,15 +350,15 @@ pub fn start_async_engine(
                                                                     log::warn!(
                                                                         "[Bedrock Protocol] Paquete 0x{:02x} ignorado de {}: NetworkSettings aún no enviado",
                                                                         pkt_id,
-                                                                        real_peer
+                                                                        peer_addr
                                                                     );
                                                                 }
                                                             } else {
                                                                 let comp_hdr = payload.get(1).copied().unwrap_or(0);
                                                                 log::info!(
                                                                     "[Bedrock Protocol] Paquete post-NetworkSettings recibido de {} ({} bytes, comp_hdr=0x{:02x})",
-                                                                    real_peer,
-                                                                    payload.len(),
+                                                                    peer_addr,
+                                                                    len,
                                                                     comp_hdr
                                                                 );
                                                             }
@@ -477,7 +368,7 @@ pub fn start_async_engine(
                                                                 log::warn!(
                                                                     "[Bedrock Protocol] Paquete 0x{:02x} ignorado de {}: NetworkSettings aún no enviado",
                                                                     raw_id,
-                                                                    real_peer
+                                                                    peer_addr
                                                                 );
                                                             } else {
                                                                 log::info!("[Bedrock Protocol] Recibido paquete de Minecraft: 0x{:02x}", raw_id);
@@ -485,11 +376,11 @@ pub fn start_async_engine(
                                                         }
                                                     }
                                                     Some(Err(err)) => {
-                                                        log::warn!("[Bedrock RX] Error leyendo stream RakNet de {}: {:?}", real_peer, err);
+                                                        log::warn!("[Bedrock RX] Error leyendo stream RakNet de {}: {:?}", peer_addr, err);
                                                         break;
                                                     }
                                                     None => {
-                                                        log::info!("[Bedrock RX] Cliente {} desconectado", real_peer);
+                                                        log::info!("[Bedrock RX] Cliente {} desconectado", peer_addr);
                                                         break;
                                                     }
                                                 }
@@ -502,121 +393,6 @@ pub fn start_async_engine(
                                 log::warn!("Listener RakNet cerrado inesperadamente");
                                 break;
                             }
-                        }
-                        None
-                    }
-                };
-
-                if let Some((len, peer, pub_tx_sock, is_v6)) = incoming {
-                    let packet_slice = if is_v6 { &buf_v6[..len] } else { &buf[..len] };
-                    let pkt_id = packet_slice[0];
-                    log::info!(
-                        "[Relay RX] Paquete recibido de {} ({} bytes, primer byte=0x{:02x})",
-                        peer,
-                        len,
-                        pkt_id
-                    );
-                    if matches!(pkt_id, 0x01 | 0x02 | 0x05 | 0x07) {
-                        log::info!(
-                            "[RakNet RX] Paquete no conectado id=0x{:02x} ({} bytes) desde {}",
-                            pkt_id,
-                            len,
-                            peer
-                        );
-                    }
-
-                    if !peer_relays.contains_key(&peer) {
-                        if let Some(rss) = current_process_rss_bytes() {
-                            if rss >= (budget_bytes * 95) / 100 {
-                                log::warn!(
-                                    "[MemoryGuard] RSS={} MB >= 95% del límite ({} MB); rechazando nuevo relay para {}",
-                                    rss / (1024 * 1024),
-                                    budget_mb,
-                                    peer
-                                );
-                                continue;
-                            }
-                        }
-                        if peer_relays.len() >= max_peer_relays {
-                            for (_, (_, old_cancel)) in peer_relays.drain() {
-                                old_cancel.cancel();
-                            }
-                            proxy_to_real.clear();
-                        }
-
-                        match UdpSocket::bind("127.0.0.1:0").await {
-                            Ok(relay) => {
-                                match (relay.connect(internal_addr).await, relay.local_addr()) {
-                                    (Ok(()), Ok(proxy_addr)) => {
-                                        let relay_arc = Arc::new(relay);
-                                        let relay_rx = Arc::clone(&relay_arc);
-                                        let pub_tx = pub_tx_sock;
-                                        let peer_cancel = task_cancel.child_token();
-                                        let peer_cancel_task = peer_cancel.clone();
-
-                                        peer_relays.insert(peer, (relay_arc, peer_cancel));
-                                        proxy_to_real.insert(proxy_addr, peer);
-
-                                        tokio::spawn(async move {
-                                            let mut rbuf = [0u8; 4096];
-                                            loop {
-                                                tokio::select! {
-                                                    _ = peer_cancel_task.cancelled() => break,
-                                                    res = relay_rx.recv(&mut rbuf) => {
-                                                        match res {
-                                                            Ok(n) if n > 0 => {
-                                                                log::info!(
-                                                                    "[Relay TX] Respuesta recibida del muxer ({} bytes, primer byte=0x{:02x}) -> enviando a {}",
-                                                                    n,
-                                                                    rbuf[0],
-                                                                    peer
-                                                                );
-                                                                if rbuf[0] == 0x1c {
-                                                                    log::info!(
-                                                                        "[RakNet TX] UnconnectedPong (0x1c, {} bytes) enviado a {}",
-                                                                        n,
-                                                                        peer
-                                                                    );
-                                                                } else if matches!(rbuf[0], 0x06 | 0x08 | 0x19) {
-                                                                    log::info!(
-                                                                        "[RakNet TX] Respuesta offline id=0x{:02x} ({} bytes) -> {}",
-                                                                        rbuf[0],
-                                                                        n,
-                                                                        peer
-                                                                    );
-                                                                }
-                                                                if let Err(e) = pub_tx.send_to(&rbuf[..n], peer).await {
-                                                                    log::warn!("[Relay TX] Error enviando UDP a {}: {}", peer, e);
-                                                                }
-                                                            }
-                                                            Ok(_) => {}
-                                                            Err(e) => {
-                                                                log::warn!("[Relay TX] Error leyendo relay_rx para {}: {}", peer, e);
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    }
-                                    (Err(e), _) => {
-                                        log::warn!("[Relay RX] Error en relay.connect({}) para {}: {}", internal_addr, peer, e);
-                                    }
-                                    (_, Err(e)) => {
-                                        log::warn!("[Relay RX] Error obteniendo local_addr del relay para {}: {}", peer, e);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!("[RakNet Relay] No se pudo crear socket relay para {}: {}", peer, e);
-                            }
-                        }
-                    }
-
-                    if let Some((relay_sock, _)) = peer_relays.get(&peer) {
-                        if let Err(e) = relay_sock.send(packet_slice).await {
-                            log::warn!("[RakNet Relay] Error enviando paquete a muxer para {}: {}", peer, e);
                         }
                     }
                 }
