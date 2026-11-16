@@ -23,6 +23,11 @@ import com.bedrockdroid.rs.model.ServerRuntimeState
 import com.bedrockdroid.rs.nativebridge.RustCoreBridge
 import com.bedrockdroid.rs.net.LanDiscoveryManager
 import com.bedrockdroid.rs.net.NetworkMonitor
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 class ServerForegroundService : Service() {
 
@@ -31,6 +36,7 @@ class ServerForegroundService : Service() {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var lanDiscovery: LanDiscoveryManager? = null
     private var networkMonitor: NetworkMonitor? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile
     private var rustRuntimeStarted: Boolean = false
 
@@ -58,6 +64,24 @@ class ServerForegroundService : Service() {
 
         val locksOk = acquireSurvivalLocks(cfg)
         ServerRuntimeState.setLocksAcquired(locksOk)
+
+        // Actualizar hardware y red en segundo plano para la Tarjeta Superior en tiempo real
+        ServerRuntimeState.setScanningHardware(true)
+        ServerRuntimeState.setProbingNetwork(true)
+        serviceScope.launch {
+            runCatching {
+                val hw = EngineLaunchPlanner.scanDeviceHardware(applicationContext)
+                ServerRuntimeState.updateHardwareReport(hw)
+            }.onFailure {
+                ServerRuntimeState.setScanningHardware(false)
+            }
+            runCatching {
+                val net = EngineLaunchPlanner.probeNetwork(cfg)
+                ServerRuntimeState.updateNetworkReport(net)
+            }.onFailure {
+                ServerRuntimeState.setProbingNetwork(false)
+            }
+        }
 
         val laneDir = EngineLaunchPlanner.laneDirectory(filesDir, cfg.activeLane)
         EngineLaunchPlanner.ensureEula(laneDir, cfg.eulaAccepted)
@@ -87,6 +111,8 @@ class ServerForegroundService : Service() {
                 if (cfg.networkCallbackEnabled) {
                     networkMonitor = NetworkMonitor(this).apply {
                         startObserving {
+                            val probe = EngineLaunchPlanner.probeNetwork(cfg)
+                            ServerRuntimeState.updateNetworkReport(probe)
                             val probeJson = RustCoreBridge.probeNetworkAndUpnpSafe(
                                 cfg.bedrockPort,
                                 cfg.javaPort,
@@ -102,6 +128,8 @@ class ServerForegroundService : Service() {
 
                 val rustStatus = RustCoreBridge.initRuntimeSafe(
                     laneDir.absolutePath,
+                    cfg.serverName,
+                    cfg.bedrockPort,
                     cfg.localFastPath,
                     cfg.tcpNoDelay,
                     cfg.ipTosLowDelay,
@@ -157,6 +185,8 @@ class ServerForegroundService : Service() {
                 if (cfg.networkCallbackEnabled) {
                     networkMonitor = NetworkMonitor(this).apply {
                         startObserving {
+                            val probe = EngineLaunchPlanner.probeNetwork(cfg)
+                            ServerRuntimeState.updateNetworkReport(probe)
                             val probeJson = RustCoreBridge.probeNetworkAndUpnpSafe(
                                 cfg.bedrockPort,
                                 cfg.javaPort,
@@ -172,6 +202,8 @@ class ServerForegroundService : Service() {
 
                 val rustStatus = RustCoreBridge.initRuntimeSafe(
                     laneDir.absolutePath,
+                    cfg.serverName,
+                    cfg.bedrockPort,
                     cfg.localFastPath,
                     cfg.tcpNoDelay,
                     cfg.ipTosLowDelay,
@@ -269,6 +301,7 @@ class ServerForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        runCatching { serviceScope.cancel() }
         runCatching { lanDiscovery?.unregister() }
         lanDiscovery = null
         runCatching { networkMonitor?.stopObserving() }

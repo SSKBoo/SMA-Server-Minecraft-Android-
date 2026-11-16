@@ -69,6 +69,7 @@ object EngineLaunchPlanner {
     }
 
     fun scanDeviceHardware(context: Context): HardwareScanReport {
+        ServerRuntimeState.setScanningHardware(true)
         val rawJson = RustCoreBridge.readSoCTopologyJsonSafe()
         val obj = runCatching { JSONObject(rawJson) }.getOrNull()
         val cores = obj?.optInt("detected_cores", Runtime.getRuntime().availableProcessors())
@@ -89,7 +90,7 @@ object EngineLaunchPlanner {
         val recXms = (safeMaxXmx / 3).coerceIn(512, 1024)
         val recMtu = if (totalMb >= 8000) 1400 else 1360
 
-        return HardwareScanReport(
+        val report = HardwareScanReport(
             socLabel = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL} (${Build.HARDWARE})",
             detectedCores = cores,
             primeMaxMhz = primeMhz,
@@ -100,9 +101,12 @@ object EngineLaunchPlanner {
             recommendedXmxMb = safeMaxXmx,
             recommendedMtu = recMtu
         )
+        ServerRuntimeState.updateHardwareReport(report)
+        return report
     }
 
     fun probeNetwork(cfg: AndroidLauncherConfig): NetworkProbeReport {
+        ServerRuntimeState.setProbingNetwork(true)
         val raw = RustCoreBridge.probeNetworkAndUpnpSafe(
             cfg.bedrockPort,
             cfg.javaPort,
@@ -125,7 +129,7 @@ object EngineLaunchPlanner {
                 "Local 127.0.0.1:$port y LAN $lanIp:$port listos. El router no respondió a UPnP IGD (verifica redirección manual o CGNAT)."
         }
 
-        return NetworkProbeReport(
+        val report = NetworkProbeReport(
             lanIp = lanIp,
             loopbackHint = "127.0.0.1:$port",
             upnpStatus = upnp,
@@ -133,6 +137,8 @@ object EngineLaunchPlanner {
             isLikelyCgnat = isCgnatOrClosed,
             guidance = guidance
         )
+        ServerRuntimeState.updateNetworkReport(report)
+        return report
     }
 
     fun checkEndpointReachable(urlString: String): String {

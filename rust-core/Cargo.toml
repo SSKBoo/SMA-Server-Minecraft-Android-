@@ -9,8 +9,8 @@ name = "bedrock_android_core"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Fase 1: Compilación modular sin inflar el binario .so en Android ni arrastrar auth-reqwest/OpenSSL
-default = ["protocol-core"]
+# Fase 2: protocol-core + transport-raknet (tokio-raknet 0.2) activos por defecto sin arrastrar OpenSSL/C
+default = ["protocol-core", "transport-raknet"]
 protocol-core = [
     "dep:bedrock",
     "bedrock/protocol",

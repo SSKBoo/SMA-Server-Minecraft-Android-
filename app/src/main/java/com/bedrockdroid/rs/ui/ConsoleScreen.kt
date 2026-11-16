@@ -56,6 +56,7 @@ import com.bedrockdroid.rs.model.LogBuffer
 import com.bedrockdroid.rs.model.LogLevel
 import com.bedrockdroid.rs.model.LogStream
 import com.bedrockdroid.rs.model.NetworkProbeReport
+import com.bedrockdroid.rs.model.ServerRuntimeState
 
 private enum class ConsoleLogFilter(val label: String) {
     ALL("ALL"),
@@ -63,6 +64,215 @@ private enum class ConsoleLogFilter(val label: String) {
     INFO("INFO"),
     WARN("WARN"),
     ERROR("ERROR")
+}
+
+@Composable
+fun StatusCard(
+    config: AndroidLauncherConfig,
+    isServerRunning: Boolean,
+    hardwareReport: HardwareScanReport?,
+    networkReport: NetworkProbeReport?,
+    onSelectLane: (EngineLane) -> Unit,
+    onStartOrStop: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val liveHardware by ServerRuntimeState.hardwareReport.collectAsState()
+    val liveNetwork by ServerRuntimeState.networkReport.collectAsState()
+    val isScanningHardware by ServerRuntimeState.isScanningHardware.collectAsState()
+    val isProbingNetwork by ServerRuntimeState.isProbingNetwork.collectAsState()
+
+    val effectiveHardware = liveHardware ?: hardwareReport
+    val effectiveNetwork = liveNetwork ?: networkReport
+
+    ElevatedCard(
+        modifier = modifier,
+        colors = CardDefaults.elevatedCardColors(containerColor = Color.White),
+        shape = RoundedCornerShape(14.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                    Text(
+                        text = config.serverName,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = if (isServerRunning) {
+                            "ACTIVO · ${config.activeLane.label}"
+                        } else {
+                            "DETENIDO · ${config.activeLane.label}"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (isServerRunning) Color(0xFF047857) else Color(0xFF64748B),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                Button(
+                    onClick = onStartOrStop,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isServerRunning) Color(0xFFDC2626) else Color(0xFF047857)
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Icon(
+                        imageVector = if (isServerRunning) Icons.Default.Close else Icons.Default.PlayArrow,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(if (isServerRunning) "Detener" else "Iniciar", fontSize = 12.sp, maxLines = 1)
+                }
+            }
+
+            // Chips bloqueados si isServerRunning == true + Toast si se pulsan activos
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                EngineLane.entries.forEach { lane ->
+                    Box(modifier = Modifier.weight(1f)) {
+                        FilterChip(
+                            selected = config.activeLane == lane,
+                            enabled = !isServerRunning,
+                            onClick = {
+                                if (!isServerRunning) {
+                                    onSelectLane(lane)
+                                }
+                            },
+                            label = {
+                                Text(
+                                    text = lane.label,
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(30.dp)
+                        )
+                        if (isServerRunning) {
+                            Box(
+                                modifier = Modifier
+                                    .matchParentSize()
+                                    .clickable(
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        indication = null
+                                    ) {
+                                        Toast.makeText(
+                                            context,
+                                            "Detén el servidor antes de cambiar de perfil",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                            )
+                        }
+                    }
+                }
+            }
+
+            val port = if (config.activeLane == EngineLane.JAVA) config.javaPort else config.bedrockPort
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "127.0.0.1:$port",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF0F172A)
+                )
+
+                val hwSnapshot = effectiveHardware
+                if (hwSnapshot != null) {
+                    Text(
+                        text = "${hwSnapshot.detectedCores} núcleos · ${hwSnapshot.ramAvailMb}MB",
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color(0xFF047857),
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                } else {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        if (isScanningHardware || isServerRunning) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(11.dp),
+                                strokeWidth = 1.5.dp,
+                                color = Color(0xFF047857)
+                            )
+                        }
+                        Text(
+                            text = "Escaneando SoC...",
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = Color(0xFF475569)
+                        )
+                    }
+                }
+
+                val netSnapshot = effectiveNetwork
+                if (netSnapshot != null) {
+                    val netLabel = when {
+                        netSnapshot.upnpStatus == "igd_gateway_found" -> "${netSnapshot.lanIp} · UPnP OK"
+                        netSnapshot.lanIp != "127.0.0.1" -> "LAN ${netSnapshot.lanIp}"
+                        else -> "Local ${netSnapshot.lanIp}"
+                    }
+                    Text(
+                        text = netLabel,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (netSnapshot.upnpStatus == "igd_gateway_found" || netSnapshot.lanIp != "127.0.0.1") {
+                            Color(0xFF047857)
+                        } else {
+                            Color(0xFF0F172A)
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                } else {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        if (isProbingNetwork || isServerRunning) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(11.dp),
+                                strokeWidth = 1.5.dp,
+                                color = Color(0xFF047857)
+                            )
+                        }
+                        Text(
+                            text = "Escaneando red...",
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = Color(0xFF475569)
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -184,144 +394,14 @@ fun ConsoleScreen(
                 }
             }
 
-            ElevatedCard(
-                colors = CardDefaults.elevatedCardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(14.dp)
-            ) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                            Text(
-                                text = config.serverName,
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = if (isServerRunning) {
-                                    "ACTIVO · ${config.activeLane.label}"
-                                } else {
-                                    "DETENIDO · ${config.activeLane.label}"
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (isServerRunning) Color(0xFF047857) else Color(0xFF64748B),
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        }
-
-                        Button(
-                            onClick = onStartOrStop,
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isServerRunning) Color(0xFFDC2626) else Color(0xFF047857)
-                            ),
-                            shape = RoundedCornerShape(10.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                        ) {
-                            Icon(
-                                imageVector = if (isServerRunning) Icons.Default.Close else Icons.Default.PlayArrow,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(Modifier.width(4.dp))
-                            Text(if (isServerRunning) "Detener" else "Iniciar", fontSize = 12.sp, maxLines = 1)
-                        }
-                    }
-
-                    // TAREA 3: Chips deshabilitados si isServerRunning == true + Toast si se pulsan activos
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        EngineLane.entries.forEach { lane ->
-                            Box(modifier = Modifier.weight(1f)) {
-                                FilterChip(
-                                    selected = config.activeLane == lane,
-                                    enabled = !isServerRunning,
-                                    onClick = {
-                                        if (!isServerRunning) {
-                                            onSelectLane(lane)
-                                        }
-                                    },
-                                    label = {
-                                        Text(
-                                            text = lane.label,
-                                            fontSize = 11.sp,
-                                            maxLines = 1,
-                                            softWrap = false
-                                        )
-                                    },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(30.dp)
-                                )
-                                if (isServerRunning) {
-                                    Box(
-                                        modifier = Modifier
-                                            .matchParentSize()
-                                            .clickable(
-                                                interactionSource = remember { MutableInteractionSource() },
-                                                indication = null
-                                            ) {
-                                                Toast.makeText(
-                                                    context,
-                                                    "Detén el servidor antes de cambiar de perfil",
-                                                    Toast.LENGTH_SHORT
-                                                ).show()
-                                            }
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    val port = if (config.activeLane == EngineLane.JAVA) config.javaPort else config.bedrockPort
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            "127.0.0.1:$port",
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color(0xFF0F172A)
-                        )
-                        Text(
-                            if (hardwareReport != null) {
-                                "${hardwareReport.detectedCores}c · ${hardwareReport.ramAvailMb}MB"
-                            } else {
-                                "SoC pendiente"
-                            },
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = Color(0xFF475569)
-                        )
-                        Text(
-                            when {
-                                networkReport == null -> "Red pendiente"
-                                networkReport.upnpStatus == "igd_gateway_found" -> "UPnP OK"
-                                else -> "LAN / CGNAT"
-                            },
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (networkReport?.upnpStatus == "igd_gateway_found") {
-                                Color(0xFF047857)
-                            } else {
-                                Color(0xFF0F172A)
-                            }
-                        )
-                    }
-                }
-            }
+            StatusCard(
+                config = config,
+                isServerRunning = isServerRunning,
+                hardwareReport = hardwareReport,
+                networkReport = networkReport,
+                onSelectLane = onSelectLane,
+                onStartOrStop = onStartOrStop
+            )
         }
 
         // TAREA 4: Terminal Linux REAL (Cabecera + Filtros + Lista weight(1f) + Input fijo abajo)

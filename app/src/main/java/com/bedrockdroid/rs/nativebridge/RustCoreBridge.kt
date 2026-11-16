@@ -23,6 +23,8 @@ object RustCoreBridge {
 
     fun initRuntimeSafe(
         engineDir: String,
+        serverName: String,
+        bedrockPort: Int,
         localFastPath: Boolean,
         tcpNoDelay: Boolean,
         ipTosLowDelay: Boolean,
@@ -38,6 +40,8 @@ object RustCoreBridge {
         return try {
             initRuntime(
                 engineDir,
+                serverName,
+                bedrockPort,
                 localFastPath,
                 tcpNoDelay,
                 ipTosLowDelay,
@@ -86,6 +90,8 @@ object RustCoreBridge {
 
     external fun initRuntime(
         engineDir: String,
+        serverName: String,
+        bedrockPort: Int,
         localFastPath: Boolean,
         tcpNoDelay: Boolean,
         ipTosLowDelay: Boolean,

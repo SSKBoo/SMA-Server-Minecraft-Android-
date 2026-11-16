@@ -227,6 +227,18 @@ object ServerRuntimeState {
     private val _locksAcquired = MutableStateFlow(false)
     val locksAcquired: StateFlow<Boolean> = _locksAcquired.asStateFlow()
 
+    private val _hardwareReport = MutableStateFlow<HardwareScanReport?>(null)
+    val hardwareReport: StateFlow<HardwareScanReport?> = _hardwareReport.asStateFlow()
+
+    private val _networkReport = MutableStateFlow<NetworkProbeReport?>(null)
+    val networkReport: StateFlow<NetworkProbeReport?> = _networkReport.asStateFlow()
+
+    private val _isScanningHardware = MutableStateFlow(false)
+    val isScanningHardware: StateFlow<Boolean> = _isScanningHardware.asStateFlow()
+
+    private val _isProbingNetwork = MutableStateFlow(false)
+    val isProbingNetwork: StateFlow<Boolean> = _isProbingNetwork.asStateFlow()
+
     val logs: StateFlow<List<ConsoleLogLine>>
         get() = LogBuffer.logs
 
@@ -236,6 +248,24 @@ object ServerRuntimeState {
 
     fun setLocksAcquired(acquired: Boolean) {
         _locksAcquired.value = acquired
+    }
+
+    fun setScanningHardware(scanning: Boolean) {
+        _isScanningHardware.value = scanning
+    }
+
+    fun updateHardwareReport(report: HardwareScanReport) {
+        _hardwareReport.value = report
+        _isScanningHardware.value = false
+    }
+
+    fun setProbingNetwork(probing: Boolean) {
+        _isProbingNetwork.value = probing
+    }
+
+    fun updateNetworkReport(report: NetworkProbeReport) {
+        _networkReport.value = report
+        _isProbingNetwork.value = false
     }
 
     fun appendLog(stream: LogStream, text: String, tag: String = "BedrockDroidUI") {

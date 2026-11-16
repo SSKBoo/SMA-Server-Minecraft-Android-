@@ -19,6 +19,8 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
     mut env: JNIEnv,
     _class: JClass,
     engine_dir: JString,
+    server_name: JString,
+    bedrock_port: jint,
     local_fast_path: jboolean,
     tcp_no_delay: jboolean,
     ip_tos_low_delay: jboolean,
@@ -36,6 +38,18 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
             .unwrap_or_else(|_| "/data/local/tmp".to_string())
     };
 
+    let motd_name: String = {
+        env.get_string(&server_name)
+            .map(|s| s.into())
+            .unwrap_or_else(|_| "BedrockDroid RS".to_string())
+    };
+
+    let udp_port = if bedrock_port <= 0 || bedrock_port > 65535 {
+        19132
+    } else {
+        bedrock_port as u16
+    };
+
     let net_cfg = net::low_latency::LowLatencyConfig {
         local_fast_path: local_fast_path == JNI_TRUE,
         tcp_no_delay: tcp_no_delay == JNI_TRUE,
@@ -50,7 +64,7 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
         thermal_guard_c,
     );
 
-    let engine_state = match runtime::start_async_engine(&dir, net_cfg) {
+    let engine_state = match runtime::start_async_engine(&dir, &motd_name, udp_port, net_cfg) {
         Ok(summary) => summary,
         Err(err) => format!("engine_err={}", err),
     };

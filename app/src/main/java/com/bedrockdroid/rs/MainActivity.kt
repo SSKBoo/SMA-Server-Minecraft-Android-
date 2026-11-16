@@ -67,8 +67,10 @@ class MainActivity : ComponentActivity() {
                             .getOrElse { LauncherPrefs.defaultConfig() }
                     )
                 }
-                var hardwareReport by remember { mutableStateOf<HardwareScanReport?>(null) }
-                var networkReport by remember { mutableStateOf<NetworkProbeReport?>(null) }
+                val isRunning by ServerRuntimeState.isRunning.collectAsState()
+                val logs by ServerRuntimeState.logs.collectAsState()
+                val hardwareReport by ServerRuntimeState.hardwareReport.collectAsState()
+                val networkReport by ServerRuntimeState.networkReport.collectAsState()
                 var latestCrashFile by remember { mutableStateOf<File?>(null) }
                 var latestCrashText by remember { mutableStateOf<String?>(null) }
 
@@ -88,10 +90,13 @@ class MainActivity : ComponentActivity() {
                             "Crash previo registrado en ${crashFile.name}:\n${crashBody.take(1500)}"
                         )
                     }
-                }
 
-                val isRunning by ServerRuntimeState.isRunning.collectAsState()
-                val logs by ServerRuntimeState.logs.collectAsState()
+                    // Escaneo inicial de hardware y red en segundo plano para actualizar StatusCard al instante
+                    withContext(Dispatchers.IO) {
+                        runCatching { EngineLaunchPlanner.scanDeviceHardware(this@MainActivity) }
+                        runCatching { EngineLaunchPlanner.probeNetwork(config) }
+                    }
+                }
 
                 val updateConfig: (com.bedrockdroid.rs.model.AndroidLauncherConfig) -> Unit = { next ->
                     if (isRunning && next.activeLane != config.activeLane) {
@@ -223,7 +228,7 @@ class MainActivity : ComponentActivity() {
                             hardwareReport = hardwareReport,
                             networkReport = networkReport,
                             onScanComplete = { hw, applyOptimal ->
-                                hardwareReport = hw
+                                ServerRuntimeState.updateHardwareReport(hw)
                                 if (applyOptimal) {
                                     updateConfig(
                                         config.copy(
@@ -237,7 +242,7 @@ class MainActivity : ComponentActivity() {
                             onConfirmOemRule = { confirmed ->
                                 updateConfig(config.copy(oemAutostartConfirmed = confirmed))
                             },
-                            onNetworkProbeComplete = { networkReport = it },
+                            onNetworkProbeComplete = { ServerRuntimeState.updateNetworkReport(it) },
                             modifier = contentModifier
                         )
 
