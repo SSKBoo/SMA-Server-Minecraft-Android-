@@ -176,6 +176,13 @@ fun SurvivalNetworkScreen(
                     }
                 }
                 ChecklistRow("WakeLock + WifiLock + Multicast (al iniciar)", isRunning) {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:${context.packageName}")
+                    }
+                    runCatching { context.startActivity(intent) }.onFailure {
+                        val fallback = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                        runCatching { context.startActivity(fallback) }
+                    }
                     refreshTrigger++
                 }
                 ChecklistRow("Regla OEM (Xiaomi/OneUI/ColorOS)", oemGranted) {
