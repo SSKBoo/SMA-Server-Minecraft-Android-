@@ -26,6 +26,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import com.bedrockdroid.rs.engine.EngineLaunchPlanner
 import com.bedrockdroid.rs.model.AndroidLauncherConfig
 import com.bedrockdroid.rs.model.HardwareScanReport
@@ -36,6 +39,19 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
+
+fun solicitarExencionBateria(context: Context) {
+    try {
+        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:${context.packageName}")
+        }
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        runCatching {
+            context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+    }
+}
 
 @Composable
 fun SurvivalNetworkScreen(
@@ -51,6 +67,20 @@ fun SurvivalNetworkScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var refreshTrigger by remember { mutableIntStateOf(0) }
+    val locksAcquired by ServerRuntimeState.locksAcquired.collectAsState()
+
+    val lifecycleOwner = context as? LifecycleOwner
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refreshTrigger++
+            }
+        }
+        lifecycleOwner?.lifecycle?.addObserver(observer)
+        onDispose {
+            lifecycleOwner?.lifecycle?.removeObserver(observer)
+        }
+    }
 
     val notifLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -75,8 +105,9 @@ fun SurvivalNetworkScreen(
         cm.restrictBackgroundStatus != ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED
     }
 
+    val wakeLocksPass = locksAcquired || isRunning
     val oemGranted = config.oemAutostartConfirmed
-    val passCount = listOf(notifGranted, dozeExempt, bgDataUnrestricted, isRunning, oemGranted).count { it }
+    val passCount = listOf(notifGranted, dozeExempt, bgDataUnrestricted, wakeLocksPass, oemGranted).count { it }
     val checklistBadge = if (passCount == 5) "$passCount/5 PASS" else "$passCount/5 PENDIENTE"
 
     Column(
@@ -159,10 +190,8 @@ fun SurvivalNetworkScreen(
                     }
                 }
                 ChecklistRow("Exención batería (Doze)", dozeExempt) {
-                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                        data = Uri.parse("package:${context.packageName}")
-                    }
-                    runCatching { context.startActivity(intent) }
+                    solicitarExencionBateria(context)
+                    refreshTrigger++
                 }
                 ChecklistRow("Datos segundo plano sin límite", bgDataUnrestricted) {
                     val intent = Intent(Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS).apply {
@@ -175,14 +204,8 @@ fun SurvivalNetworkScreen(
                         runCatching { context.startActivity(fallback) }
                     }
                 }
-                ChecklistRow("WakeLock + WifiLock + Multicast (al iniciar)", isRunning) {
-                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                        data = Uri.parse("package:${context.packageName}")
-                    }
-                    runCatching { context.startActivity(intent) }.onFailure {
-                        val fallback = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-                        runCatching { context.startActivity(fallback) }
-                    }
+                ChecklistRow("WakeLock + WifiLock + Multicast (al iniciar)", wakeLocksPass) {
+                    solicitarExencionBateria(context)
                     refreshTrigger++
                 }
                 ChecklistRow("Regla OEM (Xiaomi/OneUI/ColorOS)", oemGranted) {

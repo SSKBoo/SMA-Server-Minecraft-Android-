@@ -4,8 +4,10 @@ import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,6 +33,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -78,6 +85,7 @@ fun ConsoleScreen(
 ) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
+    val isServerRunning = isRunning
 
     var commandText by remember { mutableStateOf("") }
     var activeFilter by remember { mutableStateOf(ConsoleLogFilter.ALL) }
@@ -86,6 +94,14 @@ fun ConsoleScreen(
     var isMaximized by remember { mutableStateOf(false) }
 
     val scrollState = rememberScrollState()
+
+    val submitCommand: () -> Unit = {
+        val clean = commandText.replace("\n", "").trim()
+        if (clean.isNotEmpty()) {
+            onRunCommand(clean)
+            commandText = ""
+        }
+    }
 
     val filteredLogs = remember(logs, activeFilter, searchQuery) {
         logs.filter { line ->
@@ -119,10 +135,11 @@ fun ConsoleScreen(
         modifier = modifier
             .fillMaxSize()
             .then(
-                if (isMaximized) Modifier else Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                if (isMaximized) Modifier else Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
             ),
-        verticalArrangement = Arrangement.spacedBy(if (isMaximized) 0.dp else 8.dp)
+        verticalArrangement = Arrangement.spacedBy(if (isMaximized) 0.dp else 6.dp)
     ) {
+        // 1. Tarjeta superior de estado (oculta en Pantalla Completa)
         if (!isMaximized) {
             if (latestCrashText != null) {
                 ElevatedCard(
@@ -167,13 +184,12 @@ fun ConsoleScreen(
                 }
             }
 
-            // TarjetaEstado compacta para ceder máximo espacio vertical a la terminal
             ElevatedCard(
                 colors = CardDefaults.elevatedCardColors(containerColor = Color.White),
                 shape = RoundedCornerShape(14.dp)
             ) {
                 Column(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Row(
@@ -190,13 +206,13 @@ fun ConsoleScreen(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = if (isRunning) {
+                                text = if (isServerRunning) {
                                     "ACTIVO · ${config.activeLane.label}"
                                 } else {
                                     "DETENIDO · ${config.activeLane.label}"
                                 },
                                 style = MaterialTheme.typography.bodySmall,
-                                color = if (isRunning) Color(0xFF047857) else Color(0xFF64748B),
+                                color = if (isServerRunning) Color(0xFF047857) else Color(0xFF64748B),
                                 fontWeight = FontWeight.SemiBold
                             )
                         }
@@ -204,39 +220,65 @@ fun ConsoleScreen(
                         Button(
                             onClick = onStartOrStop,
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isRunning) Color(0xFFDC2626) else Color(0xFF047857)
+                                containerColor = if (isServerRunning) Color(0xFFDC2626) else Color(0xFF047857)
                             ),
                             shape = RoundedCornerShape(10.dp),
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                         ) {
                             Icon(
-                                imageVector = if (isRunning) Icons.Default.Close else Icons.Default.PlayArrow,
+                                imageVector = if (isServerRunning) Icons.Default.Close else Icons.Default.PlayArrow,
                                 contentDescription = null,
                                 modifier = Modifier.size(16.dp)
                             )
                             Spacer(Modifier.width(4.dp))
-                            Text(if (isRunning) "Detener" else "Iniciar", fontSize = 12.sp, maxLines = 1)
+                            Text(if (isServerRunning) "Detener" else "Iniciar", fontSize = 12.sp, maxLines = 1)
                         }
                     }
 
+                    // TAREA 3: Chips deshabilitados si isServerRunning == true + Toast si se pulsan activos
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         EngineLane.entries.forEach { lane ->
-                            FilterChip(
-                                selected = config.activeLane == lane,
-                                onClick = { onSelectLane(lane) },
-                                label = {
-                                    Text(
-                                        text = lane.label,
-                                        fontSize = 11.sp,
-                                        maxLines = 1,
-                                        softWrap = false
+                            Box(modifier = Modifier.weight(1f)) {
+                                FilterChip(
+                                    selected = config.activeLane == lane,
+                                    enabled = !isServerRunning,
+                                    onClick = {
+                                        if (!isServerRunning) {
+                                            onSelectLane(lane)
+                                        }
+                                    },
+                                    label = {
+                                        Text(
+                                            text = lane.label,
+                                            fontSize = 11.sp,
+                                            maxLines = 1,
+                                            softWrap = false
+                                        )
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(30.dp)
+                                )
+                                if (isServerRunning) {
+                                    Box(
+                                        modifier = Modifier
+                                            .matchParentSize()
+                                            .clickable(
+                                                interactionSource = remember { MutableInteractionSource() },
+                                                indication = null
+                                            ) {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Detén el servidor antes de cambiar de perfil",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            }
                                     )
-                                },
-                                modifier = Modifier.weight(1f).height(30.dp)
-                            )
+                                }
+                            }
                         }
                     }
 
@@ -282,15 +324,19 @@ fun ConsoleScreen(
             }
         }
 
-        // Terminal CLI Interactiva Fase 1.5.2
+        // TAREA 4: Terminal Linux REAL (Cabecera + Filtros + Lista weight(1f) + Input fijo abajo)
         Column(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
+            modifier = (
+                if (isMaximized) {
+                    Modifier.fillMaxSize()
+                } else {
+                    Modifier.weight(1f).fillMaxWidth()
+                }
+            )
                 .clip(RoundedCornerShape(if (isMaximized) 0.dp else 14.dp))
                 .background(Color(0xFF0B1120))
         ) {
-            // Cabecera de terminal con Exportar en una sola línea, Limpiar y Pantalla Completa
+            // 2a. Cabecera con Exportar, Limpiar y Pantalla Completa en la esquina superior derecha
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -299,14 +345,14 @@ fun ConsoleScreen(
                         onClick = {},
                         onLongClick = copyAllLogs
                     )
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f).padding(end = 6.dp)) {
                     Text(
-                        text = "arm64@bedrockdroid:~ (${filteredLogs.size}/${logs.size})",
-                        color = Color(0xFFCBD5E1),
+                        text = "root@bedrockdroid:~# (${filteredLogs.size}/${logs.size})",
+                        color = Color(0xFF34D399),
                         fontFamily = FontFamily.Monospace,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.SemiBold,
@@ -314,7 +360,7 @@ fun ConsoleScreen(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "Mantén pulsado para copiar todo",
+                        text = "Terminal ARM64 · Mantén pulsado para copiar",
                         color = Color(0xFF94A3B8),
                         fontSize = 10.sp,
                         maxLines = 1,
@@ -327,13 +373,13 @@ fun ConsoleScreen(
                 ) {
                     TextButton(
                         onClick = { LogBuffer.exportLogs(context) },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Share,
                             contentDescription = "Exportar logs",
                             tint = Color(0xFF34D399),
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                         Spacer(Modifier.width(4.dp))
                         Text(
@@ -345,12 +391,12 @@ fun ConsoleScreen(
                             softWrap = false
                         )
                     }
-                    IconButton(onClick = onClearLogs, modifier = Modifier.size(32.dp)) {
+                    IconButton(onClick = onClearLogs, modifier = Modifier.size(30.dp)) {
                         Icon(
                             imageVector = Icons.Default.Delete,
                             contentDescription = "Limpiar consola",
                             tint = Color(0xFF94A3B8),
-                            modifier = Modifier.size(17.dp)
+                            modifier = Modifier.size(16.dp)
                         )
                     }
                     IconButton(
@@ -367,14 +413,14 @@ fun ConsoleScreen(
                 }
             }
 
+            // 2b. Filtros compactos (visibles en modo normal para ceder espacio al log)
             if (!isMaximized) {
-                // BarraFiltros: Chips ALL/DEBUG/INFO/WARN/ERROR en horizontalScroll + Auto-scroll + Búsqueda compacta (48.dp)
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color(0xFF111827))
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -400,7 +446,7 @@ fun ConsoleScreen(
                                             softWrap = false
                                         )
                                     },
-                                    modifier = Modifier.height(32.dp)
+                                    modifier = Modifier.height(30.dp)
                                 )
                             }
                         }
@@ -477,7 +523,7 @@ fun ConsoleScreen(
                 }
             }
 
-            // TerminalLogs(modifier = Modifier.weight(1f)) con SelectionContainer + verticalScroll + FAB Copiar todo
+            // 3. Lista de logs con Modifier.weight(1f) ocupando todo el espacio restante
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -488,8 +534,8 @@ fun ConsoleScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .verticalScroll(scrollState)
-                            .padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 58.dp),
-                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                            .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 54.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         filteredLogs.forEach { line ->
                             val lineColor = when (line.stream) {
@@ -517,7 +563,7 @@ fun ConsoleScreen(
                     contentColor = Color.White,
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
-                        .padding(12.dp)
+                        .padding(10.dp)
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 10.dp),
@@ -540,14 +586,13 @@ fun ConsoleScreen(
             }
 
             if (!isMaximized) {
-                // BotonesComandos: Chips rápidos + Entrada CLI compacta
-                val quickCmds = listOf("./launch hybrid", "./launch bedrock", "./launch java", "netcheck", "soc", "stop", "help")
+                val quickCmds = listOf("./launch bedrock", "./launch java", "./launch hybrid", "netcheck", "soc", "stop", "help")
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState())
                         .background(Color(0xFF111827))
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                        .padding(horizontal = 8.dp, vertical = 3.dp),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     quickCmds.forEach { qc ->
@@ -567,78 +612,95 @@ fun ConsoleScreen(
                                 containerColor = Color(0xFF1E293B)
                             ),
                             border = null,
-                            modifier = Modifier.height(30.dp)
+                            modifier = Modifier.height(28.dp)
+                        )
+                    }
+                }
+            }
+
+            // 4. Input de texto fijo abajo con el prompt root@bedrockdroid:~# _ (SIEMPRE visible)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF0F172A))
+                    .border(1.dp, Color(0xFF1E293B))
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFF020617))
+                        .border(1.dp, Color(0xFF334155), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "root@bedrockdroid:~# ",
+                        color = Color(0xFF34D399),
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1
+                    )
+                    Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                        if (commandText.isEmpty()) {
+                            Text(
+                                text = "_",
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 13.sp,
+                                color = Color(0xFF34D399),
+                                maxLines = 1
+                            )
+                        }
+                        BasicTextField(
+                            value = commandText,
+                            onValueChange = { next ->
+                                if (next.contains('\n')) {
+                                    commandText = next.replace("\n", "")
+                                    submitCommand()
+                                } else {
+                                    commandText = next
+                                }
+                            },
+                            singleLine = true,
+                            textStyle = TextStyle(
+                                color = Color.White,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 13.sp
+                            ),
+                            cursorBrush = SolidColor(Color(0xFF34D399)),
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                            keyboardActions = KeyboardActions(
+                                onSend = { submitCommand() }
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onPreviewKeyEvent { keyEvent ->
+                                    if ((keyEvent.key == Key.Enter || keyEvent.key == Key.NumPadEnter) &&
+                                        keyEvent.type == KeyEventType.KeyUp
+                                    ) {
+                                        submitCommand()
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
                         )
                     }
                 }
 
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF0F172A))
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                FilledIconButton(
+                    onClick = submitCommand,
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = Color(0xFF047857)
+                    ),
+                    modifier = Modifier.size(44.dp)
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(Color(0xFF111827))
-                            .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp))
-                            .padding(horizontal = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
-                            if (commandText.isEmpty()) {
-                                Text(
-                                    text = "Escribe comando CLI (ej. netcheck)...",
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 12.sp,
-                                    color = Color(0xFF64748B),
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                            BasicTextField(
-                                value = commandText,
-                                onValueChange = { commandText = it },
-                                singleLine = true,
-                                textStyle = TextStyle(
-                                    color = Color.White,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 13.sp
-                                ),
-                                cursorBrush = SolidColor(Color(0xFF10B981)),
-                                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                                keyboardActions = KeyboardActions(
-                                    onSend = {
-                                        if (commandText.isNotBlank()) {
-                                            onRunCommand(commandText)
-                                            commandText = ""
-                                        }
-                                    }
-                                ),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
-                    }
-
-                    FilledIconButton(
-                        onClick = {
-                            if (commandText.isNotBlank()) {
-                                onRunCommand(commandText)
-                                commandText = ""
-                            }
-                        },
-                        colors = IconButtonDefaults.filledIconButtonColors(
-                            containerColor = Color(0xFF047857)
-                        ),
-                        modifier = Modifier.size(44.dp)
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Ejecutar comando")
-                    }
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Ejecutar comando")
                 }
             }
         }

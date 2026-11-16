@@ -10,6 +10,7 @@ import com.bedrockdroid.rs.model.AndroidLauncherConfig
 import com.bedrockdroid.rs.model.EngineLane
 import com.bedrockdroid.rs.model.HardwareScanReport
 import com.bedrockdroid.rs.model.JavaFlavor
+import com.bedrockdroid.rs.model.LauncherPrefs
 import com.bedrockdroid.rs.model.LogStream
 import com.bedrockdroid.rs.model.NetworkProbeReport
 import com.bedrockdroid.rs.model.ServerRuntimeState
@@ -228,7 +229,15 @@ object EngineLaunchPlanner {
                     lower.contains("java") -> EngineLane.JAVA
                     else -> EngineLane.HYBRID
                 }
+                if (ServerRuntimeState.isRunning.value && targetLane != cfg.activeLane) {
+                    ServerRuntimeState.appendLog(
+                        LogStream.WARN,
+                        "Detén el servidor antes de cambiar de perfil (ejecuta 'stop' primero)."
+                    )
+                    return
+                }
                 val updated = cfg.copy(activeLane = targetLane)
+                LauncherPrefs.save(context, updated)
                 onConfigChange(updated)
                 if (targetLane == EngineLane.JAVA || targetLane == EngineLane.HYBRID) {
                     ServerRuntimeState.appendLog(

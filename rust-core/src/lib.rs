@@ -1,3 +1,5 @@
+#![allow(unused_crate_dependencies)]
+
 pub mod net;
 pub mod perf;
 pub mod runtime;

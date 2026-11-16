@@ -31,6 +31,8 @@ class ServerForegroundService : Service() {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var lanDiscovery: LanDiscoveryManager? = null
     private var networkMonitor: NetworkMonitor? = null
+    @Volatile
+    private var rustRuntimeStarted: Boolean = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         LogBuffer.startProcessLogcatCollector()
@@ -54,67 +56,142 @@ class ServerForegroundService : Service() {
             startForeground(NOTIF_ID, notification)
         }
 
-        acquireSurvivalLocks(cfg)
+        val locksOk = acquireSurvivalLocks(cfg)
+        ServerRuntimeState.setLocksAcquired(locksOk)
 
         val laneDir = EngineLaunchPlanner.laneDirectory(filesDir, cfg.activeLane)
         EngineLaunchPlanner.ensureEula(laneDir, cfg.eulaAccepted)
-        if (cfg.activeLane == EngineLane.HYBRID) {
-            EngineLaunchPlanner.createOrUpdateHybridProfile(filesDir, cfg)
-        }
 
-        lanDiscovery = LanDiscoveryManager(this).apply {
-            if (cfg.enableMdns) {
-                runCatching { registerLanService(cfg.serverName, cfg.bedrockPort) }
-                    .onSuccess {
-                        ServerRuntimeState.appendLog(
-                            LogStream.NET,
-                            "[mDNS] Anunciando _minecraft._udp en puerto ${cfg.bedrockPort}"
-                        )
-                    }
-            }
-        }
+        // Reiniciar monitores previos antes de levantar el carril seleccionado
+        runCatching { lanDiscovery?.unregister() }
+        lanDiscovery = null
+        runCatching { networkMonitor?.stopObserving() }
+        networkMonitor = null
+        rustRuntimeStarted = false
 
-        networkMonitor = NetworkMonitor(this).apply {
-            if (cfg.networkCallbackEnabled) {
-                startObserving {
-                    val probeJson = RustCoreBridge.probeNetworkAndUpnpSafe(
-                        cfg.bedrockPort,
-                        cfg.javaPort,
-                        cfg.enableUpnp,
-                        cfg.dualStackIpv6
-                    )
-                    if (probeJson != null) {
-                        ServerRuntimeState.appendLog(LogStream.NET, "[NetworkCallback] $probeJson")
+        when (cfg.activeLane) {
+            EngineLane.BEDROCK -> {
+                // Carril Bedrock: SOLO motor nativo Rust + RakNet/mDNS UDP. NO iniciar JVM.
+                if (cfg.enableMdns) {
+                    lanDiscovery = LanDiscoveryManager(this).apply {
+                        runCatching { registerLanService(cfg.serverName, cfg.bedrockPort) }
+                            .onSuccess {
+                                ServerRuntimeState.appendLog(
+                                    LogStream.NET,
+                                    "[mDNS] Anunciando _minecraft._udp en puerto ${cfg.bedrockPort}"
+                                )
+                            }
                     }
                 }
+
+                if (cfg.networkCallbackEnabled) {
+                    networkMonitor = NetworkMonitor(this).apply {
+                        startObserving {
+                            val probeJson = RustCoreBridge.probeNetworkAndUpnpSafe(
+                                cfg.bedrockPort,
+                                cfg.javaPort,
+                                cfg.enableUpnp,
+                                cfg.dualStackIpv6
+                            )
+                            if (probeJson != null) {
+                                ServerRuntimeState.appendLog(LogStream.NET, "[NetworkCallback] $probeJson")
+                            }
+                        }
+                    }
+                }
+
+                val rustStatus = RustCoreBridge.initRuntimeSafe(
+                    laneDir.absolutePath,
+                    cfg.localFastPath,
+                    cfg.tcpNoDelay,
+                    cfg.ipTosLowDelay,
+                    cfg.localJitterMs,
+                    cfg.wanMtuBytes,
+                    cfg.snapdragonPinning,
+                    cfg.ioPriorityBe,
+                    cfg.thermalGuardC
+                )
+                rustRuntimeStarted = rustStatus.startsWith("OK")
+                val rustStream = if (rustRuntimeStarted) LogStream.STDOUT else LogStream.ERR
+                ServerRuntimeState.appendLog(rustStream, "[Rust JNI] $rustStatus", "RustJNI")
+            }
+
+            EngineLane.JAVA -> {
+                // Carril Java: SOLO JVM ARM64 en TCP 25565. NO invocar initRuntime ni RakNet/mDNS UDP 19132.
+                val jvmArgs = EngineLaunchPlanner.buildJvmArgs(cfg).joinToString(" ")
+                ServerRuntimeState.appendLog(
+                    LogStream.STDOUT,
+                    "[JVM ARM64] Iniciando perfil Java (${cfg.javaFlavor.label} ${cfg.javaVersion}) en TCP ${cfg.javaPort}"
+                )
+                ServerRuntimeState.appendLog(
+                    LogStream.STDOUT,
+                    "[JVM ARM64] $jvmArgs"
+                )
+            }
+
+            EngineLane.HYBRID -> {
+                // Carril Híbrido: inicia AMBOS -> JVM ARM64 (TCP 25565) + motor Bedrock/Geyser Rust JNI (UDP 19132).
+                EngineLaunchPlanner.createOrUpdateHybridProfile(filesDir, cfg)
+                val jvmArgs = EngineLaunchPlanner.buildJvmArgs(cfg).joinToString(" ")
+                ServerRuntimeState.appendLog(
+                    LogStream.STDOUT,
+                    "[JVM ARM64] Iniciando base Java (${cfg.javaFlavor.label} ${cfg.javaVersion} + Geyser ${cfg.hybridGeyserVersion}) en TCP ${cfg.javaPort}"
+                )
+                ServerRuntimeState.appendLog(
+                    LogStream.STDOUT,
+                    "[JVM ARM64] $jvmArgs"
+                )
+
+                if (cfg.enableMdns) {
+                    lanDiscovery = LanDiscoveryManager(this).apply {
+                        runCatching { registerLanService(cfg.serverName, cfg.bedrockPort) }
+                            .onSuccess {
+                                ServerRuntimeState.appendLog(
+                                    LogStream.NET,
+                                    "[mDNS] Anunciando _minecraft._udp en puerto ${cfg.bedrockPort}"
+                                )
+                            }
+                    }
+                }
+
+                if (cfg.networkCallbackEnabled) {
+                    networkMonitor = NetworkMonitor(this).apply {
+                        startObserving {
+                            val probeJson = RustCoreBridge.probeNetworkAndUpnpSafe(
+                                cfg.bedrockPort,
+                                cfg.javaPort,
+                                cfg.enableUpnp,
+                                cfg.dualStackIpv6
+                            )
+                            if (probeJson != null) {
+                                ServerRuntimeState.appendLog(LogStream.NET, "[NetworkCallback] $probeJson")
+                            }
+                        }
+                    }
+                }
+
+                val rustStatus = RustCoreBridge.initRuntimeSafe(
+                    laneDir.absolutePath,
+                    cfg.localFastPath,
+                    cfg.tcpNoDelay,
+                    cfg.ipTosLowDelay,
+                    cfg.localJitterMs,
+                    cfg.wanMtuBytes,
+                    cfg.snapdragonPinning,
+                    cfg.ioPriorityBe,
+                    cfg.thermalGuardC
+                )
+                rustRuntimeStarted = rustStatus.startsWith("OK")
+                val rustStream = if (rustRuntimeStarted) LogStream.STDOUT else LogStream.ERR
+                ServerRuntimeState.appendLog(rustStream, "[Rust JNI] $rustStatus", "RustJNI")
             }
         }
-
-        val rustStatus = RustCoreBridge.initRuntimeSafe(
-            laneDir.absolutePath,
-            cfg.localFastPath,
-            cfg.tcpNoDelay,
-            cfg.ipTosLowDelay,
-            cfg.localJitterMs,
-            cfg.wanMtuBytes,
-            cfg.snapdragonPinning,
-            cfg.ioPriorityBe,
-            cfg.thermalGuardC
-        )
 
         ServerRuntimeState.setRunning(true)
         ServerRuntimeState.appendLog(
             LogStream.STDOUT,
             "[Servicio 24/7] Carril ${cfg.activeLane.label} iniciado en ${laneDir.absolutePath}"
         )
-        val rustStream = if (rustStatus.startsWith("OK")) LogStream.STDOUT else LogStream.ERR
-        ServerRuntimeState.appendLog(rustStream, "[Rust JNI] $rustStatus", "RustJNI")
-        if (cfg.activeLane != EngineLane.BEDROCK) {
-            ServerRuntimeState.appendLog(
-                LogStream.STDOUT,
-                "[JVM ARM64] ${EngineLaunchPlanner.buildJvmArgs(cfg).joinToString(" ")}"
-            )
-        }
         ServerRuntimeState.appendLog(
             LogStream.NET,
             "[Fast-Path Local] Juega en este celular en 127.0.0.1:$activePort (<1 ms, jitter=0ms)"
@@ -123,35 +200,51 @@ class ServerForegroundService : Service() {
         return START_STICKY
     }
 
-    private fun acquireSurvivalLocks(cfg: AndroidLauncherConfig) {
+    private fun acquireSurvivalLocks(cfg: AndroidLauncherConfig): Boolean {
         if (cfg.partialWakeLockEnabled) {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BedrockDroidRS::ServerWakeLock").apply {
-                setReferenceCounted(false)
-                if (!isHeld) acquire()
+            runCatching {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BedrockDroidRS::ServerWakeLock").apply {
+                    setReferenceCounted(false)
+                    if (!isHeld) acquire()
+                }
             }
         }
 
-        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        if (cfg.wifiLowLatencyLock) {
-            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            } else {
-                @Suppress("DEPRECATION")
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
-            }
-            wifiLock = wifi.createWifiLock(mode, "BedrockDroidRS::LowLatencyWifi").apply {
-                setReferenceCounted(false)
-                if (!isHeld) acquire()
+        val wifi = runCatching { applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager }.getOrNull()
+        if (wifi != null && cfg.wifiLowLatencyLock) {
+            runCatching {
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wifi.createWifiLock(mode, "BedrockDroidRS::LowLatencyWifi").apply {
+                    setReferenceCounted(false)
+                    if (!isHeld) acquire()
+                }
             }
         }
 
-        if (cfg.multicastLockEnabled) {
-            multicastLock = wifi.createMulticastLock("BedrockDroidRS::MdnsMulticast").apply {
-                setReferenceCounted(false)
-                if (!isHeld) acquire()
+        if (wifi != null && cfg.multicastLockEnabled) {
+            runCatching {
+                multicastLock = wifi.createMulticastLock("BedrockDroidRS::MdnsMulticast").apply {
+                    setReferenceCounted(false)
+                    if (!isHeld) acquire()
+                }
             }
         }
+
+        val wakeOk = !cfg.partialWakeLockEnabled || (wakeLock?.isHeld == true)
+        val wifiOk = !cfg.wifiLowLatencyLock || (wifiLock?.isHeld == true)
+        val multiOk = !cfg.multicastLockEnabled || (multicastLock?.isHeld == true)
+        val allAcquired = wakeOk && wifiOk && multiOk
+        ServerRuntimeState.appendLog(
+            if (allAcquired) LogStream.STDOUT else LogStream.WARN,
+            "[Locks 24/7] WakeLock=${wakeLock?.isHeld == true} · WifiLock=${wifiLock?.isHeld == true} · Multicast=${multicastLock?.isHeld == true}"
+        )
+        return allAcquired
     }
 
     private fun ensureNotificationChannel() {
@@ -177,11 +270,17 @@ class ServerForegroundService : Service() {
 
     override fun onDestroy() {
         runCatching { lanDiscovery?.unregister() }
+        lanDiscovery = null
         runCatching { networkMonitor?.stopObserving() }
+        networkMonitor = null
         runCatching { if (multicastLock?.isHeld == true) multicastLock?.release() }
         runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
         runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
-        RustCoreBridge.shutdownRuntimeSafe()
+        if (rustRuntimeStarted) {
+            RustCoreBridge.shutdownRuntimeSafe()
+            rustRuntimeStarted = false
+        }
+        ServerRuntimeState.setLocksAcquired(false)
         ServerRuntimeState.setRunning(false)
         ServerRuntimeState.appendLog(LogStream.WARN, "[Servicio 24/7] Servidor detenido y locks liberados.")
         LogBuffer.stopProcessLogcatCollector()

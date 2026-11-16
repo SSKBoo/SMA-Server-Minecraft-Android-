@@ -224,11 +224,18 @@ object ServerRuntimeState {
     private val _isRunning = MutableStateFlow(false)
     val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
 
+    private val _locksAcquired = MutableStateFlow(false)
+    val locksAcquired: StateFlow<Boolean> = _locksAcquired.asStateFlow()
+
     val logs: StateFlow<List<ConsoleLogLine>>
         get() = LogBuffer.logs
 
     fun setRunning(running: Boolean) {
         _isRunning.value = running
+    }
+
+    fun setLocksAcquired(acquired: Boolean) {
+        _locksAcquired.value = acquired
     }
 
     fun appendLog(stream: LogStream, text: String, tag: String = "BedrockDroidUI") {

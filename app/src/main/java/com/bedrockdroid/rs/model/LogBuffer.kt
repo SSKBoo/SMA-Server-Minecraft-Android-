@@ -111,11 +111,20 @@ object LogBuffer {
         try {
             if (logcatJob?.isActive == true) return
             val pid = Process.myPid()
-            appendLevel(LogLevel.DEBUG, "LogcatPipe", "Iniciando captura logcat --pid=$pid (*:D)")
+            val command = arrayOf(
+                "logcat", "--pid=$pid", "-s",
+                "BedrockDroidRS:V", "bedrockdroid.rs:V", "RustJNI:V", "LogBuffer:V", "BedrockDroidUI:V",
+                "*:S" // Silencia todo lo demás
+            )
+            appendLevel(
+                LogLevel.DEBUG,
+                "LogcatPipe",
+                "Iniciando captura logcat --pid=$pid -s BedrockDroidRS:V bedrockdroid.rs:V RustJNI:V LogBuffer:V BedrockDroidUI:V *:S"
+            )
 
             logcatJob = collectorScope.launch {
                 try {
-                    val proc = ProcessBuilder("logcat", "--pid=$pid", "-v", "time", "*:D")
+                    val proc = ProcessBuilder(*command)
                         .redirectErrorStream(true)
                         .start()
                     logcatProcess = proc
@@ -160,28 +169,24 @@ object LogBuffer {
     }
 
     private fun parseAndAppendLogcatLine(raw: String) {
-        if (raw.isBlank() || raw.startsWith("--------- beginning of")) return
+        val trimmed = raw.trim()
+        if (trimmed.isBlank() || trimmed.startsWith("--------- beginning of")) return
         val level = when {
-            raw.contains(" E/") || raw.contains(" F/") -> LogLevel.ERROR
-            raw.contains(" W/") -> LogLevel.WARN
-            raw.contains(" I/") -> LogLevel.INFO
-            raw.contains(" D/") -> LogLevel.DEBUG
+            trimmed.startsWith("E/") || trimmed.startsWith("F/") || trimmed.contains(" E/") || trimmed.contains(" F/") -> LogLevel.ERROR
+            trimmed.startsWith("W/") || trimmed.contains(" W/") -> LogLevel.WARN
+            trimmed.startsWith("I/") || trimmed.contains(" I/") -> LogLevel.INFO
+            trimmed.startsWith("D/") || trimmed.startsWith("V/") || trimmed.contains(" D/") || trimmed.contains(" V/") -> LogLevel.DEBUG
             else -> return
         }
-        // Priorizar logs propios del núcleo Rust y fallos AndroidRuntime; evitar bucle con ruido Compose
-        val isNativeCore = raw.contains("BedrockDroidRS") ||
-            raw.contains("bedrock_android_core") ||
-            raw.contains("AndroidRuntime") ||
-            raw.contains("libc") ||
-            raw.contains("tokio")
-        if (!isNativeCore && level == LogLevel.DEBUG) return
-
         val tag = when {
-            raw.contains("BedrockDroidRS") -> "BedrockDroidRS"
-            raw.contains("AndroidRuntime") -> "AndroidRuntime"
-            else -> "logcat"
+            trimmed.contains("BedrockDroidRS") -> "BedrockDroidRS"
+            trimmed.contains("bedrockdroid.rs") -> "bedrockdroid.rs"
+            trimmed.contains("RustJNI") -> "RustJNI"
+            trimmed.contains("LogBuffer") -> "LogBuffer"
+            trimmed.contains("BedrockDroidUI") -> "BedrockDroidUI"
+            else -> return
         }
-        appendLevel(level, tag, raw.trim())
+        appendLevel(level, tag, trimmed)
     }
 
     fun exportLogs(context: Context): File? {

@@ -94,8 +94,16 @@ class MainActivity : ComponentActivity() {
                 val logs by ServerRuntimeState.logs.collectAsState()
 
                 val updateConfig: (com.bedrockdroid.rs.model.AndroidLauncherConfig) -> Unit = { next ->
-                    config = next
-                    runCatching { LauncherPrefs.save(this@MainActivity, next) }
+                    if (isRunning && next.activeLane != config.activeLane) {
+                        android.widget.Toast.makeText(
+                            this@MainActivity,
+                            "Detén el servidor antes de cambiar de perfil",
+                            android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        config = next
+                        runCatching { LauncherPrefs.save(this@MainActivity, next) }
+                    }
                 }
 
                 Scaffold(
