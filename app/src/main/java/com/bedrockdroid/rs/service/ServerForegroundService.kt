@@ -62,6 +62,7 @@ class ServerForegroundService : Service() {
             startForeground(NOTIF_ID, notification)
         }
 
+        ServerRuntimeState.setLocksAcquired(false)
         val locksOk = acquireSurvivalLocks(cfg)
         ServerRuntimeState.setLocksAcquired(locksOk)
 
@@ -129,6 +130,7 @@ class ServerForegroundService : Service() {
                 val rustStatus = RustCoreBridge.initRuntimeSafe(
                     laneDir.absolutePath,
                     cfg.serverName,
+                    cfg.activeLane.name,
                     cfg.bedrockPort,
                     cfg.localFastPath,
                     cfg.tcpNoDelay,
@@ -203,6 +205,7 @@ class ServerForegroundService : Service() {
                 val rustStatus = RustCoreBridge.initRuntimeSafe(
                     laneDir.absolutePath,
                     cfg.serverName,
+                    cfg.activeLane.name,
                     cfg.bedrockPort,
                     cfg.localFastPath,
                     cfg.tcpNoDelay,
@@ -268,13 +271,14 @@ class ServerForegroundService : Service() {
             }
         }
 
-        val wakeOk = !cfg.partialWakeLockEnabled || (wakeLock?.isHeld == true)
-        val wifiOk = !cfg.wifiLowLatencyLock || (wifiLock?.isHeld == true)
-        val multiOk = !cfg.multicastLockEnabled || (multicastLock?.isHeld == true)
+        // Solo PASS cuando los tres locks (WakeLock, WifiLock y MulticastLock) están activamente adquiridos
+        val wakeOk = wakeLock?.isHeld == true
+        val wifiOk = wifiLock?.isHeld == true
+        val multiOk = multicastLock?.isHeld == true
         val allAcquired = wakeOk && wifiOk && multiOk
         ServerRuntimeState.appendLog(
             if (allAcquired) LogStream.STDOUT else LogStream.WARN,
-            "[Locks 24/7] WakeLock=${wakeLock?.isHeld == true} · WifiLock=${wifiLock?.isHeld == true} · Multicast=${multicastLock?.isHeld == true}"
+            "[Locks 24/7] WakeLock=$wakeOk · WifiLock=$wifiOk · Multicast=$multiOk (all=$allAcquired)"
         )
         return allAcquired
     }
@@ -307,8 +311,11 @@ class ServerForegroundService : Service() {
         runCatching { networkMonitor?.stopObserving() }
         networkMonitor = null
         runCatching { if (multicastLock?.isHeld == true) multicastLock?.release() }
+        multicastLock = null
         runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
+        wifiLock = null
         runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+        wakeLock = null
         if (rustRuntimeStarted) {
             RustCoreBridge.shutdownRuntimeSafe()
             rustRuntimeStarted = false

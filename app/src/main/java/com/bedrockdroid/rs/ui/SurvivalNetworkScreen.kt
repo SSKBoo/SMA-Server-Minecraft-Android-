@@ -67,6 +67,7 @@ fun SurvivalNetworkScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var refreshTrigger by remember { mutableIntStateOf(0) }
+    val serverStatus by ServerRuntimeState.serverStatus.collectAsState()
     val locksAcquired by ServerRuntimeState.locksAcquired.collectAsState()
 
     val lifecycleOwner = context as? LifecycleOwner
@@ -105,7 +106,8 @@ fun SurvivalNetworkScreen(
         cm.restrictBackgroundStatus != ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED
     }
 
-    val wakeLocksPass = locksAcquired || isRunning
+    // Solo PASS (verde) cuando el servidor está activo Y los tres locks fueron adquiridos
+    val wakeLocksPass = serverStatus.isRunning && serverStatus.locksAcquired && locksAcquired
     val oemGranted = config.oemAutostartConfirmed
     val passCount = listOf(notifGranted, dozeExempt, bgDataUnrestricted, wakeLocksPass, oemGranted).count { it }
     val checklistBadge = if (passCount == 5) "$passCount/5 PASS" else "$passCount/5 PENDIENTE"
@@ -275,7 +277,8 @@ private fun ChecklistRow(title: String, passed: Boolean, onAction: () -> Unit) {
                 if (passed) "PASS" else "PENDIENTE",
                 fontSize = 11.sp,
                 fontFamily = FontFamily.Monospace,
-                color = if (passed) Color(0xFF047857) else Color(0xFFD97706)
+                fontWeight = if (passed) FontWeight.Bold else FontWeight.Medium,
+                color = if (passed) Color(0xFF047857) else Color(0xFF64748B)
             )
         }
         if (!passed) {

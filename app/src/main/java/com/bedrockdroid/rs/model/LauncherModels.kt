@@ -220,7 +220,15 @@ object LauncherPrefs {
     }
 }
 
+data class ServerStatusSnapshot(
+    val isRunning: Boolean = false,
+    val locksAcquired: Boolean = false
+)
+
 object ServerRuntimeState {
+    private val _serverStatus = MutableStateFlow(ServerStatusSnapshot())
+    val serverStatus: StateFlow<ServerStatusSnapshot> = _serverStatus.asStateFlow()
+
     private val _isRunning = MutableStateFlow(false)
     val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
 
@@ -244,10 +252,17 @@ object ServerRuntimeState {
 
     fun setRunning(running: Boolean) {
         _isRunning.value = running
+        val nextLocks = if (running) _serverStatus.value.locksAcquired else false
+        _locksAcquired.value = nextLocks
+        _serverStatus.value = ServerStatusSnapshot(
+            isRunning = running,
+            locksAcquired = nextLocks
+        )
     }
 
     fun setLocksAcquired(acquired: Boolean) {
         _locksAcquired.value = acquired
+        _serverStatus.value = _serverStatus.value.copy(locksAcquired = acquired)
     }
 
     fun setScanningHardware(scanning: Boolean) {

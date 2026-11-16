@@ -20,6 +20,7 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
     _class: JClass,
     engine_dir: JString,
     server_name: JString,
+    lane_name: JString,
     bedrock_port: jint,
     local_fast_path: jboolean,
     tcp_no_delay: jboolean,
@@ -44,6 +45,12 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
             .unwrap_or_else(|_| "BedrockDroid RS".to_string())
     };
 
+    let lane: String = {
+        env.get_string(&lane_name)
+            .map(|s| s.into())
+            .unwrap_or_else(|_| "BEDROCK".to_string())
+    };
+
     let udp_port = if bedrock_port <= 0 || bedrock_port > 65535 {
         19132
     } else {
@@ -64,7 +71,7 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
         thermal_guard_c,
     );
 
-    let engine_state = match runtime::start_async_engine(&dir, &motd_name, udp_port, net_cfg) {
+    let engine_state = match runtime::start_async_engine(&dir, &motd_name, &lane, udp_port, net_cfg) {
         Ok(summary) => summary,
         Err(err) => format!("engine_err={}", err),
     };
