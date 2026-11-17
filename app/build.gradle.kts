@@ -52,6 +52,12 @@ android {
         compose = true
     }
 
+    packaging {
+        jniLibs {
+            keepDebugSymbols += setOf("**/*.so")
+        }
+    }
+
     sourceSets {
         getByName("main") {
             jniLibs.srcDirs("src/main/jniLibs")

@@ -4,7 +4,7 @@ pub mod net;
 pub mod perf;
 pub mod runtime;
 
-use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE, JNI_VERSION_1_6};
 use jni::JNIEnv;
 use std::path::PathBuf;
@@ -24,6 +24,23 @@ fn into_jstring_or_null(env: &JNIEnv, text: String) -> jstring {
     env.new_string(text)
         .map(JString::into_raw)
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// Copia segura de `JByteArray` desde ART a `Vec<u8>` mediante `get_byte_array_region`.
+/// Nunca usar `Vec::from_raw_parts` sobre punteros JNI de `get_array_elements`: ART es dueño
+/// de esa memoria y llamar `free()` desde Rust dispara `SIGABRT`.
+#[allow(dead_code)]
+pub fn copy_jbyte_array_safe(env: &JNIEnv, array: &JByteArray) -> Result<Vec<u8>, String> {
+    let len = env
+        .get_array_length(array)
+        .map_err(|e| format!("JNI get_array_length error: {}", e))?;
+    if len <= 0 {
+        return Ok(Vec::new());
+    }
+    let mut raw = vec![0i8; len as usize];
+    env.get_byte_array_region(array, 0, &mut raw)
+        .map_err(|e| format!("JNI get_byte_array_region error: {}", e))?;
+    Ok(raw.into_iter().map(|b| b as u8).collect())
 }
 
 #[no_mangle]

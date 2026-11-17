@@ -28,6 +28,7 @@ full-server = ["protocol-core", "auth-xbl", "world-level", "transport-nethernet"
 bedrock = { git = "https://github.com/bedrock-crustaceans/bedrock-rs.git", rev = "a730b6bbf28c80dee37ff82d2275f1db9078c03e", default-features = false, optional = true }
 
 # Transporte NetherNet (WebRTC ICE/DTLS/SCTP + señalización HTTP /v1/join) y capa de sesión Bedrock 26.60+
+# Nota P3: crates.io publica acacia-nethernet 0.1.0 (depende de str0m ^0.24.0; Cargo.lock regenerado en CI toma el parche 0.24.x más reciente)
 acacia-nethernet = "0.1.0"
 acacia-session = "0.1.0"
 p384 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
@@ -70,7 +71,8 @@ ctr = { opt-level = 3 }
 
 [profile.release]
 panic = "unwind"
-debug = 1
+debug = 2
+strip = false
 opt-level = 3
 lto = "thin"
 codegen-units = 1
