@@ -145,6 +145,13 @@ class ServerForegroundService : Service() {
                         }
                     }
 
+                    RustCoreBridge.registerCrashCallbackSafe(
+                        com.bedrockdroid.rs.crash.CrashLogFileManager.getCrashLogFile(applicationContext).absolutePath,
+                        com.bedrockdroid.rs.crash.CrashHandler.isProtectionEnabled(applicationContext)
+                    ) { error ->
+                        com.bedrockdroid.rs.crash.CrashHandler.logCrash(error)
+                    }
+
                     RustCoreBridge.registerPlayerCallbackSafe { playerName, count, connected ->
                         ServerRuntimeState.setPlayerConnected(connected, count, playerName)
                         if (connected) {
@@ -257,6 +264,13 @@ class ServerForegroundService : Service() {
                                 }
                             }
                         }
+                    }
+
+                    RustCoreBridge.registerCrashCallbackSafe(
+                        com.bedrockdroid.rs.crash.CrashLogFileManager.getCrashLogFile(applicationContext).absolutePath,
+                        com.bedrockdroid.rs.crash.CrashHandler.isProtectionEnabled(applicationContext)
+                    ) { error ->
+                        com.bedrockdroid.rs.crash.CrashHandler.logCrash(error)
                     }
 
                     RustCoreBridge.registerPlayerCallbackSafe { playerName, count, connected ->

@@ -1,5 +1,6 @@
 # Protección obligatoria de símbolos JNI y puente nativo Rust
 -keep class com.bedrockdroid.rs.nativebridge.** { *; }
+-keep class com.bedrockdroid.rs.crash.** { *; }
 -keepclasseswithmembernames,includedescriptorclasses class * {
     native <methods>;
 }

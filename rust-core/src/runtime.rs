@@ -21,12 +21,15 @@ use flate2::read::{DeflateDecoder, ZlibDecoder};
 use p384::ecdsa::SigningKey;
 use rand_core::OsRng;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::any::Any;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::runtime::{Builder, Runtime};
@@ -84,9 +87,13 @@ struct ConnectedPlayerState {
 }
 
 pub type PlayerEventHook = Arc<dyn Fn(&str, usize, bool) + Send + Sync>;
+pub type CrashEventHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 static PLAYER_STATE: OnceLock<Mutex<ConnectedPlayerState>> = OnceLock::new();
 static PLAYER_EVENT_HOOK: OnceLock<Mutex<Option<PlayerEventHook>>> = OnceLock::new();
+static CRASH_EVENT_HOOK: OnceLock<Mutex<Option<CrashEventHook>>> = OnceLock::new();
+static CRASH_LOG_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+static CRASH_PROTECTION_ENABLED: AtomicBool = AtomicBool::new(false);
 
 fn player_state_slot() -> &'static Mutex<ConnectedPlayerState> {
     PLAYER_STATE.get_or_init(|| Mutex::new(ConnectedPlayerState::default()))
@@ -94,6 +101,100 @@ fn player_state_slot() -> &'static Mutex<ConnectedPlayerState> {
 
 fn player_hook_slot() -> &'static Mutex<Option<PlayerEventHook>> {
     PLAYER_EVENT_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+fn crash_hook_slot() -> &'static Mutex<Option<CrashEventHook>> {
+    CRASH_EVENT_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+fn crash_log_path_slot() -> &'static Mutex<Option<PathBuf>> {
+    CRASH_LOG_PATH.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_crash_protection_enabled(enabled: bool) {
+    CRASH_PROTECTION_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
+pub fn is_crash_protection_enabled() -> bool {
+    CRASH_PROTECTION_ENABLED.load(Ordering::SeqCst)
+}
+
+pub fn set_crash_log_path(path: Option<PathBuf>) {
+    if let Ok(mut guard) = crash_log_path_slot().lock() {
+        *guard = path;
+    }
+}
+
+pub fn set_crash_event_hook(hook: Option<CrashEventHook>) {
+    if let Ok(mut guard) = crash_hook_slot().lock() {
+        *guard = hook;
+    }
+}
+
+pub fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown non-string panic payload".to_string()
+    }
+}
+
+fn append_crash_to_disk(error: &str) {
+    if !is_crash_protection_enabled() {
+        return;
+    }
+    let path_opt = crash_log_path_slot().lock().ok().and_then(|g| g.clone());
+    if let Some(path) = path_opt {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let epoch_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(file, "=== [epoch={}] RUST CRASH / PANIC ===", epoch_secs);
+            let _ = writeln!(file, "{}", error.trim_end());
+            let _ = writeln!(file);
+            let _ = file.flush();
+            let _ = file.sync_all();
+        }
+    }
+}
+
+pub fn report_rust_crash(error: &str) {
+    if !is_crash_protection_enabled() {
+        return;
+    }
+    log::error!("{}", error);
+    append_crash_to_disk(error);
+    let hook_opt = crash_hook_slot().lock().ok().and_then(|g| g.clone());
+    if let Some(hook) = hook_opt {
+        hook(error);
+    }
+}
+
+pub fn run_catch_unwind<F: FnOnce()>(context_label: &str, f: F) -> bool {
+    if !is_crash_protection_enabled() {
+        f();
+        return true;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(()) => true,
+        Err(payload) => {
+            let bt = std::backtrace::Backtrace::force_capture();
+            let msg = format!(
+                "[Rust Panic] Excepción capturada en {}: {}\n--- Rust Backtrace ---\n{}",
+                context_label,
+                panic_payload_to_string(payload),
+                bt
+            );
+            report_rust_crash(&msg);
+            false
+        }
+    }
 }
 
 pub fn set_player_event_hook(hook: Option<PlayerEventHook>) {
@@ -1231,17 +1332,19 @@ pub fn handle_bedrock_session_data(
             }
         };
 
-        let name = packet_name(pkt.id).unwrap_or("UnknownPacket");
-        log::info!(
-            "Paquete de Bedrock recibido (ID: 0x{:02x} / {}) desde {} ({} bytes)",
-            pkt.id,
-            name,
-            peer_addr,
-            pkt.body.len()
-        );
-        log::info!("[Bedrock Protocol] Recibido paquete de Minecraft: 0x{:02x}", pkt.id);
+        let pkt_id = pkt.id;
+        let _ = run_catch_unwind(&format!("bedrock_packet_0x{:02x}", pkt_id), || {
+            let name = packet_name(pkt.id).unwrap_or("UnknownPacket");
+            log::info!(
+                "Paquete de Bedrock recibido (ID: 0x{:02x} / {}) desde {} ({} bytes)",
+                pkt.id,
+                name,
+                peer_addr,
+                pkt.body.len()
+            );
+            log::info!("[Bedrock Protocol] Recibido paquete de Minecraft: 0x{:02x}", pkt.id);
 
-        match pkt.id {
+            match pkt.id {
             // TAREA 3.1: RequestNetworkSettings (0xC1 / 193) -> NetworkSettings (0x8F)
             id if id == RequestNetworkSettings::ID || (!progress.has_sent_network_settings && id == 0x0b) => {
                 if let Ok(req) = pkt.decode::<RequestNetworkSettings>() {
@@ -1419,6 +1522,7 @@ pub fn handle_bedrock_session_data(
                 );
             }
         }
+        });
     }
 }
 
@@ -1541,7 +1645,29 @@ async fn handle_http_signaling_stream(
 
         let local_candidate = resolve_local_candidate_addr(local_tcp_ip, udp_port);
         let now = Instant::now();
-        match Connection::answer(offer_sdp, local_candidate, &host_key, now) {
+        let answer_res = if is_crash_protection_enabled() {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Connection::answer(offer_sdp, local_candidate, &host_key, now)
+            })) {
+                Ok(r) => r,
+                Err(payload) => {
+                    let bt = std::backtrace::Backtrace::force_capture();
+                    let panic_msg = format!(
+                        "[Rust Panic] Connection::answer HTTP desde {}: {}\n--- Rust Backtrace ---\n{}",
+                        peer_addr,
+                        panic_payload_to_string(payload),
+                        bt
+                    );
+                    report_rust_crash(&panic_msg);
+                    let resp = http::response(500, "text/plain", "Internal Rust panic during WebRTC answer");
+                    let _ = stream.write_all(&resp).await;
+                    return;
+                }
+            }
+        } else {
+            Connection::answer(offer_sdp, local_candidate, &host_key, now)
+        };
+        match answer_res {
             Ok((mut conn, answer_sdp)) => {
                 log::info!(
                     "Señalización HTTP recibida: SDP offer procesado para {} (candidato ICE local={} client_ver={:?})",
@@ -1594,6 +1720,7 @@ async fn handle_http_signaling_stream(
 }
 
 /// Inicializa logcat nativo y registra panic_hook exactamente una sola vez.
+/// Redirige cualquier Rust Panic (mensaje + ubicación + backtrace) hacia archivo en disco y CrashHandler.logCrash.
 pub fn init_android_logging() {
     LOGGING_INIT.get_or_init(|| {
         #[cfg(target_os = "android")]
@@ -1606,7 +1733,20 @@ pub fn init_android_logging() {
         }
 
         std::panic::set_hook(Box::new(|info| {
-            log::error!("PANIC nativo en bedrock_android_core: {}", info);
+            if !is_crash_protection_enabled() {
+                log::error!("PANIC nativo en bedrock_android_core: {}", info);
+                return;
+            }
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "unknown_location".to_string());
+            let bt = std::backtrace::Backtrace::force_capture();
+            let report = format!(
+                "PANIC nativo en bedrock_android_core ({}): {}\n--- Rust Backtrace ---\n{}",
+                location, info, bt
+            );
+            report_rust_crash(&report);
         }));
     });
 }
@@ -1839,7 +1979,28 @@ pub fn start_async_engine(
                         _ = lan_cancel.cancelled() => break,
                         res = lan_sock.recv_from(&mut lan_buf) => {
                             if let Ok((len, from)) = res {
-                                if let Ok((pkt, sender_id)) = LanPacket::decode(&lan_buf[..len]) {
+                                let decoded_opt = if is_crash_protection_enabled() {
+                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        LanPacket::decode(&lan_buf[..len])
+                                    })) {
+                                        Ok(Ok(v)) => Some(v),
+                                        Ok(Err(_)) => None,
+                                        Err(payload) => {
+                                            let bt = std::backtrace::Backtrace::force_capture();
+                                            let msg = format!(
+                                                "[Rust Panic] LanPacket::decode desde {}: {}\n--- Rust Backtrace ---\n{}",
+                                                from,
+                                                panic_payload_to_string(payload),
+                                                bt
+                                            );
+                                            report_rust_crash(&msg);
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    LanPacket::decode(&lan_buf[..len]).ok()
+                                };
+                                if let Some((pkt, sender_id)) = decoded_opt {
                                     match pkt {
                                         LanPacket::Request => {
                                             let server_data = ServerData {
@@ -1866,7 +2027,28 @@ pub fn start_async_engine(
                                                     SignalKind::ConnectRequest => {
                                                         let local_cand = resolve_local_candidate_addr(None, effective_port);
                                                         let now = Instant::now();
-                                                        if let Ok((mut conn, answer_sdp)) = Connection::answer(&sig.data, local_cand, &lan_key, now) {
+                                                        let lan_ans = if is_crash_protection_enabled() {
+                                                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                                Connection::answer(&sig.data, local_cand, &lan_key, now)
+                                                            })) {
+                                                                Ok(Ok(v)) => Some(v),
+                                                                Ok(Err(_)) => None,
+                                                                Err(payload) => {
+                                                                    let bt = std::backtrace::Backtrace::force_capture();
+                                                                    let msg = format!(
+                                                                        "[Rust Panic] Connection::answer LAN desde {}: {}\n--- Rust Backtrace ---\n{}",
+                                                                        from,
+                                                                        panic_payload_to_string(payload),
+                                                                        bt
+                                                                    );
+                                                                    report_rust_crash(&msg);
+                                                                    None
+                                                                }
+                                                            }
+                                                        } else {
+                                                            Connection::answer(&sig.data, local_cand, &lan_key, now).ok()
+                                                        };
+                                                        if let Some((mut conn, answer_sdp)) = lan_ans {
                                                             log::info!("Señalización LAN recibida: ConnectRequest desde {} (session={})", from, sig.connection_id);
                                                             while let Some(tx) = conn.poll_transmit() {
                                                                 let _ = lan_udp.send_to(&tx.contents, tx.destination).await;
@@ -1977,7 +2159,9 @@ pub fn start_async_engine(
                                     if let Ok(mut guard) = v6_peers.lock() {
                                         let mut closed_ids = Vec::new();
                                         for (&sid, peer) in guard.iter_mut() {
-                                            peer.conn.handle_datagram(now, src_addr, pkt);
+                                            let _ = run_catch_unwind("webrtc_v6_handle_datagram", || {
+                                                peer.conn.handle_datagram(now, src_addr, pkt);
+                                            });
                                             while let Some(ev) = poll_connection_event(&mut peer.conn) {
                                                 match ev {
                                                     Event::Connected => {
@@ -1989,14 +2173,16 @@ pub fn start_async_engine(
                                                         );
                                                     }
                                                     Event::Data(payload) => {
-                                                        handle_bedrock_session_data(
-                                                            &mut peer.conn,
-                                                            &mut peer.session,
-                                                            &mut peer.progress,
-                                                            peer.remote_addr,
-                                                            &payload,
-                                                            now,
-                                                        );
+                                                        let _ = run_catch_unwind("webrtc_v6_session_data", || {
+                                                            handle_bedrock_session_data(
+                                                                &mut peer.conn,
+                                                                &mut peer.session,
+                                                                &mut peer.progress,
+                                                                peer.remote_addr,
+                                                                &payload,
+                                                                now,
+                                                            );
+                                                        });
                                                     }
                                                     Event::Disconnected(reason) => {
                                                         if peer.progress.has_sent_login_success && !peer.progress.has_sent_start_game {
@@ -2115,7 +2301,9 @@ pub fn start_async_engine(
                         if let Ok(mut guard) = peers.lock() {
                             let mut closed_ids = Vec::new();
                             for (&sid, peer) in guard.iter_mut() {
-                                peer.conn.handle_datagram(now, src_addr, pkt);
+                                let _ = run_catch_unwind("webrtc_v4_handle_datagram", || {
+                                    peer.conn.handle_datagram(now, src_addr, pkt);
+                                });
                                 while let Some(ev) = poll_connection_event(&mut peer.conn) {
                                     match ev {
                                         Event::Connected => {
@@ -2127,14 +2315,16 @@ pub fn start_async_engine(
                                             );
                                         }
                                         Event::Data(payload) => {
-                                            handle_bedrock_session_data(
-                                                &mut peer.conn,
-                                                &mut peer.session,
-                                                &mut peer.progress,
-                                                peer.remote_addr,
-                                                &payload,
-                                                now,
-                                            );
+                                            let _ = run_catch_unwind("webrtc_v4_session_data", || {
+                                                handle_bedrock_session_data(
+                                                    &mut peer.conn,
+                                                    &mut peer.session,
+                                                    &mut peer.progress,
+                                                    peer.remote_addr,
+                                                    &payload,
+                                                    now,
+                                                );
+                                            });
                                         }
                                         Event::Disconnected(reason) => {
                                             if peer.progress.has_sent_login_success && !peer.progress.has_sent_start_game {
@@ -2185,7 +2375,9 @@ pub fn start_async_engine(
                     if let Ok(mut guard) = peers.lock() {
                         let mut closed_ids = Vec::new();
                         for (&sid, peer) in guard.iter_mut() {
-                            peer.conn.handle_timeout(now);
+                            let _ = run_catch_unwind("webrtc_rtc_handle_timeout", || {
+                                peer.conn.handle_timeout(now);
+                            });
                             while let Some(ev) = poll_connection_event(&mut peer.conn) {
                                 match ev {
                                     Event::Connected => {
@@ -2196,14 +2388,16 @@ pub fn start_async_engine(
                                         );
                                     }
                                     Event::Data(payload) => {
-                                        handle_bedrock_session_data(
-                                            &mut peer.conn,
-                                            &mut peer.session,
-                                            &mut peer.progress,
-                                            peer.remote_addr,
-                                            &payload,
-                                            now,
-                                        );
+                                        let _ = run_catch_unwind("webrtc_rtc_session_data", || {
+                                            handle_bedrock_session_data(
+                                                &mut peer.conn,
+                                                &mut peer.session,
+                                                &mut peer.progress,
+                                                peer.remote_addr,
+                                                &payload,
+                                                now,
+                                            );
+                                        });
                                     }
                                     Event::Disconnected(reason) => {
                                         if peer.progress.has_sent_login_success && !peer.progress.has_sent_start_game {
@@ -2640,5 +2834,50 @@ mod tests {
 
         reset_player_state();
         set_player_event_hook(None);
+    }
+
+    #[test]
+    fn panic_hook_and_catch_unwind_capture_crash_to_hook_and_file() {
+        let tmp_path = std::env::temp_dir().join(format!("bdr_crash_test_{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&tmp_path);
+        set_crash_log_path(Some(tmp_path.clone()));
+
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_cb = Arc::clone(&captured);
+        set_crash_event_hook(Some(Arc::new(move |err| {
+            if let Ok(mut g) = captured_cb.lock() {
+                g.push(err.to_string());
+            }
+        })));
+
+        // Por defecto desactivada: report_rust_crash no guarda nada en disco
+        set_crash_protection_enabled(false);
+        assert!(!is_crash_protection_enabled());
+        report_rust_crash("should not persist while disabled");
+        assert!(!tmp_path.exists());
+        assert_eq!(captured.lock().expect("lock captured").len(), 0);
+
+        // Activar solo para pruebas: catch_unwind captura pánico y guarda en disco + hook
+        set_crash_protection_enabled(true);
+        assert!(is_crash_protection_enabled());
+
+        let ok = run_catch_unwind("test_packet_join", || {
+            panic!("simulated packet panic during join");
+        });
+        assert!(!ok);
+
+        {
+            let g = captured.lock().expect("lock captured");
+            assert_eq!(g.len(), 1);
+            assert!(g[0].contains("[Rust Panic] Excepción capturada en test_packet_join: simulated packet panic during join"));
+        }
+
+        let disk = std::fs::read_to_string(&tmp_path).expect("crash file must exist");
+        assert!(disk.contains("simulated packet panic during join"));
+
+        let _ = std::fs::remove_file(&tmp_path);
+        set_crash_protection_enabled(false);
+        set_crash_log_path(None);
+        set_crash_event_hook(None);
     }
 }

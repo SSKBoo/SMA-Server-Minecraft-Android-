@@ -1,8 +1,14 @@
 package com.bedrockdroid.rs.nativebridge
 
+import com.bedrockdroid.rs.crash.CrashHandler
+
 object RustCoreBridge {
     fun interface PlayerConnectionListener {
         fun onPlayerLoginStateChanged(playerName: String, connectedCount: Int, connected: Boolean)
+    }
+
+    fun interface CrashCallbackListener {
+        fun onRustCrash(error: String)
     }
 
     @Volatile
@@ -24,6 +30,31 @@ object RustCoreBridge {
     fun isAvailable(): Boolean = nativeLoaded
 
     fun lastLoadError(): String? = loadError
+
+    fun registerCrashCallbackSafe(
+        crashLogPath: String,
+        enabled: Boolean = false,
+        listener: CrashCallbackListener = CrashCallbackListener { error -> CrashHandler.logCrash(error) }
+    ): Boolean {
+        if (!nativeLoaded) return false
+        return try {
+            registerCrashCallback(crashLogPath, listener)
+            setCrashProtectionEnabled(enabled)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun setCrashProtectionEnabledSafe(enabled: Boolean): Boolean {
+        if (!nativeLoaded) return false
+        return try {
+            setCrashProtectionEnabled(enabled)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     fun registerPlayerCallbackSafe(listener: PlayerConnectionListener): Boolean {
         if (!nativeLoaded) return false
@@ -129,6 +160,10 @@ object RustCoreBridge {
             // Ignorar fallos durante apagado nativo
         }
     }
+
+    external fun registerCrashCallback(crashLogPath: String, listener: CrashCallbackListener)
+
+    external fun setCrashProtectionEnabled(enabled: Boolean)
 
     external fun registerPlayerCallback(listener: PlayerConnectionListener)
 

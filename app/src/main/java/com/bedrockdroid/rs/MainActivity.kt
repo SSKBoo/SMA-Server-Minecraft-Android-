@@ -12,6 +12,7 @@ import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -20,6 +21,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.bedrockdroid.rs.crash.CrashHandler
 import com.bedrockdroid.rs.engine.EngineLaunchPlanner
 import com.bedrockdroid.rs.model.HardwareScanReport
 import com.bedrockdroid.rs.model.LauncherPrefs
@@ -30,6 +32,7 @@ import com.bedrockdroid.rs.model.ServerRuntimeState
 import com.bedrockdroid.rs.service.ServerForegroundService
 import com.bedrockdroid.rs.ui.BedrockDroidTheme
 import com.bedrockdroid.rs.ui.ConsoleScreen
+import com.bedrockdroid.rs.ui.CrashScreen
 import com.bedrockdroid.rs.ui.EnginesScreen
 import com.bedrockdroid.rs.ui.SettingsScreen
 import com.bedrockdroid.rs.ui.SurvivalNetworkScreen
@@ -42,7 +45,8 @@ private enum class AppTab(val label: String) {
     CONSOLE("Consola"),
     ENGINES("Motores"),
     SURVIVAL("24/7 y Red"),
-    SETTINGS("Ajustes")
+    SETTINGS("Ajustes"),
+    CRASH("Crash")
 }
 
 class MainActivity : ComponentActivity() {
@@ -71,10 +75,12 @@ class MainActivity : ComponentActivity() {
                 val logs by ServerRuntimeState.logs.collectAsState()
                 val hardwareReport by ServerRuntimeState.hardwareReport.collectAsState()
                 val networkReport by ServerRuntimeState.networkReport.collectAsState()
+                val hasPendingCrash by CrashHandler.hasPendingCrash.collectAsState()
                 var latestCrashFile by remember { mutableStateOf<File?>(null) }
                 var latestCrashText by remember { mutableStateOf<String?>(null) }
 
                 LaunchedEffect(Unit) {
+                    CrashHandler.refreshState(this@MainActivity)
                     val found = withContext(Dispatchers.IO) {
                         val file = LogBuffer.readLatestCrashReport(this@MainActivity)
                         val text = file?.let { runCatching { it.readText() }.getOrNull() }
@@ -158,6 +164,25 @@ class MainActivity : ComponentActivity() {
                                 onClick = { currentTab = AppTab.SETTINGS },
                                 icon = { Icon(Icons.Default.Settings, contentDescription = null) },
                                 label = { Text("Ajustes") }
+                            )
+                            NavigationBarItem(
+                                selected = currentTab == AppTab.CRASH,
+                                onClick = {
+                                    CrashHandler.refreshState(this@MainActivity)
+                                    currentTab = AppTab.CRASH
+                                },
+                                icon = {
+                                    BadgedBox(
+                                        badge = {
+                                            if (hasPendingCrash) {
+                                                Badge(containerColor = Color(0xFFDC2626))
+                                            }
+                                        }
+                                    ) {
+                                        Icon(Icons.Default.Warning, contentDescription = "Crash")
+                                    }
+                                },
+                                label = { Text("Crash") }
                             )
                         }
                     }
@@ -260,6 +285,15 @@ class MainActivity : ComponentActivity() {
                             config = config,
                             isRunning = isRunning,
                             onUpdateConfig = updateConfig,
+                            modifier = contentModifier
+                        )
+
+                        AppTab.CRASH -> CrashScreen(
+                            onCrashCleared = {
+                                latestCrashFile = null
+                                latestCrashText = null
+                                LogBuffer.clearCrashReports(this@MainActivity)
+                            },
                             modifier = contentModifier
                         )
                     }
