@@ -16,7 +16,7 @@
 
 ## Correcciones integradas contra fallos comunes
 - **Rust NDK puro sin warnings**: Sin `openssl-sys`, `zlib-ng-sys`, `rustls` ni `webpki-roots`; usa `flate2` (`rust_backend` / `miniz_oxide`).
-- **Builds reproducibles (`--locked`)**: `.gitignore` mantiene `!rust-core/Cargo.lock` visible y el workflow de CI usa `--locked` automáticamente cuando `rust-core/Cargo.lock` está presente en el repositorio. Recuerda tener `rust-core/Cargo.lock` commiteado en tu repo (`git add rust-core/Cargo.lock`).
+- **Generación automática de `Cargo.lock` en CI**: `.gitignore` excluye `Cargo.lock` y el workflow ejecuta `cargo test --lib` y `cargo ndk ... build --release` sin `--locked` para regenerar dependencias desde cero en cada ejecución (si ya existía en un repo previo, ejecuta `git rm --cached rust-core/Cargo.lock`).
 - **Página de memoria 16 KB (Android 15+)**: `-Wl,-z,max-page-size=16384` en `.cargo/config.toml`.
 - **JNI + R8/ProGuard**: Reglas `-keep` explícitas para `RustCoreBridge`.
 - **Android 14/15 24/7**: `foregroundServiceType="dataSync"` + `PARTIAL_WAKE_LOCK` + `WIFI_MODE_FULL_LOW_LATENCY` + `MulticastLock`.
