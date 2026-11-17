@@ -2,15 +2,15 @@ use crate::net::low_latency::LowLatencyConfig;
 use acacia_nethernet::{
     http,
     lan::{DISCOVERY_PORT, LanPacket, ServerData},
-    signaling, Connection, Event as RtcEvent, Signal, SignalKind, PROBE_PATH, join_path,
+    Connection, Event as RtcEvent, Signal, SignalKind, PROBE_PATH, join_path,
 };
 use acacia_session::proto::{
-    self, encode_packet, packet_name,
+    encode_packet, packet_name,
     packets::{
         ClientToServerHandshake, Login, NetworkSettings, NetworkSettingsCompressionAlgorithm,
         PlayStatus, PlayStatusStatus, RequestNetworkSettings, ServerToClientHandshake,
     },
-    RawPacket,
+    Packet, RawPacket,
 };
 use acacia_session::server::{read_login, ServerConnection};
 use bytes::{Bytes, BytesMut};
@@ -286,8 +286,8 @@ pub fn handle_bedrock_session_data(
                 let settings = NetworkSettings {
                     compression_threshold: 256,
                     compression_algorithm: NetworkSettingsCompressionAlgorithm::Deflate,
-                    client_throttle_enabled: false,
-                    client_throttle_threshold: 0,
+                    client_throttle: false,
+                    client_throttle_threshold: 0u8,
                     client_throttle_scalar: 0.0,
                 };
 
@@ -381,7 +381,6 @@ pub fn handle_bedrock_session_data(
             }
 
             other => {
-                let _ = proto::packets::Packet::ID;
                 log::info!(
                     "[Bedrock Session] Paquete 0x{:02x} ({}) procesado en sesión activa con {}",
                     other,
@@ -720,19 +719,18 @@ pub fn start_async_engine(
                                         }
                                         LanPacket::Message { recipient, data } if recipient == net_id => {
                                             if let Ok(sig) = Signal::parse(&data) {
-                                                let _ = signaling::PROTOCOL_VERSION;
                                                 match sig.kind {
                                                     SignalKind::ConnectRequest => {
                                                         let local_cand = resolve_local_candidate_addr(None, effective_port);
                                                         let now = Instant::now();
                                                         if let Ok((mut conn, answer_sdp)) = Connection::answer(&sig.data, local_cand, &lan_key, now) {
-                                                            log::info!("Señalización LAN recibida: ConnectRequest desde {} (session={})", from, sig.session_id);
+                                                            log::info!("Señalización LAN recibida: ConnectRequest desde {} (session={})", from, sig.connection_id);
                                                             while let Some(tx) = conn.poll_transmit() {
                                                                 let _ = lan_udp.send_to(&tx.contents, tx.destination).await;
                                                             }
                                                             if let Ok(mut guard) = lan_peers.lock() {
                                                                 guard.insert(
-                                                                    sig.session_id,
+                                                                    sig.connection_id,
                                                                     PeerSession {
                                                                         conn,
                                                                         session: ServerConnection::nethernet(lan_key.clone()),
@@ -743,7 +741,7 @@ pub fn start_async_engine(
                                                             }
                                                             let answer_sig = Signal {
                                                                 kind: SignalKind::ConnectResponse,
-                                                                session_id: sig.session_id,
+                                                                connection_id: sig.connection_id,
                                                                 data: answer_sdp,
                                                             };
                                                             let msg = LanPacket::Message {
@@ -756,7 +754,7 @@ pub fn start_async_engine(
                                                     SignalKind::CandidateAdd => {
                                                         let now = Instant::now();
                                                         if let Ok(mut guard) = lan_peers.lock() {
-                                                            if let Some(peer) = guard.get_mut(&sig.session_id) {
+                                                            if let Some(peer) = guard.get_mut(&sig.connection_id) {
                                                                 let _ = peer.conn.add_remote_candidate(&sig.data, now);
                                                             }
                                                         }
@@ -1080,8 +1078,8 @@ mod tests {
         let settings = NetworkSettings {
             compression_threshold: 256,
             compression_algorithm: NetworkSettingsCompressionAlgorithm::Deflate,
-            client_throttle_enabled: false,
-            client_throttle_threshold: 0,
+            client_throttle: false,
+            client_throttle_threshold: 0u8,
             client_throttle_scalar: 0.0,
         };
         let mut out = BytesMut::new();
