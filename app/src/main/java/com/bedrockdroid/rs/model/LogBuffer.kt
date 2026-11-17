@@ -112,14 +112,14 @@ object LogBuffer {
             if (logcatJob?.isActive == true) return
             val pid = Process.myPid()
             val command = arrayOf(
-                "logcat", "--pid=$pid", "-s",
+                "logcat", "-v", "brief", "--pid=$pid", "-s",
                 "BedrockDroidRS:V", "bedrockdroid.rs:V", "RustJNI:V", "LogBuffer:V", "BedrockDroidUI:V",
                 "*:S" // Silencia todo lo demás
             )
             appendLevel(
                 LogLevel.DEBUG,
                 "LogcatPipe",
-                "Iniciando captura logcat --pid=$pid -s BedrockDroidRS:V bedrockdroid.rs:V RustJNI:V LogBuffer:V BedrockDroidUI:V *:S"
+                "Iniciando captura logcat -v brief --pid=$pid -s BedrockDroidRS:V bedrockdroid.rs:V RustJNI:V LogBuffer:V BedrockDroidUI:V *:S"
             )
 
             logcatJob = collectorScope.launch {
@@ -172,10 +172,10 @@ object LogBuffer {
         val trimmed = raw.trim()
         if (trimmed.isBlank() || trimmed.startsWith("--------- beginning of")) return
         val level = when {
-            trimmed.startsWith("E/") || trimmed.startsWith("F/") || trimmed.contains(" E/") || trimmed.contains(" F/") -> LogLevel.ERROR
-            trimmed.startsWith("W/") || trimmed.contains(" W/") -> LogLevel.WARN
-            trimmed.startsWith("I/") || trimmed.contains(" I/") -> LogLevel.INFO
-            trimmed.startsWith("D/") || trimmed.startsWith("V/") || trimmed.contains(" D/") || trimmed.contains(" V/") -> LogLevel.DEBUG
+            trimmed.startsWith("E/") || trimmed.startsWith("F/") || trimmed.contains(" E/") || trimmed.contains(" F/") || trimmed.contains(" E ") || trimmed.contains(" F ") -> LogLevel.ERROR
+            trimmed.startsWith("W/") || trimmed.contains(" W/") || trimmed.contains(" W ") -> LogLevel.WARN
+            trimmed.startsWith("I/") || trimmed.contains(" I/") || trimmed.contains(" I ") -> LogLevel.INFO
+            trimmed.startsWith("D/") || trimmed.startsWith("V/") || trimmed.contains(" D/") || trimmed.contains(" V/") || trimmed.contains(" D ") || trimmed.contains(" V ") -> LogLevel.DEBUG
             else -> return
         }
         val tag = when {

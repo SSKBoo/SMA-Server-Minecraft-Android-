@@ -205,7 +205,7 @@ object EngineLaunchPlanner {
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "Comandos disponibles:")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  ./launch bedrock | java | hybrid -> Inicia el carril elegido")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  stop                             -> Detiene ForegroundService")
-                ServerRuntimeState.appendLog(LogStream.STDOUT, "  ping | test                      -> Envía Unconnected Ping RakNet a 127.0.0.1")
+                ServerRuntimeState.appendLog(LogStream.STDOUT, "  ping | test                      -> Prueba señalización HTTP NetherNet (/v1/join) en 127.0.0.1")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  pinglan                          -> Ping UDP Kotlin (sin JNI) a 127.0.0.1, LAN y ::1")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  sockets | ss | netstat           -> Inspecciona sockets UDP/UID sin JNI")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  netcheck | upnp status           -> Prueba LAN, loopback y UPnP")

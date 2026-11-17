@@ -25,6 +25,7 @@ class LanDiscoveryManager(context: Context) {
             for (iface in ifaces) {
                 if (!iface.isUp || iface.isLoopback) continue
                 val ifaceName = iface.name.lowercase()
+                if (ifaceName.startsWith("tun") || ifaceName.startsWith("ppp") || ifaceName.startsWith("rmnet")) continue
                 for (addr in iface.inetAddresses.toList()) {
                     if (addr is Inet4Address && !addr.isLoopbackAddress) {
                         val hostAddr = addr.hostAddress ?: continue

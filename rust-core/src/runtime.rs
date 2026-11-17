@@ -18,7 +18,7 @@ use p384::ecdsa::SigningKey;
 use rand_core::OsRng;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -217,6 +217,40 @@ fn resolve_local_candidate_addr(preferred_ip: Option<IpAddr>, udp_port: u16) -> 
         }
     }
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), udp_port)
+}
+
+/// Abre sockets acompañantes IPv6-only (`[::]:port`) para TCP (/v1/join) y UDP (WebRTC / Pong ::1).
+fn bind_optional_ipv6_sockets(port: u16) -> Option<(TcpListener, Arc<UdpSocket>)> {
+    let v6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+
+    let tcp_sock = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .ok()?;
+    let _ = tcp_sock.set_only_v6(true);
+    let _ = tcp_sock.set_reuse_address(true);
+    tcp_sock.set_nonblocking(true).ok()?;
+    tcp_sock.bind(&v6_addr.into()).ok()?;
+    tcp_sock.listen(128).ok()?;
+    let std_tcp: std::net::TcpListener = tcp_sock.into();
+    let tcp_v6 = TcpListener::from_std(std_tcp).ok()?;
+
+    let udp_sock = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .ok()?;
+    let _ = udp_sock.set_only_v6(true);
+    let _ = udp_sock.set_reuse_address(true);
+    udp_sock.set_nonblocking(true).ok()?;
+    udp_sock.bind(&v6_addr.into()).ok()?;
+    let std_udp: std::net::UdpSocket = udp_sock.into();
+    let udp_v6 = UdpSocket::from_std(std_udp).ok()?;
+
+    Some((tcp_v6, Arc::new(udp_v6)))
 }
 
 /// Procesa un lote de datos de sesión de Minecraft Bedrock recibido por el canal SCTP de WebRTC
@@ -773,6 +807,122 @@ pub fn start_async_engine(
             });
         }
 
+        // Listener acompañante Dual-Stack IPv6 ([::]:port) para TCP /v1/join y UDP (::1 ping / WebRTC IPv6)
+        let udp_v6_shared: Option<Arc<UdpSocket>> =
+            if let Some((tcp_v6, udp_v6)) = bind_optional_ipv6_sockets(effective_port) {
+                let udp_v6_for_main = Arc::clone(&udp_v6);
+                let v6_cancel = task_cancel.child_token();
+                let v6_peers = Arc::clone(&peers);
+                let v6_key = host_key.clone();
+                let v6_motd = motd_string.clone();
+                tokio::spawn(async move {
+                log::info!(
+                    "[NetherNet IPv6] Listener Dual-Stack activo en [::]:{} (TCP /v1/join + UDP WebRTC)",
+                    effective_port
+                );
+                let mut v6_buf = [0u8; 65535];
+                const RAKNET_MAGIC_V6: [u8; 16] = [
+                    0x00, 0xFF, 0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFE, 0xFD, 0xFD, 0xFD, 0xFD, 0x12,
+                    0x34, 0x56, 0x78,
+                ];
+                loop {
+                    tokio::select! {
+                        _ = v6_cancel.cancelled() => break,
+                        accept_res = tcp_v6.accept() => {
+                            if let Ok((stream, peer_addr)) = accept_res {
+                                let peers_clone = Arc::clone(&v6_peers);
+                                let udp_clone = Arc::clone(&udp_v6);
+                                let key_clone = v6_key.clone();
+                                let motd_clone = v6_motd.clone();
+                                tokio::spawn(async move {
+                                    handle_http_signaling_stream(
+                                        stream,
+                                        peer_addr,
+                                        effective_port,
+                                        net_id,
+                                        motd_clone,
+                                        key_clone,
+                                        peers_clone,
+                                        udp_clone,
+                                    ).await;
+                                });
+                            }
+                        }
+                        recv_res = udp_v6.recv_from(&mut v6_buf) => {
+                            if let Ok((len, src_addr)) = recv_res {
+                                let pkt = &v6_buf[..len];
+                                if len >= 25 && (pkt[0] == 0x01 || pkt[0] == 0x02) && pkt[9..25] == RAKNET_MAGIC_V6 {
+                                    let motd_bytes = v6_motd.as_bytes();
+                                    let mut pong = Vec::with_capacity(35 + motd_bytes.len());
+                                    pong.push(0x1c);
+                                    pong.extend_from_slice(&pkt[1..9]);
+                                    pong.extend_from_slice(&net_id.to_be_bytes());
+                                    pong.extend_from_slice(&RAKNET_MAGIC_V6);
+                                    pong.extend_from_slice(&(motd_bytes.len() as u16).to_be_bytes());
+                                    pong.extend_from_slice(motd_bytes);
+                                    let _ = udp_v6.send_to(&pong, src_addr).await;
+                                } else {
+                                    let now = Instant::now();
+                                    let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+                                    if let Ok(mut guard) = v6_peers.lock() {
+                                        let mut closed_ids = Vec::new();
+                                        for (&sid, peer) in guard.iter_mut() {
+                                            peer.conn.handle_datagram(now, src_addr, pkt);
+                                            while let Some(ev) = poll_connection_event(&mut peer.conn) {
+                                                match ev {
+                                                    Event::Connected => {
+                                                        peer.remote_addr = src_addr;
+                                                        log::info!(
+                                                            "Conexión WebRTC IPv6 establecida con {} (session={}). Esperando RequestNetworkSettings...",
+                                                            src_addr,
+                                                            sid
+                                                        );
+                                                    }
+                                                    Event::Data(payload) => {
+                                                        handle_bedrock_session_data(
+                                                            &mut peer.conn,
+                                                            &mut peer.session,
+                                                            &mut peer.has_sent_network_settings,
+                                                            peer.remote_addr,
+                                                            &payload,
+                                                            now,
+                                                        );
+                                                    }
+                                                    Event::Disconnected(reason) => {
+                                                        log::info!(
+                                                            "Conexión WebRTC IPv6 cerrada con {} (session={}): {}",
+                                                            peer.remote_addr,
+                                                            sid,
+                                                            reason
+                                                        );
+                                                        closed_ids.push(sid);
+                                                    }
+                                                }
+                                            }
+                                            while let Some(tx) = peer.conn.poll_transmit() {
+                                                outbound.push((tx.destination, tx.contents));
+                                            }
+                                        }
+                                        for sid in closed_ids {
+                                            guard.remove(&sid);
+                                        }
+                                    }
+                                    for (dest, data) in outbound {
+                                        if dest.is_ipv6() {
+                                            let _ = udp_v6.send_to(&data, dest).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            Some(udp_v6_for_main)
+        } else {
+            None
+        };
+
         // Bucle principal: acepta señalización HTTP (/v1/join), recibe datagramas UDP WebRTC y despacha Event
         let mut udp_buf = [0u8; 65535];
         let mut rtc_tick = tokio::time::interval(Duration::from_millis(20));
@@ -927,7 +1077,13 @@ pub fn start_async_engine(
                         }
                     }
                     for (dest, data) in outbound {
-                        let _ = udp_shared.send_to(&data, dest).await;
+                        if dest.is_ipv6() {
+                            if let Some(ref v6) = udp_v6_shared {
+                                let _ = v6.send_to(&data, dest).await;
+                            }
+                        } else {
+                            let _ = udp_shared.send_to(&data, dest).await;
+                        }
                     }
                 }
             }
