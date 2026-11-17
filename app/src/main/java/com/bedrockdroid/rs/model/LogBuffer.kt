@@ -16,7 +16,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.BufferedReader
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStreamReader
+import java.io.OutputStreamWriter
 import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
@@ -24,12 +26,17 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
 object LogBuffer {
-    const val DEFAULT_MAX_LINES = 2000
+    const val DEFAULT_MAX_LINES = 500
+    const val LOGCAT_STREAM_FILE_NAME = "logcat_pipe.log"
 
     private val lock = Any()
+    private val streamFileLock = Any()
     private val seq = AtomicLong(10L)
     private var maxLines: Int = DEFAULT_MAX_LINES
     private val ring = ArrayDeque<ConsoleLogLine>(DEFAULT_MAX_LINES)
+
+    @Volatile
+    private var appContext: Context? = null
 
     private val collectorScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var logcatJob: Job? = null
@@ -41,7 +48,7 @@ object LogBuffer {
 
     init {
         try {
-            append(LogStream.DEBUG, "[LogBuffer] Buffer circular inicializado (capacidad=$DEFAULT_MAX_LINES líneas).", "LogBuffer")
+            append(LogStream.DEBUG, "[LogBuffer] Buffer UI acotado (capacidad=$DEFAULT_MAX_LINES líneas); LogcatPipe en streaming MODE_APPEND.", "LogBuffer")
             append(LogStream.STDOUT, "BedrockDroid RS · Núcleo Rust ARM64 (JNI) listo.", "System")
             append(LogStream.STDOUT, "Toca 'Iniciar', usa un chip rápido o escribe 'help'.", "System")
         } catch (_: Throwable) {
@@ -49,9 +56,16 @@ object LogBuffer {
         }
     }
 
+    fun initContext(context: Context) {
+        appContext = context.applicationContext
+    }
+
+    fun getLogcatStreamFile(context: Context): File =
+        File(context.filesDir, LOGCAT_STREAM_FILE_NAME)
+
     fun configureMaxLines(limit: Int) {
         synchronized(lock) {
-            maxLines = limit.coerceIn(100, 10000)
+            maxLines = limit.coerceIn(100, 1000)
             while (ring.size > maxLines) {
                 ring.removeFirst()
             }
@@ -60,19 +74,27 @@ object LogBuffer {
     }
 
     fun append(stream: LogStream, text: String, tag: String = "BedrockDroidRS") {
-        val line = ConsoleLogLine(
-            id = seq.incrementAndGet(),
-            time = nowStamp(),
-            stream = stream,
-            text = text,
-            tag = tag
-        )
-        synchronized(lock) {
-            if (ring.size >= maxLines) {
-                ring.removeFirst()
+        try {
+            val line = ConsoleLogLine(
+                id = seq.incrementAndGet(),
+                time = nowStamp(),
+                stream = stream,
+                text = text,
+                tag = tag
+            )
+            synchronized(lock) {
+                if (ring.size >= maxLines) {
+                    ring.removeFirst()
+                }
+                ring.addLast(line)
+                _logs.value = ring.toList()
             }
-            ring.addLast(line)
-            _logs.value = ring.toList()
+        } catch (_: OutOfMemoryError) {
+            runCatching { System.gc() }
+            synchronized(lock) {
+                ring.clear()
+                _logs.value = emptyList()
+            }
         }
     }
 
@@ -101,15 +123,43 @@ object LogBuffer {
         }
     }
 
+    fun clearStreamLogFile(context: Context) {
+        val ctx = context.applicationContext
+        synchronized(streamFileLock) {
+            runCatching {
+                ctx.openFileOutput(LOGCAT_STREAM_FILE_NAME, Context.MODE_PRIVATE).use { fos ->
+                    fos.write(ByteArray(0))
+                    fos.flush()
+                    fos.close()
+                }
+            }
+            val file = getLogcatStreamFile(ctx)
+            if (file.exists()) {
+                runCatching {
+                    FileOutputStream(file, false).use { fos ->
+                        fos.write(ByteArray(0))
+                        fos.flush()
+                        fos.close()
+                    }
+                    file.delete()
+                }
+            }
+        }
+    }
+
     fun snapshotText(entries: List<ConsoleLogLine> = _logs.value): String {
         return entries.joinToString("\n") { line ->
             "[${line.time}] [${line.level.badge}] [${line.tag}] ${line.text}"
         }
     }
 
-    fun startProcessLogcatCollector() {
+    fun startProcessLogcatCollector(context: Context? = null) {
         try {
+            if (context != null) {
+                appContext = context.applicationContext
+            }
             if (logcatJob?.isActive == true) return
+            val ctx = (context ?: appContext)?.applicationContext
             val pid = Process.myPid()
             val command = arrayOf(
                 "logcat", "-v", "brief", "--pid=$pid", "-s",
@@ -119,11 +169,17 @@ object LogBuffer {
             appendLevel(
                 LogLevel.DEBUG,
                 "LogcatPipe",
-                "Iniciando captura logcat -v brief --pid=$pid -s BedrockDroidRS:V bedrockdroid.rs:V RustJNI:V LogBuffer:V BedrockDroidUI:V *:S"
+                "Iniciando captura logcat en streaming MODE_APPEND -> $LOGCAT_STREAM_FILE_NAME (PID=$pid)"
             )
 
             logcatJob = collectorScope.launch {
+                var streamFos: FileOutputStream? = null
+                var streamWriter: OutputStreamWriter? = null
                 try {
+                    if (ctx != null) {
+                        streamFos = ctx.openFileOutput(LOGCAT_STREAM_FILE_NAME, Context.MODE_APPEND)
+                        streamWriter = OutputStreamWriter(streamFos, Charsets.UTF_8)
+                    }
                     val proc = ProcessBuilder(*command)
                         .redirectErrorStream(true)
                         .start()
@@ -131,8 +187,21 @@ object LogBuffer {
                     BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
                         while (isActive) {
                             val raw = reader.readLine() ?: break
-                            parseAndAppendLogcatLine(raw)
+                            val formatted = formatStreamLogcatLine(raw) ?: continue
+                            if (streamWriter != null) {
+                                synchronized(streamFileLock) {
+                                    streamWriter.write(formatted)
+                                    streamWriter.write("\n")
+                                    streamWriter.flush()
+                                }
+                            }
                         }
+                    }
+                } catch (_: OutOfMemoryError) {
+                    runCatching { System.gc() }
+                    runCatching {
+                        streamWriter?.write("[OOM] OutOfMemoryError en LogcatPipe\n")
+                        streamWriter?.flush()
                     }
                 } catch (_: SecurityException) {
                     if (isActive) {
@@ -150,6 +219,10 @@ object LogBuffer {
                             "Captura logcat no disponible (${err.javaClass.simpleName}): ${err.message}"
                         )
                     }
+                } finally {
+                    runCatching { streamWriter?.flush() }
+                    runCatching { streamWriter?.close() }
+                    runCatching { streamFos?.close() }
                 }
             }
         } catch (err: Throwable) {
@@ -181,16 +254,16 @@ object LogBuffer {
         return enabled
     }
 
-    private fun parseAndAppendLogcatLine(raw: String) {
+    private fun formatStreamLogcatLine(raw: String): String? {
         val trimmed = raw.trim()
-        if (trimmed.isBlank() || trimmed.startsWith("--------- beginning of")) return
-        if (!verboseDiagnostics && trimmed.contains("Note: end time exceeds INT32_MAX")) return
+        if (trimmed.isBlank() || trimmed.startsWith("--------- beginning of")) return null
+        if (!verboseDiagnostics && trimmed.contains("Note: end time exceeds INT32_MAX")) return null
         val level = when {
             trimmed.startsWith("E/") || trimmed.startsWith("F/") || trimmed.contains(" E/") || trimmed.contains(" F/") || trimmed.contains(" E ") || trimmed.contains(" F ") -> LogLevel.ERROR
             trimmed.startsWith("W/") || trimmed.contains(" W/") || trimmed.contains(" W ") -> LogLevel.WARN
             trimmed.startsWith("I/") || trimmed.contains(" I/") || trimmed.contains(" I ") -> LogLevel.INFO
             trimmed.startsWith("D/") || trimmed.startsWith("V/") || trimmed.contains(" D/") || trimmed.contains(" V/") || trimmed.contains(" D ") || trimmed.contains(" V ") -> LogLevel.DEBUG
-            else -> return
+            else -> return null
         }
         val tag = when {
             trimmed.contains("BedrockDroidRS") -> "BedrockDroidRS"
@@ -198,9 +271,9 @@ object LogBuffer {
             trimmed.contains("RustJNI") -> "RustJNI"
             trimmed.contains("LogBuffer") -> "LogBuffer"
             trimmed.contains("BedrockDroidUI") -> "BedrockDroidUI"
-            else -> return
+            else -> return null
         }
-        appendLevel(level, tag, trimmed)
+        return "[${nowStamp()}] [${level.badge}] [$tag] $trimmed"
     }
 
     fun exportLogs(context: Context): File? {
@@ -217,7 +290,22 @@ object LogBuffer {
                 appendLine("Lines: ${_logs.value.size}")
                 appendLine("======================================")
             }
-            outFile.writeText(header + snapshotText() + "\n")
+            FileOutputStream(outFile, false).use { outFos ->
+                outFos.write((header + snapshotText() + "\n").toByteArray(Charsets.UTF_8))
+                val streamFile = getLogcatStreamFile(context)
+                if (streamFile.exists() && streamFile.length() > 0L) {
+                    outFos.write("\n=== LogcatPipe Stream ===\n".toByteArray(Charsets.UTF_8))
+                    streamFile.inputStream().use { inStream ->
+                        val buffer = ByteArray(8192)
+                        while (true) {
+                            val read = inStream.read(buffer)
+                            if (read <= 0) break
+                            outFos.write(buffer, 0, read)
+                        }
+                    }
+                }
+                outFos.flush()
+            }
 
             runCatching {
                 Toast.makeText(

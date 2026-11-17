@@ -5,10 +5,20 @@ pub mod perf;
 pub mod runtime;
 
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE};
+use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE, JNI_VERSION_1_6};
 use jni::JNIEnv;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[no_mangle]
+pub extern "system" fn JNI_OnLoad(
+    _vm: *mut jni::sys::JavaVM,
+    _reserved: *mut std::ffi::c_void,
+) -> jint {
+    runtime::init_android_logging();
+    runtime::init_native_signal_handlers();
+    JNI_VERSION_1_6
+}
 
 fn into_jstring_or_null(env: &JNIEnv, text: String) -> jstring {
     env.new_string(text)

@@ -52,253 +52,327 @@ private enum class AppTab(val label: String) {
 class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        runCatching {
-            WindowCompat.setDecorFitsSystemWindows(window, false)
-            WindowInsetsControllerCompat(window, window.decorView).apply {
-                isAppearanceLightStatusBars = true
-                isAppearanceLightNavigationBars = true
+        try {
+            super.onCreate(savedInstanceState)
+            runCatching {
+                WindowCompat.setDecorFitsSystemWindows(window, false)
+                WindowInsetsControllerCompat(window, window.decorView).apply {
+                    isAppearanceLightStatusBars = true
+                    isAppearanceLightNavigationBars = true
+                }
             }
-        }
 
-        setContent {
-            BedrockDroidTheme {
-                val scope = rememberCoroutineScope()
-                var currentTab by remember { mutableStateOf(AppTab.CONSOLE) }
-                var config by remember {
-                    mutableStateOf(
-                        runCatching { LauncherPrefs.load(this@MainActivity) }
-                            .getOrElse { LauncherPrefs.defaultConfig() }
-                    )
-                }
-                val isRunning by ServerRuntimeState.isRunning.collectAsState()
-                val logs by ServerRuntimeState.logs.collectAsState()
-                val hardwareReport by ServerRuntimeState.hardwareReport.collectAsState()
-                val networkReport by ServerRuntimeState.networkReport.collectAsState()
-                val hasPendingCrash by CrashHandler.hasPendingCrash.collectAsState()
-                var latestCrashFile by remember { mutableStateOf<File?>(null) }
-                var latestCrashText by remember { mutableStateOf<String?>(null) }
-
-                LaunchedEffect(Unit) {
-                    CrashHandler.refreshState(this@MainActivity)
-                    val found = withContext(Dispatchers.IO) {
-                        val file = LogBuffer.readLatestCrashReport(this@MainActivity)
-                        val text = file?.let { runCatching { it.readText() }.getOrNull() }
-                        file to text
-                    }
-                    val (crashFile, crashBody) = found
-                    latestCrashFile = crashFile
-                    latestCrashText = crashBody
-                    if (crashFile != null && crashBody != null) {
-                        LogBuffer.appendLevel(
-                            LogLevel.ERROR,
-                            "CrashRecovery",
-                            "Crash previo registrado en ${crashFile.name}:\n${crashBody.take(1500)}"
+            setContent {
+                BedrockDroidTheme {
+                    val scope = rememberCoroutineScope()
+                    var currentTab by remember { mutableStateOf(AppTab.CONSOLE) }
+                    var config by remember {
+                        mutableStateOf(
+                            try {
+                                LauncherPrefs.load(this@MainActivity)
+                            } catch (oom: OutOfMemoryError) {
+                                CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.loadPrefs", oom)
+                                LauncherPrefs.defaultConfig()
+                            } catch (_: Throwable) {
+                                LauncherPrefs.defaultConfig()
+                            }
                         )
                     }
+                    val isRunning by ServerRuntimeState.isRunning.collectAsState()
+                    val logs by ServerRuntimeState.logs.collectAsState()
+                    val hardwareReport by ServerRuntimeState.hardwareReport.collectAsState()
+                    val networkReport by ServerRuntimeState.networkReport.collectAsState()
+                    val hasPendingCrash by CrashHandler.hasPendingCrash.collectAsState()
+                    var latestCrashFile by remember { mutableStateOf<File?>(null) }
+                    var latestCrashText by remember { mutableStateOf<String?>(null) }
 
-                    // Escaneo inicial de hardware y red en segundo plano para actualizar StatusCard al instante
-                    withContext(Dispatchers.IO) {
-                        runCatching { EngineLaunchPlanner.scanDeviceHardware(this@MainActivity) }
-                        runCatching { EngineLaunchPlanner.probeNetwork(config) }
-                    }
-                }
-
-                val updateConfig: (com.bedrockdroid.rs.model.AndroidLauncherConfig) -> Unit = { next ->
-                    val locksRuntimeConfig = next.activeLane != config.activeLane ||
-                        next.rustMaxRamMb != config.rustMaxRamMb ||
-                        next.rustBlockingThreads != config.rustBlockingThreads ||
-                        next.jvmXmxMb != config.jvmXmxMb ||
-                        next.jvmXmsMb != config.jvmXmsMb ||
-                        next.bedrockPort != config.bedrockPort
-                    if (isRunning && locksRuntimeConfig) {
-                        android.widget.Toast.makeText(
-                            this@MainActivity,
-                            "Detén el servidor antes de cambiar de perfil, RAM o Threads",
-                            android.widget.Toast.LENGTH_SHORT
-                        ).show()
-                    } else {
-                        config = next
-                        runCatching { LauncherPrefs.save(this@MainActivity, next) }
-                    }
-                }
-
-                Scaffold(
-                    containerColor = Color(0xFFF8FAFC),
-                    topBar = {
-                        TopAppBar(
-                            title = {
-                                Text(
-                                    "BedrockDroid RS · ARM64",
-                                    fontWeight = FontWeight.Bold
+                    LaunchedEffect(Unit) {
+                        try {
+                            CrashHandler.refreshState(this@MainActivity)
+                            val found = withContext(Dispatchers.IO) {
+                                val file = LogBuffer.readLatestCrashReport(this@MainActivity)
+                                val text = file?.let { runCatching { it.readText().take(4096) }.getOrNull() }
+                                file to text
+                            }
+                            val (crashFile, crashBody) = found
+                            latestCrashFile = crashFile
+                            latestCrashText = crashBody
+                            if (crashFile != null && crashBody != null) {
+                                LogBuffer.appendLevel(
+                                    LogLevel.ERROR,
+                                    "CrashRecovery",
+                                    "Crash previo registrado en ${crashFile.name}:\n${crashBody.take(1500)}"
                                 )
-                            },
-                            colors = TopAppBarDefaults.topAppBarColors(
-                                containerColor = Color.White,
-                                titleContentColor = Color(0xFF0F172A)
-                            )
-                        )
-                    },
-                    bottomBar = {
-                        NavigationBar(containerColor = Color.White) {
-                            NavigationBarItem(
-                                selected = currentTab == AppTab.CONSOLE,
-                                onClick = { currentTab = AppTab.CONSOLE },
-                                icon = { Icon(Icons.Default.Home, contentDescription = null) },
-                                label = { Text("Consola") }
-                            )
-                            NavigationBarItem(
-                                selected = currentTab == AppTab.ENGINES,
-                                onClick = { currentTab = AppTab.ENGINES },
-                                icon = { Icon(Icons.Default.Build, contentDescription = null) },
-                                label = { Text("Motores") }
-                            )
-                            NavigationBarItem(
-                                selected = currentTab == AppTab.SURVIVAL,
-                                onClick = { currentTab = AppTab.SURVIVAL },
-                                icon = { Icon(Icons.Default.CheckCircle, contentDescription = null) },
-                                label = { Text("24/7 y Red") }
-                            )
-                            NavigationBarItem(
-                                selected = currentTab == AppTab.SETTINGS,
-                                onClick = { currentTab = AppTab.SETTINGS },
-                                icon = { Icon(Icons.Default.Settings, contentDescription = null) },
-                                label = { Text("Ajustes") }
-                            )
-                            NavigationBarItem(
-                                selected = currentTab == AppTab.CRASH,
-                                onClick = {
-                                    CrashHandler.refreshState(this@MainActivity)
-                                    currentTab = AppTab.CRASH
+                            }
+
+                            // Escaneo inicial de hardware y red en segundo plano para actualizar StatusCard al instante
+                            withContext(Dispatchers.IO) {
+                                runCatching { EngineLaunchPlanner.scanDeviceHardware(this@MainActivity) }
+                                runCatching { EngineLaunchPlanner.probeNetwork(config) }
+                            }
+                        } catch (oom: OutOfMemoryError) {
+                            CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.LaunchedEffect", oom)
+                        } catch (t: Throwable) {
+                            CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.LaunchedEffect", t)
+                        }
+                    }
+
+                    val updateConfig: (com.bedrockdroid.rs.model.AndroidLauncherConfig) -> Unit = { next ->
+                        try {
+                            val locksRuntimeConfig = next.activeLane != config.activeLane ||
+                                next.rustMaxRamMb != config.rustMaxRamMb ||
+                                next.rustBlockingThreads != config.rustBlockingThreads ||
+                                next.jvmXmxMb != config.jvmXmxMb ||
+                                next.jvmXmsMb != config.jvmXmsMb ||
+                                next.bedrockPort != config.bedrockPort
+                            if (isRunning && locksRuntimeConfig) {
+                                android.widget.Toast.makeText(
+                                    this@MainActivity,
+                                    "Detén el servidor antes de cambiar de perfil, RAM o Threads",
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            } else {
+                                config = next
+                                runCatching { LauncherPrefs.save(this@MainActivity, next) }
+                            }
+                        } catch (oom: OutOfMemoryError) {
+                            CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.updateConfig", oom)
+                        } catch (t: Throwable) {
+                            CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.updateConfig", t)
+                        }
+                    }
+
+                    Scaffold(
+                        containerColor = Color(0xFFF8FAFC),
+                        topBar = {
+                            TopAppBar(
+                                title = {
+                                    Text(
+                                        "BedrockDroid RS · ARM64",
+                                        fontWeight = FontWeight.Bold
+                                    )
                                 },
-                                icon = {
-                                    BadgedBox(
-                                        badge = {
-                                            if (hasPendingCrash) {
-                                                Badge(containerColor = Color(0xFFDC2626))
-                                            }
+                                colors = TopAppBarDefaults.topAppBarColors(
+                                    containerColor = Color.White,
+                                    titleContentColor = Color(0xFF0F172A)
+                                )
+                            )
+                        },
+                        bottomBar = {
+                            NavigationBar(containerColor = Color.White) {
+                                NavigationBarItem(
+                                    selected = currentTab == AppTab.CONSOLE,
+                                    onClick = { currentTab = AppTab.CONSOLE },
+                                    icon = { Icon(Icons.Default.Home, contentDescription = null) },
+                                    label = { Text("Consola") }
+                                )
+                                NavigationBarItem(
+                                    selected = currentTab == AppTab.ENGINES,
+                                    onClick = { currentTab = AppTab.ENGINES },
+                                    icon = { Icon(Icons.Default.Build, contentDescription = null) },
+                                    label = { Text("Motores") }
+                                )
+                                NavigationBarItem(
+                                    selected = currentTab == AppTab.SURVIVAL,
+                                    onClick = { currentTab = AppTab.SURVIVAL },
+                                    icon = { Icon(Icons.Default.CheckCircle, contentDescription = null) },
+                                    label = { Text("24/7 y Red") }
+                                )
+                                NavigationBarItem(
+                                    selected = currentTab == AppTab.SETTINGS,
+                                    onClick = { currentTab = AppTab.SETTINGS },
+                                    icon = { Icon(Icons.Default.Settings, contentDescription = null) },
+                                    label = { Text("Ajustes") }
+                                )
+                                NavigationBarItem(
+                                    selected = currentTab == AppTab.CRASH,
+                                    onClick = {
+                                        try {
+                                            CrashHandler.refreshState(this@MainActivity)
+                                            currentTab = AppTab.CRASH
+                                        } catch (oom: OutOfMemoryError) {
+                                            CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.openCrashTab", oom)
+                                        } catch (t: Throwable) {
+                                            CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.openCrashTab", t)
                                         }
-                                    ) {
-                                        Icon(Icons.Default.Warning, contentDescription = "Crash")
+                                    },
+                                    icon = {
+                                        BadgedBox(
+                                            badge = {
+                                                if (hasPendingCrash) {
+                                                    Badge(containerColor = Color(0xFFDC2626))
+                                                }
+                                            }
+                                        ) {
+                                            Icon(Icons.Default.Warning, contentDescription = "Crash")
+                                        }
+                                    },
+                                    label = { Text("Crash") }
+                                )
+                            }
+                        }
+                    ) { innerPadding ->
+                        val contentModifier = Modifier
+                            .padding(innerPadding)
+                            .consumeWindowInsets(innerPadding)
+                            .imePadding()
+                        when (currentTab) {
+                            AppTab.CONSOLE -> ConsoleScreen(
+                                config = config,
+                                isRunning = isRunning,
+                                logs = logs,
+                                hardwareReport = hardwareReport,
+                                networkReport = networkReport,
+                                onSelectLane = { lane -> updateConfig(config.copy(activeLane = lane)) },
+                                onUpdateConfig = updateConfig,
+                                onStartOrStop = {
+                                    try {
+                                        if (isRunning) {
+                                            stopService(Intent(this@MainActivity, ServerForegroundService::class.java))
+                                        } else {
+                                            ContextCompat.startForegroundService(
+                                                this@MainActivity,
+                                                Intent(this@MainActivity, ServerForegroundService::class.java)
+                                            )
+                                        }
+                                    } catch (oom: OutOfMemoryError) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onStartOrStop", oom)
+                                    } catch (t: Throwable) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onStartOrStop", t)
                                     }
                                 },
-                                label = { Text("Crash") }
+                                onRunCommand = { cmd ->
+                                    scope.launch {
+                                        try {
+                                            withContext(Dispatchers.IO) {
+                                                EngineLaunchPlanner.executeCliCommand(
+                                                    this@MainActivity,
+                                                    cmd,
+                                                    config
+                                                ) { next ->
+                                                    scope.launch(Dispatchers.Main) {
+                                                        updateConfig(next)
+                                                    }
+                                                }
+                                            }
+                                        } catch (oom: OutOfMemoryError) {
+                                            CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onRunCommand", oom)
+                                        } catch (t: Throwable) {
+                                            CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onRunCommand", t)
+                                        }
+                                    }
+                                },
+                                onClearLogs = {
+                                    try {
+                                        ServerRuntimeState.clearLogs()
+                                        LogBuffer.clearStreamLogFile(this@MainActivity)
+                                    } catch (oom: OutOfMemoryError) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onClearLogs", oom)
+                                    } catch (t: Throwable) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onClearLogs", t)
+                                    }
+                                },
+                                latestCrashFileName = latestCrashFile?.name,
+                                latestCrashText = latestCrashText,
+                                onShareCrash = {
+                                    try {
+                                        latestCrashFile?.let { file ->
+                                            LogBuffer.shareFileWithChooser(
+                                                context = this@MainActivity,
+                                                file = file,
+                                                subject = "BedrockDroid RS Crash Report (${file.name})",
+                                                chooserTitle = "Compartir reporte de crash"
+                                            )
+                                        }
+                                    } catch (oom: OutOfMemoryError) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onShareCrash", oom)
+                                    } catch (t: Throwable) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onShareCrash", t)
+                                    }
+                                },
+                                onDismissCrash = {
+                                    try {
+                                        latestCrashFile = null
+                                        latestCrashText = null
+                                        LogBuffer.clearCrashReports(this@MainActivity)
+                                    } catch (oom: OutOfMemoryError) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onDismissCrash", oom)
+                                    } catch (t: Throwable) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onDismissCrash", t)
+                                    }
+                                },
+                                modifier = contentModifier
+                            )
+
+                            AppTab.ENGINES -> EnginesScreen(
+                                config = config,
+                                onUpdateConfig = updateConfig,
+                                modifier = contentModifier
+                            )
+
+                            AppTab.SURVIVAL -> SurvivalNetworkScreen(
+                                config = config,
+                                isRunning = isRunning,
+                                hardwareReport = hardwareReport,
+                                networkReport = networkReport,
+                                onScanComplete = { hw, applyOptimal ->
+                                    try {
+                                        ServerRuntimeState.updateHardwareReport(hw)
+                                        if (applyOptimal) {
+                                            updateConfig(
+                                                config.copy(
+                                                    jvmXmsMb = hw.recommendedXmsMb,
+                                                    jvmXmxMb = hw.recommendedXmxMb,
+                                                    rustMaxRamMb = hw.recommendedRustRamMb,
+                                                    wanMtuBytes = hw.recommendedMtu
+                                                )
+                                            )
+                                        }
+                                    } catch (oom: OutOfMemoryError) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onScanComplete", oom)
+                                    } catch (t: Throwable) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onScanComplete", t)
+                                    }
+                                },
+                                onConfirmOemRule = { confirmed ->
+                                    updateConfig(config.copy(oemAutostartConfirmed = confirmed))
+                                    ServerRuntimeState.setOemRuleConfirmed(confirmed)
+                                    ServerRuntimeState.refreshChecklist(this@MainActivity)
+                                },
+                                onNetworkProbeComplete = { ServerRuntimeState.updateNetworkReport(it) },
+                                modifier = contentModifier
+                            )
+
+                            AppTab.SETTINGS -> SettingsScreen(
+                                config = config,
+                                isRunning = isRunning,
+                                onUpdateConfig = updateConfig,
+                                modifier = contentModifier
+                            )
+
+                            AppTab.CRASH -> CrashScreen(
+                                onCrashCleared = {
+                                    try {
+                                        latestCrashFile = null
+                                        latestCrashText = null
+                                        LogBuffer.clearCrashReports(this@MainActivity)
+                                    } catch (oom: OutOfMemoryError) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onCrashCleared", oom)
+                                    } catch (t: Throwable) {
+                                        CrashHandler.logCriticalThrowable(this@MainActivity, "MainActivity.onCrashCleared", t)
+                                    }
+                                },
+                                modifier = contentModifier
                             )
                         }
                     }
-                ) { innerPadding ->
-                    val contentModifier = Modifier
-                        .padding(innerPadding)
-                        .consumeWindowInsets(innerPadding)
-                        .imePadding()
-                    when (currentTab) {
-                        AppTab.CONSOLE -> ConsoleScreen(
-                            config = config,
-                            isRunning = isRunning,
-                            logs = logs,
-                            hardwareReport = hardwareReport,
-                            networkReport = networkReport,
-                            onSelectLane = { lane -> updateConfig(config.copy(activeLane = lane)) },
-                            onUpdateConfig = updateConfig,
-                            onStartOrStop = {
-                                if (isRunning) {
-                                    stopService(Intent(this@MainActivity, ServerForegroundService::class.java))
-                                } else {
-                                    ContextCompat.startForegroundService(
-                                        this@MainActivity,
-                                        Intent(this@MainActivity, ServerForegroundService::class.java)
-                                    )
-                                }
-                            },
-                            onRunCommand = { cmd ->
-                                scope.launch {
-                                    withContext(Dispatchers.IO) {
-                                        EngineLaunchPlanner.executeCliCommand(
-                                            this@MainActivity,
-                                            cmd,
-                                            config
-                                        ) { next ->
-                                            scope.launch(Dispatchers.Main) {
-                                                updateConfig(next)
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            onClearLogs = { ServerRuntimeState.clearLogs() },
-                            latestCrashFileName = latestCrashFile?.name,
-                            latestCrashText = latestCrashText,
-                            onShareCrash = {
-                                latestCrashFile?.let { file ->
-                                    runCatching {
-                                        LogBuffer.shareFileWithChooser(
-                                            context = this@MainActivity,
-                                            file = file,
-                                            subject = "BedrockDroid RS Crash Report (${file.name})",
-                                            chooserTitle = "Compartir reporte de crash"
-                                        )
-                                    }
-                                }
-                            },
-                            onDismissCrash = {
-                                latestCrashFile = null
-                                latestCrashText = null
-                                LogBuffer.clearCrashReports(this@MainActivity)
-                            },
-                            modifier = contentModifier
-                        )
-
-                        AppTab.ENGINES -> EnginesScreen(
-                            config = config,
-                            onUpdateConfig = updateConfig,
-                            modifier = contentModifier
-                        )
-
-                        AppTab.SURVIVAL -> SurvivalNetworkScreen(
-                            config = config,
-                            isRunning = isRunning,
-                            hardwareReport = hardwareReport,
-                            networkReport = networkReport,
-                            onScanComplete = { hw, applyOptimal ->
-                                ServerRuntimeState.updateHardwareReport(hw)
-                                if (applyOptimal) {
-                                    updateConfig(
-                                        config.copy(
-                                            jvmXmsMb = hw.recommendedXmsMb,
-                                            jvmXmxMb = hw.recommendedXmxMb,
-                                            rustMaxRamMb = hw.recommendedRustRamMb,
-                                            wanMtuBytes = hw.recommendedMtu
-                                        )
-                                    )
-                                }
-                            },
-                            onConfirmOemRule = { confirmed ->
-                                updateConfig(config.copy(oemAutostartConfirmed = confirmed))
-                                ServerRuntimeState.setOemRuleConfirmed(confirmed)
-                                ServerRuntimeState.refreshChecklist(this@MainActivity)
-                            },
-                            onNetworkProbeComplete = { ServerRuntimeState.updateNetworkReport(it) },
-                            modifier = contentModifier
-                        )
-
-                        AppTab.SETTINGS -> SettingsScreen(
-                            config = config,
-                            isRunning = isRunning,
-                            onUpdateConfig = updateConfig,
-                            modifier = contentModifier
-                        )
-
-                        AppTab.CRASH -> CrashScreen(
-                            onCrashCleared = {
-                                latestCrashFile = null
-                                latestCrashText = null
-                                LogBuffer.clearCrashReports(this@MainActivity)
-                            },
-                            modifier = contentModifier
-                        )
-                    }
                 }
             }
+        } catch (oom: OutOfMemoryError) {
+            CrashHandler.logCriticalThrowable(this, "MainActivity.onCreate", oom)
+        } catch (t: Throwable) {
+            CrashHandler.logCriticalThrowable(this, "MainActivity.onCreate", t)
+            throw t
         }
     }
 }

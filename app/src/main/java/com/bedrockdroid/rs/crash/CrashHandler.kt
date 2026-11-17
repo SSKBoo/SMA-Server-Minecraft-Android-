@@ -2,6 +2,7 @@ package com.bedrockdroid.rs.crash
 
 import android.content.Context
 import android.util.Log
+import com.bedrockdroid.rs.model.LogBuffer
 import com.bedrockdroid.rs.model.LogStream
 import com.bedrockdroid.rs.model.ServerRuntimeState
 import com.bedrockdroid.rs.nativebridge.RustCoreBridge
@@ -62,9 +63,15 @@ object CrashHandler {
     @JvmStatic
     fun refreshState(context: Context? = appContext) {
         val ctx = context ?: appContext ?: return
-        val content = runCatching { CrashLogFileManager.readCrashLog(ctx) }.getOrDefault("")
-        _crashLogContent.value = content
-        _hasPendingCrash.value = content.isNotBlank()
+        try {
+            val content = CrashLogFileManager.readCrashLogPreview(ctx)
+            _crashLogContent.value = content
+            _hasPendingCrash.value = content.isNotBlank() || CrashLogFileManager.hasPendingCrash(ctx)
+        } catch (oom: OutOfMemoryError) {
+            logCriticalThrowable(ctx, "CrashHandler.refreshState", oom)
+        } catch (_: Throwable) {
+            // Ignorar error de lectura secundaria
+        }
     }
 
     @JvmStatic
@@ -87,9 +94,36 @@ object CrashHandler {
     }
 
     @JvmStatic
+    fun logCriticalThrowable(context: Context? = appContext, origin: String, throwable: Throwable) {
+        val ctx = (context ?: appContext)?.applicationContext
+        if (throwable is OutOfMemoryError) {
+            runCatching { System.gc() }
+        }
+        val summary = try {
+            if (throwable is OutOfMemoryError) {
+                "OutOfMemoryError en $origin: ${throwable.message ?: "heap agotado"}"
+            } else {
+                "Throwable en $origin (${throwable.javaClass.name}): ${throwable.message}\n${throwable.stackTraceToString().take(4096)}"
+            }
+        } catch (_: Throwable) {
+            "CriticalThrowable en $origin: ${throwable.javaClass.simpleName}"
+        }
+        runCatching { Log.e("BedrockDroidCrash", summary) }
+        if (ctx != null && (throwable is OutOfMemoryError || isProtectionEnabled(ctx))) {
+            runCatching { CrashLogFileManager.appendCrash(ctx, summary) }
+            runCatching {
+                _crashLogContent.value = CrashLogFileManager.readCrashLogPreview(ctx)
+                _hasPendingCrash.value = true
+            }
+        }
+    }
+
+    @JvmStatic
     fun clearLogs(context: Context) {
         CrashLogFileManager.clearCrashLog(context)
+        runCatching { LogBuffer.clearStreamLogFile(context) }
         _crashLogContent.value = ""
         _hasPendingCrash.value = false
+        refreshState(context)
     }
 }

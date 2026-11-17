@@ -48,28 +48,40 @@ fun CrashScreen(
     val exportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            val uri = result.data?.data ?: return@rememberLauncherForActivityResult
-            CrashLogFileManager.exportCrashLogToUri(context, uri)
-                .onSuccess { bytes ->
-                    Toast.makeText(
-                        context,
-                        "Log de error exportado ($bytes bytes)",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-                .onFailure { err ->
-                    Toast.makeText(
-                        context,
-                        "Error al exportar: ${err.message}",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
+        try {
+            if (result.resultCode == Activity.RESULT_OK) {
+                val uri = result.data?.data ?: return@rememberLauncherForActivityResult
+                CrashLogFileManager.exportCrashLogToUri(context, uri)
+                    .onSuccess { bytes ->
+                        Toast.makeText(
+                            context,
+                            "Log de error exportado ($bytes bytes)",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                    .onFailure { err ->
+                        Toast.makeText(
+                            context,
+                            "Error al exportar: ${err.message}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+            }
+        } catch (oom: OutOfMemoryError) {
+            CrashHandler.logCriticalThrowable(context, "CrashScreen.export", oom)
+        } catch (t: Throwable) {
+            CrashHandler.logCriticalThrowable(context, "CrashScreen.export", t)
         }
     }
 
     LaunchedEffect(Unit) {
-        CrashHandler.refreshState(context)
+        try {
+            CrashHandler.refreshState(context)
+        } catch (oom: OutOfMemoryError) {
+            CrashHandler.logCriticalThrowable(context, "CrashScreen.LaunchedEffect", oom)
+        } catch (t: Throwable) {
+            CrashHandler.logCriticalThrowable(context, "CrashScreen.LaunchedEffect", t)
+        }
     }
 
     Column(
@@ -115,7 +127,7 @@ fun CrashScreen(
                 }
                 Text(
                     text = if (protectionEnabled) {
-                        "Modo pruebas activo: catch_unwind, set_hook y Kotlin guardan los errores en ${crashFile.absolutePath}"
+                        "Modo pruebas activo: signal-hook, catch_unwind, set_hook y Kotlin guardan los errores en ${crashFile.absolutePath}"
                     } else {
                         "Desactivada para no guardar todo siempre en disco. Pulsa el botón solo cuando quieras hacer pruebas."
                     },
@@ -125,17 +137,23 @@ fun CrashScreen(
 
                 Button(
                     onClick = {
-                        val next = !protectionEnabled
-                        CrashHandler.setProtectionEnabled(context, next)
-                        Toast.makeText(
-                            context,
-                            if (next) {
-                                "Protección de pruebas ACTIVADA: capturando Rust Panics en crash_log.txt"
-                            } else {
-                                "Protección de pruebas DESACTIVADA: modo normal sin guardado"
-                            },
-                            Toast.LENGTH_SHORT
-                        ).show()
+                        try {
+                            val next = !protectionEnabled
+                            CrashHandler.setProtectionEnabled(context, next)
+                            Toast.makeText(
+                                context,
+                                if (next) {
+                                    "Protección de pruebas ACTIVADA: capturando SIGSEGV/SIGABRT y Panics en crash_log.txt"
+                                } else {
+                                    "Protección de pruebas DESACTIVADA: modo normal sin guardado"
+                                },
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        } catch (oom: OutOfMemoryError) {
+                            CrashHandler.logCriticalThrowable(context, "CrashScreen.toggleProtection", oom)
+                        } catch (t: Throwable) {
+                            CrashHandler.logCriticalThrowable(context, "CrashScreen.toggleProtection", t)
+                        }
                     },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
@@ -159,12 +177,18 @@ fun CrashScreen(
                 ) {
                     Button(
                         onClick = {
-                            val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                                addCategory(Intent.CATEGORY_OPENABLE)
-                                type = "text/plain"
-                                putExtra(Intent.EXTRA_TITLE, "BedrockDroid_Crash_Log.txt")
+                            try {
+                                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                                    addCategory(Intent.CATEGORY_OPENABLE)
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_TITLE, "BedrockDroid_Crash_Log.txt")
+                                }
+                                exportLauncher.launch(intent)
+                            } catch (oom: OutOfMemoryError) {
+                                CrashHandler.logCriticalThrowable(context, "CrashScreen.exportClick", oom)
+                            } catch (t: Throwable) {
+                                CrashHandler.logCriticalThrowable(context, "CrashScreen.exportClick", t)
                             }
-                            exportLauncher.launch(intent)
                         },
                         modifier = Modifier.weight(1f),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A))
@@ -176,11 +200,17 @@ fun CrashScreen(
 
                     OutlinedButton(
                         onClick = {
-                            CrashHandler.clearLogs(context)
-                            onCrashCleared()
-                            Toast.makeText(context, "crash_log.txt limpiado", Toast.LENGTH_SHORT).show()
+                            try {
+                                CrashHandler.clearLogs(context)
+                                onCrashCleared()
+                                Toast.makeText(context, "Archivos crash_log.txt y logcat_pipe.log limpiados", Toast.LENGTH_SHORT).show()
+                            } catch (oom: OutOfMemoryError) {
+                                CrashHandler.logCriticalThrowable(context, "CrashScreen.clearLogs", oom)
+                            } catch (t: Throwable) {
+                                CrashHandler.logCriticalThrowable(context, "CrashScreen.clearLogs", t)
+                            }
                         },
-                        enabled = hasPendingCrash
+                        enabled = true
                     ) {
                         Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))

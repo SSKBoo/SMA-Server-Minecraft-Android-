@@ -94,6 +94,9 @@ static PLAYER_EVENT_HOOK: OnceLock<Mutex<Option<PlayerEventHook>>> = OnceLock::n
 static CRASH_EVENT_HOOK: OnceLock<Mutex<Option<CrashEventHook>>> = OnceLock::new();
 static CRASH_LOG_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static CRASH_PROTECTION_ENABLED: AtomicBool = AtomicBool::new(false);
+static SIGNAL_HOOKS_INIT: OnceLock<()> = OnceLock::new();
+const DEFAULT_ANDROID_CRASH_LOG_PATH: &str =
+    "/storage/emulated/0/Android/data/com.bedrockdroid.rs/files/crash_log.txt";
 
 fn player_state_slot() -> &'static Mutex<ConnectedPlayerState> {
     PLAYER_STATE.get_or_init(|| Mutex::new(ConnectedPlayerState::default()))
@@ -129,6 +132,60 @@ pub fn set_crash_event_hook(hook: Option<CrashEventHook>) {
     if let Ok(mut guard) = crash_hook_slot().lock() {
         *guard = hook;
     }
+}
+
+pub fn record_native_signal_crash(sig_name: &str, sig_num: i32) {
+    if !is_crash_protection_enabled() {
+        return;
+    }
+    let bt = backtrace::Backtrace::new();
+    let target_path = crash_log_path_slot()
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ANDROID_CRASH_LOG_PATH));
+    if let Some(parent) = target_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&target_path) {
+        let _ = writeln!(file, "CRASH NATIVO: {} (sig={})\n{:?}", sig_name, sig_num, bt);
+        let _ = file.flush();
+        let _ = file.sync_all();
+    }
+}
+
+pub fn init_native_signal_handlers() {
+    SIGNAL_HOOKS_INIT.get_or_init(|| {
+        #[cfg(unix)]
+        unsafe {
+            use signal_hook::consts::signal::{SIGABRT, SIGBUS, SIGILL, SIGSEGV};
+            let signals: [(&str, libc::c_int); 4] = [
+                ("SIGSEGV", SIGSEGV),
+                ("SIGABRT", SIGABRT),
+                ("SIGBUS", SIGBUS),
+                ("SIGILL", SIGILL),
+            ];
+            for (sig_name, sig_num) in signals {
+                let res = if signal_hook::consts::FORBIDDEN.contains(&sig_num) {
+                    signal_hook_registry::register_signal_unchecked(sig_num, move || {
+                        record_native_signal_crash(sig_name, sig_num as i32);
+                    })
+                } else {
+                    signal_hook::low_level::register(sig_num, move || {
+                        record_native_signal_crash(sig_name, sig_num as i32);
+                    })
+                };
+                if let Err(err) = res {
+                    log::warn!(
+                        "[RustSignalHook] No se pudo registrar señal {} ({}): {}",
+                        sig_name,
+                        sig_num,
+                        err
+                    );
+                }
+            }
+        }
+    });
 }
 
 pub fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
@@ -1749,6 +1806,7 @@ pub fn init_android_logging() {
             report_rust_crash(&report);
         }));
     });
+    init_native_signal_handlers();
 }
 
 pub fn current_engine_state() -> EngineState {
@@ -2857,7 +2915,7 @@ mod tests {
         assert!(!tmp_path.exists());
         assert_eq!(captured.lock().expect("lock captured").len(), 0);
 
-        // Activar solo para pruebas: catch_unwind captura pánico y guarda en disco + hook
+        init_native_signal_handlers();
         set_crash_protection_enabled(true);
         assert!(is_crash_protection_enabled());
 
@@ -2865,6 +2923,8 @@ mod tests {
             panic!("simulated packet panic during join");
         });
         assert!(!ok);
+
+        record_native_signal_crash("SIGABRT", 6);
 
         {
             let g = captured.lock().expect("lock captured");
@@ -2874,6 +2934,7 @@ mod tests {
 
         let disk = std::fs::read_to_string(&tmp_path).expect("crash file must exist");
         assert!(disk.contains("simulated packet panic during join"));
+        assert!(disk.contains("CRASH NATIVO: SIGABRT (sig=6)"));
 
         let _ = std::fs::remove_file(&tmp_path);
         set_crash_protection_enabled(false);

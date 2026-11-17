@@ -44,7 +44,7 @@ class ServerForegroundService : Service() {
     private var lastNetworkCallbackProbeMs: Long = 0L
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        LogBuffer.startProcessLogcatCollector()
+        LogBuffer.startProcessLogcatCollector(applicationContext)
         val cfg = LauncherPrefs.load(this)
         ensureNotificationChannel()
 

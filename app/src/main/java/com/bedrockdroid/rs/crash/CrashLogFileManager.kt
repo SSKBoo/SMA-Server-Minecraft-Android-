@@ -49,6 +49,28 @@ object CrashLogFileManager {
     }
 
     @JvmStatic
+    @Synchronized
+    fun readCrashLogPreview(context: Context, maxBytes: Int = 65536): String {
+        val file = getCrashLogFile(context)
+        if (!file.exists() || file.length() == 0L) return ""
+        return runCatching {
+            val len = file.length()
+            if (len <= maxBytes) {
+                file.readText(Charsets.UTF_8)
+            } else {
+                val startOffset = len - maxBytes
+                java.io.RandomAccessFile(file, "r").use { raf ->
+                    raf.seek(startOffset)
+                    val buf = ByteArray(maxBytes)
+                    val read = raf.read(buf)
+                    val tail = if (read > 0) String(buf, 0, read, Charsets.UTF_8) else ""
+                    "... [Mostrando últimos ${maxBytes / 1024} KB de ${len / 1024} KB] ...\n" + tail
+                }
+            }
+        }.getOrDefault("")
+    }
+
+    @JvmStatic
     fun hasPendingCrash(context: Context): Boolean {
         val file = getCrashLogFile(context)
         return file.exists() && file.length() > 0L
@@ -57,14 +79,39 @@ object CrashLogFileManager {
     @JvmStatic
     @Synchronized
     fun clearCrashLog(context: Context) {
-        val file = getCrashLogFile(context)
-        if (file.exists()) {
-            runCatching {
-                FileOutputStream(file, false).use { fos ->
-                    fos.flush()
-                    fos.close()
+        val candidates = listOfNotNull(
+            getCrashLogFile(context),
+            File(context.filesDir, CRASH_LOG_FILE_NAME),
+            File(context.filesDir, "logcat_pipe.log")
+        ).distinctBy { it.absolutePath }
+
+        candidates.forEach { file ->
+            if (file.exists()) {
+                runCatching {
+                    FileOutputStream(file, false).use { fos ->
+                        fos.write(ByteArray(0))
+                        fos.flush()
+                        runCatching { fos.fd.sync() }
+                        fos.close()
+                    }
+                    file.delete()
                 }
-                file.delete()
+            }
+        }
+
+        val crashDir = File(context.filesDir, "crash")
+        if (crashDir.exists() && crashDir.isDirectory) {
+            runCatching {
+                crashDir.listFiles()?.forEach { f ->
+                    runCatching {
+                        FileOutputStream(f, false).use { fos ->
+                            fos.write(ByteArray(0))
+                            fos.flush()
+                            fos.close()
+                        }
+                        f.delete()
+                    }
+                }
             }
         }
     }
