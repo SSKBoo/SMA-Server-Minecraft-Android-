@@ -202,7 +202,7 @@ fun CrashScreen(
             SelectionContainer {
                 Text(
                     text = crashLogText.ifBlank {
-                        "No se han registrado crashes ni pánicos nativos en crash_log.txt.\n\nLa protección inicia DESACTIVADA para no guardar todo continuamente. Activa el botón "Activar Protección (Solo Pruebas)" antes de probar la conexión cuando quieras capturar un Rust Panic en crash_log.txt."
+                        "No se han registrado crashes ni pánicos nativos en crash_log.txt.\n\nLa protección inicia DESACTIVADA para no guardar todo continuamente. Activa el botón \"Activar Protección (Solo Pruebas)\" antes de probar la conexión cuando quieras capturar un Rust Panic en crash_log.txt."
                     },
                     fontFamily = FontFamily.Monospace,
                     fontSize = 11.sp,
