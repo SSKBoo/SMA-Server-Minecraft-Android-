@@ -1,6 +1,10 @@
 package com.bedrockdroid.rs.nativebridge
 
 object RustCoreBridge {
+    fun interface PlayerConnectionListener {
+        fun onPlayerLoginStateChanged(playerName: String, connectedCount: Int, connected: Boolean)
+    }
+
     @Volatile
     private var nativeLoaded: Boolean = false
 
@@ -20,6 +24,27 @@ object RustCoreBridge {
     fun isAvailable(): Boolean = nativeLoaded
 
     fun lastLoadError(): String? = loadError
+
+    fun registerPlayerCallbackSafe(listener: PlayerConnectionListener): Boolean {
+        if (!nativeLoaded) return false
+        return try {
+            registerPlayerCallback(listener)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun pollConnectedPlayerStatusSafe(): String {
+        if (!nativeLoaded) {
+            return "{\"connected\":false,\"count\":0,\"player\":\"\",\"worldSpawnSent\":false,\"chunksSent\":0}"
+        }
+        return try {
+            pollConnectedPlayerStatus()
+        } catch (_: Throwable) {
+            "{\"connected\":false,\"count\":0,\"player\":\"\",\"worldSpawnSent\":false,\"chunksSent\":0}"
+        }
+    }
 
     fun initRuntimeSafe(
         engineDir: String,
@@ -104,6 +129,10 @@ object RustCoreBridge {
             // Ignorar fallos durante apagado nativo
         }
     }
+
+    external fun registerPlayerCallback(listener: PlayerConnectionListener)
+
+    external fun pollConnectedPlayerStatus(): String
 
     external fun initRuntime(
         engineDir: String,

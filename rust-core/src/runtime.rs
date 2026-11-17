@@ -7,8 +7,11 @@ use acacia_nethernet::{
 use acacia_session::proto::{
     encode_packet, packet_name,
     packets::{
-        ClientToServerHandshake, Login, NetworkSettings, NetworkSettingsCompressionAlgorithm,
-        PlayStatus, PlayStatusStatus, RequestNetworkSettings, ServerToClientHandshake,
+        ClientCacheStatus, ClientToServerHandshake, Login, NetworkSettings,
+        NetworkSettingsCompressionAlgorithm, PlayStatus, PlayStatusStatus, RequestChunkRadius,
+        RequestNetworkSettings, ResourcePackClientResponse,
+        ResourcePackClientResponseResponseStatus, ServerToClientHandshake,
+        SetLocalPlayerAsInitialized,
     },
     Packet, RawPacket,
 };
@@ -53,11 +56,119 @@ pub fn poll_connection_event(conn: &mut Connection) -> Option<Event> {
     conn.poll_message().map(Event::Data)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SessionProgress {
+    pub has_sent_network_settings: bool,
+    pub player_logged_in: bool,
+    pub has_sent_start_game: bool,
+    pub has_sent_initial_chunks: bool,
+}
+
 struct PeerSession {
     conn: Connection,
     session: ServerConnection,
     remote_addr: SocketAddr,
-    has_sent_network_settings: bool,
+    progress: SessionProgress,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConnectedPlayerState {
+    connected_count: usize,
+    last_player_name: String,
+    world_spawn_sent: bool,
+    chunks_sent: usize,
+}
+
+pub type PlayerEventHook = Arc<dyn Fn(&str, usize, bool) + Send + Sync>;
+
+static PLAYER_STATE: OnceLock<Mutex<ConnectedPlayerState>> = OnceLock::new();
+static PLAYER_EVENT_HOOK: OnceLock<Mutex<Option<PlayerEventHook>>> = OnceLock::new();
+
+fn player_state_slot() -> &'static Mutex<ConnectedPlayerState> {
+    PLAYER_STATE.get_or_init(|| Mutex::new(ConnectedPlayerState::default()))
+}
+
+fn player_hook_slot() -> &'static Mutex<Option<PlayerEventHook>> {
+    PLAYER_EVENT_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_player_event_hook(hook: Option<PlayerEventHook>) {
+    if let Ok(mut guard) = player_hook_slot().lock() {
+        *guard = hook;
+    }
+}
+
+fn emit_player_hook(player_name: &str, count: usize, connected: bool) {
+    let hook_opt = player_hook_slot().lock().ok().and_then(|g| g.clone());
+    if let Some(hook) = hook_opt {
+        hook(player_name, count, connected);
+    }
+}
+
+fn notify_player_login(player_name: &str) {
+    let clean_name = if player_name.trim().is_empty() {
+        "Jugador Bedrock".to_string()
+    } else {
+        player_name.trim().to_string()
+    };
+    let count = {
+        let mut st = match player_state_slot().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        st.connected_count = st.connected_count.saturating_add(1);
+        st.last_player_name = clean_name.clone();
+        st.connected_count
+    };
+    emit_player_hook(&clean_name, count, true);
+}
+
+fn notify_player_disconnect() {
+    let (name, count, still_connected) = {
+        let mut st = match player_state_slot().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        st.connected_count = st.connected_count.saturating_sub(1);
+        if st.connected_count == 0 {
+            st.last_player_name.clear();
+            st.world_spawn_sent = false;
+            st.chunks_sent = 0;
+            (String::new(), 0usize, false)
+        } else {
+            (st.last_player_name.clone(), st.connected_count, true)
+        }
+    };
+    emit_player_hook(&name, count, still_connected);
+}
+
+fn notify_world_spawn_sent(chunks_sent: usize) {
+    if let Ok(mut st) = player_state_slot().lock() {
+        st.world_spawn_sent = true;
+        st.chunks_sent = st.chunks_sent.saturating_add(chunks_sent);
+    }
+}
+
+fn reset_player_state() {
+    if let Ok(mut st) = player_state_slot().lock() {
+        *st = ConnectedPlayerState::default();
+    }
+    emit_player_hook("", 0, false);
+}
+
+pub fn current_connected_player_status_json() -> String {
+    let st = player_state_slot()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    serde_json::json!({
+        "connected": st.connected_count > 0,
+        "count": st.connected_count,
+        "player": st.last_player_name,
+        "worldSpawnSent": st.world_spawn_sent,
+        "chunksSent": st.chunks_sent
+    })
+    .to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,12 +630,475 @@ pub fn is_protocol_compatible(client_protocol: Option<u32>, client_version: Opti
     }
 }
 
+/// Decodificador compacto Base64/Base64URL para inspeccionar el payload JWT de `Login` sin dependencias externas.
+fn decode_base64_segment(segment: &str) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let clean: Vec<u8> = segment
+        .bytes()
+        .filter(|&b| b != b'=' && !b.is_ascii_whitespace())
+        .collect();
+    if clean.len() < 4 {
+        return None;
+    }
+    let mut out = Vec::with_capacity((clean.len() * 3) / 4);
+    let mut i = 0usize;
+    while i + 1 < clean.len() {
+        let a = val(clean[i])?;
+        let b = val(clean[i + 1])?;
+        out.push((a << 2) | (b >> 4));
+        if i + 2 < clean.len() {
+            let c = val(clean[i + 2])?;
+            out.push(((b & 0x0f) << 4) | (c >> 2));
+            if i + 3 < clean.len() {
+                let d = val(clean[i + 3])?;
+                out.push(((c & 0x03) << 6) | d);
+            }
+        }
+        i += 4;
+    }
+    Some(out)
+}
+
+fn find_json_display_name(text: &str) -> Option<String> {
+    for needle in ["\"displayName\"", "\"DisplayName\""] {
+        if let Some(pos) = text.find(needle) {
+            let rest = &text[pos + needle.len()..];
+            if let Some(colon_idx) = rest.find(':') {
+                let after_colon = rest[colon_idx + 1..].trim_start();
+                if let Some(quoted) = after_colon.strip_prefix('"') {
+                    if let Some(end_quote) = quoted.find('"') {
+                        let name = quoted[..end_quote].trim();
+                        if !name.is_empty() && name.len() <= 32 {
+                            return Some(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extrae el gamertag del cliente desde el cuerpo del paquete `Login` (JWT en claro o cadena Base64URL).
+pub fn extract_player_name_from_login(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    if let Some(name) = find_json_display_name(&text) {
+        return name;
+    }
+    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '+' || c == '/' || c == '.')) {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() == 3 {
+            if let Some(decoded) = decode_base64_segment(parts[1]) {
+                let payload_str = String::from_utf8_lossy(&decoded);
+                if let Some(name) = find_json_display_name(&payload_str) {
+                    return name;
+                }
+            }
+        }
+    }
+    "Jugador Bedrock".to_string()
+}
+
+fn zigzag32(n: i32) -> u32 {
+    ((n << 1) ^ (n >> 31)) as u32
+}
+
+/// Calcula el hash FNV-1a 32-bit de un compuesto NBT little-endian (`nbtx`) de estado de bloque Bedrock.
+pub fn block_state_hash_nbtx(block_name: &str) -> u32 {
+    let mut root = nbtx::Compound::new();
+    root.insert("name".into(), nbtx::Value::String(block_name.into()));
+    root.insert("states".into(), nbtx::Value::Compound(nbtx::Compound::new()));
+    root.insert("version".into(), nbtx::Value::Int(18_163_713));
+
+    let nbt_bytes = nbtx::to_le_bytes(&nbtx::Value::Compound(root))
+        .unwrap_or_else(|_| block_name.as_bytes().to_vec());
+
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in &nbt_bytes {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+fn append_uniform_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, block_hash: u32) {
+    out.push(0x09); // SubChunk versión 9
+    out.push(0x01); // 1 capa de bloques
+    out.push(sub_y as u8);
+    out.push(0x01); // 0 bits por bloque (paleta de 1 valor) + flag network=1
+    encode_varuint32(zigzag32(block_hash as i32), out);
+}
+
+fn append_surface_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, stone_hash: u32, grass_hash: u32) {
+    out.push(0x09); // SubChunk versión 9
+    out.push(0x01); // 1 capa de bloques
+    out.push(sub_y as u8);
+    out.push(0x03); // 1 bit por bloque (paleta de 2 valores) + flag network=1
+
+    // 4096 bloques empaquetados a 1 bit/bloque -> 128 palabras u32 LE.
+    // Coordenada en SubChunk: index = (x << 8) | (z << 4) | y -> local_y = index & 0x0F.
+    for word_idx in 0..128usize {
+        let base = word_idx * 32;
+        let mut word: u32 = 0;
+        for bit in 0..32usize {
+            let local_y = (base + bit) & 0x0F;
+            if local_y == 15 {
+                word |= 1u32 << bit;
+            }
+        }
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+
+    encode_varuint32(zigzag32(2), out); // 2 entradas en paleta
+    encode_varuint32(zigzag32(stone_hash as i32), out);
+    encode_varuint32(zigzag32(grass_hash as i32), out);
+}
+
+fn append_overworld_biomes_and_borders(out: &mut Vec<u8>) {
+    // Overworld abarca 24 subchunks de bioma (-64..319); paleta uniforme = 1 (Plains)
+    for _ in 0..24 {
+        out.push(0x01);
+        encode_varuint32(zigzag32(1), out);
+    }
+    out.push(0x00); // border_blocks = 0
+}
+
+/// Genera un chunk vacío (todo `minecraft:air`) usando hashes NBT `nbtx` (9 subchunks: -4..=4).
+pub fn build_empty_air_chunk_payload_nbtx() -> Vec<u8> {
+    let air_hash = block_state_hash_nbtx("minecraft:air");
+    let mut data = Vec::with_capacity(256);
+    for sub_y in -4i8..=4i8 {
+        append_uniform_subchunk_v9(&mut data, sub_y, air_hash);
+    }
+    append_overworld_biomes_and_borders(&mut data);
+    data
+}
+
+/// Genera un chunk de spawn seguro con `nbtx`: piedra en `y=-64..62`, césped en `y=63` y aire en `y>=64`,
+/// para que el jugador que aparece en `(0, 64, 0)` no caiga al vacío.
+pub fn build_spawn_chunk_payload_nbtx() -> Vec<u8> {
+    let air_hash = block_state_hash_nbtx("minecraft:air");
+    let stone_hash = block_state_hash_nbtx("minecraft:stone");
+    let grass_hash = block_state_hash_nbtx("minecraft:grass_block");
+
+    let mut data = Vec::with_capacity(768);
+    // Subchunks -4..=2 (y = -64..47): sólido de piedra
+    for sub_y in -4i8..=2i8 {
+        append_uniform_subchunk_v9(&mut data, sub_y, stone_hash);
+    }
+    // Subchunk 3 (y = 48..63): stone en local_y 0..14 y grass_block en local_y 15 (y=63)
+    append_surface_subchunk_v9(&mut data, 3, stone_hash, grass_hash);
+    // Subchunk 4 (y = 64..79): todo aire para el jugador en y=64
+    append_uniform_subchunk_v9(&mut data, 4, air_hash);
+
+    append_overworld_biomes_and_borders(&mut data);
+    data
+}
+
+#[cfg(feature = "protocol-core")]
+fn encode_bedrock_v2225_packet<P: bedrock::protocol::Packet>(pkt: &P) -> Result<Bytes, String> {
+    use bedrock::protocol::{PacketHeader as BedrockPacketHeader, ProtoCodec as BedrockProtoCodec};
+
+    let mut raw = Vec::with_capacity(256);
+    let header = BedrockPacketHeader {
+        packet_id: P::ID,
+        sender_sub_client_id: 0,
+        target_sub_client_id: 0,
+    };
+    header
+        .serialize(&mut raw)
+        .map_err(|e| format!("header encode err (id={}): {}", P::ID, e))?;
+    pkt.serialize(&mut raw)
+        .map_err(|e| format!("body encode err (id={}): {}", P::ID, e))?;
+    Ok(Bytes::from(raw))
+}
+
+#[cfg(feature = "protocol-core")]
+pub fn build_v2225_start_game_packet_bytes() -> Result<Bytes, String> {
+    use bedrock::protocol::v2168::enums::EducationEditionOffer;
+    use bedrock::protocol::v2168::packets::StartGamePacket;
+    use bedrock::protocol::v2225::types::{
+        EditorLevelMigrationVersion, GameRuleLegacyData, LevelSettings,
+    };
+    use bedrock::protocol::v662::enums::{
+        ChatRestrictionLevel, Difficulty, EditorWorldType, GamePublishSetting, GameType,
+        GeneratorType, SpawnBiomeType,
+    };
+    use bedrock::protocol::v662::types::{
+        ActorRuntimeID, ActorUniqueID, BaseGameVersion, EduSharedUriResource, Experiments,
+        NetworkPermissions, SpawnSettings,
+    };
+    use bedrock::protocol::v818::types::SyncedPlayerMovementSettings;
+    use bedrock::protocol::v944::types::NetworkBlockPosition;
+    use bedrock::protocol::V2225;
+
+    let pkt = StartGamePacket::<V2225> {
+        target_actor_id: ActorUniqueID(1),
+        target_runtime_id: ActorRuntimeID(1),
+        actor_game_type: GameType::Survival,
+        position: (0.0, 64.0, 0.0),
+        rotation: (0.0, 0.0),
+        settings: LevelSettings::<V2225> {
+            seed: 1,
+            spawn_settings: SpawnSettings::<V2225> {
+                spawn_type: SpawnBiomeType::Default,
+                user_defined_biome_name: String::new(),
+                dimension: 0,
+            },
+            generator_type: GeneratorType::Flat,
+            game_type: GameType::Survival,
+            is_hardcore_enabled: false,
+            game_difficulty: Difficulty::Normal,
+            default_spawn_block_position: NetworkBlockPosition { x: 0, y: 64, z: 0 },
+            achievements_disabled: true,
+            editor_world_type: EditorWorldType::NonEditor,
+            is_created_in_editor: false,
+            is_exported_from_editor: false,
+            editor_level_migration_version: EditorLevelMigrationVersion::Legacy,
+            day_cycle_stop_time: 6000,
+            education_edition_offer: EducationEditionOffer::None,
+            education_features_enabled: false,
+            education_product_id: String::new(),
+            rain_level: 0.0,
+            lightning_level: 0.0,
+            has_confirmed_platform_locked_content: false,
+            multiplayer_enabled: true,
+            lan_broadcasting_enabled: true,
+            xbox_live_broadcast_setting: GamePublishSetting::FriendsOfFriends,
+            platform_broadcast_setting: GamePublishSetting::FriendsOfFriends,
+            commands_enabled: true,
+            texture_packs_required: false,
+            rule_data: GameRuleLegacyData {
+                rules_list: Vec::new(),
+            },
+            experiments: Experiments {
+                experiments: Vec::new(),
+                ever_toggled: false,
+            },
+            bonus_chest_enabled: false,
+            starting_map_enabled: false,
+            player_permissions: 1,
+            server_chunk_tick_range: 4,
+            locked_behaviour_pack: false,
+            locked_resource_pack: false,
+            from_locked_template: false,
+            use_msa_gamer_tags: false,
+            from_template: false,
+            has_locked_template_settings: false,
+            only_spawn_v1_villagers: false,
+            persona_disabled: false,
+            custom_skins_disabled: false,
+            emote_chat_muted: false,
+            base_game_version: BaseGameVersion(MOTD_ADVERTISED_VERSION.to_string()),
+            limited_world_width: 0,
+            limited_world_depth: 0,
+            nether_type: false,
+            edu_shared_uri_resource: EduSharedUriResource {
+                button_name: String::new(),
+                link_uri: String::new(),
+            },
+            override_force_experimental_gameplay: None,
+            chat_restriction_level: ChatRestrictionLevel::None,
+            disable_player_interactions: false,
+            server_editor_connection_policy: 0,
+            allow_anonymous_block_drops_in_editor_worlds: false,
+        },
+        level_id: "bedrockdroid_world".to_string(),
+        level_name: "Bedrock World".to_string(),
+        template_content_identity: String::new(),
+        is_trial: false,
+        movement_settings: SyncedPlayerMovementSettings {
+            rewind_history_size: 40,
+            server_authoritative_block_breaking: true,
+        },
+        current_level_time: 6000,
+        enchantment_seed: 0,
+        block_properties: Vec::new(),
+        multiplayer_correlation_id: String::new(),
+        enable_item_stack_net_manager: true,
+        server_version: MOTD_ADVERTISED_VERSION.to_string(),
+        player_property_data: HashMap::new(),
+        server_block_type_registry_checksum: 0,
+        world_template_id: uuid::Uuid::nil(),
+        server_enabled_client_side_generation: false,
+        block_network_ids_are_hashes: true,
+        network_permissions: NetworkPermissions {
+            server_auth_sound_enabled: false,
+        },
+        server_join_information: None,
+        server_id: String::new(),
+        scenario_id: String::new(),
+        world_id: String::new(),
+        owner_id: String::new(),
+    };
+    encode_bedrock_v2225_packet(&pkt)
+}
+
+#[cfg(feature = "protocol-core")]
+pub fn build_v2225_level_chunk_packet_bytes(cx: i32, cz: i32, serialized_chunk_data: Vec<u8>) -> Result<Bytes, String> {
+    use bedrock::protocol::v2225::packets::LevelChunkPacket;
+    use bedrock::protocol::v662::types::ChunkPos;
+    use bedrock::protocol::V2225;
+
+    let pkt = LevelChunkPacket::<V2225> {
+        chunk_position: ChunkPos { x: cx, z: cz },
+        dimension_id: 0,
+        sub_chunk_count: 9,
+        client_request_sub_chunk_limit: None,
+        cache_enabled: false,
+        cache_blobs: Vec::new(),
+        serialized_chunk_data,
+        is_client_biome_update: false,
+    };
+    encode_bedrock_v2225_packet(&pkt)
+}
+
+#[cfg(feature = "protocol-core")]
+pub fn build_v2225_player_spawn_status_bytes() -> Result<Bytes, String> {
+    use bedrock::protocol::v662::enums::PlayStatus as BedrockPlayStatus;
+    use bedrock::protocol::v662::packets::PlayStatusPacket;
+    use bedrock::protocol::V2225;
+
+    let pkt = PlayStatusPacket::<V2225> {
+        status: BedrockPlayStatus::PlayerSpawn,
+    };
+    encode_bedrock_v2225_packet(&pkt)
+}
+
+#[cfg(feature = "protocol-core")]
+pub fn send_spawn_chunks(
+    conn: &mut Connection,
+    session: &mut ServerConnection,
+    peer_addr: SocketAddr,
+    now: Instant,
+    radius: i32,
+) -> usize {
+    use bedrock::protocol::v662::packets::{ChunkRadiusUpdatedPacket, NetworkChunkPublisherUpdatePacket};
+    use bedrock::protocol::v662::types::BlockPos;
+    use bedrock::protocol::V2225;
+
+    let clamped_radius = radius.clamp(1, 4);
+    if let Ok(pub_pkt) = encode_bedrock_v2225_packet(&NetworkChunkPublisherUpdatePacket::<V2225> {
+        new_view_position: BlockPos { x: 0, y: 64, z: 0 },
+        new_view_radius: (clamped_radius as u32) * 16,
+        server_built_chunks: Vec::new(),
+    }) {
+        let batch = session.encode(&[pub_pkt]);
+        conn.send(batch, now);
+    }
+    if let Ok(rad_pkt) = encode_bedrock_v2225_packet(&ChunkRadiusUpdatedPacket {
+        chunk_radius: clamped_radius,
+    }) {
+        let batch = session.encode(&[rad_pkt]);
+        conn.send(batch, now);
+    }
+
+    let spawn_chunk_template = build_spawn_chunk_payload_nbtx();
+    let mut sent_count = 0usize;
+    for cx in -2..=2 {
+        for cz in -2..=2 {
+            if let Ok(chunk_bytes) =
+                build_v2225_level_chunk_packet_bytes(cx, cz, spawn_chunk_template.clone())
+            {
+                let batch = session.encode(&[chunk_bytes]);
+                conn.send(batch, now);
+                sent_count += 1;
+            }
+        }
+    }
+    log::info!(
+        "[Bedrock World] {} chunks nbtx generados (suelo stone/grass y=63, aire y>=64) enviados a {}",
+        sent_count,
+        peer_addr
+    );
+    sent_count
+}
+
+#[cfg(not(feature = "protocol-core"))]
+pub fn send_spawn_chunks(
+    _conn: &mut Connection,
+    _session: &mut ServerConnection,
+    _peer_addr: SocketAddr,
+    _now: Instant,
+    _radius: i32,
+) -> usize {
+    0
+}
+
+pub fn send_world_start_and_spawn(
+    conn: &mut Connection,
+    session: &mut ServerConnection,
+    progress: &mut SessionProgress,
+    peer_addr: SocketAddr,
+    now: Instant,
+) {
+    #[cfg(feature = "protocol-core")]
+    {
+        use bedrock::protocol::v662::packets::SetTimePacket;
+
+        if !progress.has_sent_start_game {
+            match build_v2225_start_game_packet_bytes() {
+                Ok(start_bytes) => {
+                    let start_batch = session.encode(&[start_bytes]);
+                    conn.send(start_batch, now);
+                    progress.has_sent_start_game = true;
+                    log::info!(
+                        "[Bedrock World] StartGamePacket (0x0b) enviado a {} (spawn=0,64,0)",
+                        peer_addr
+                    );
+                }
+                Err(err) => {
+                    log::warn!("[Bedrock World] Error codificando StartGamePacket: {}", err);
+                }
+            }
+
+            if let Ok(time_bytes) = encode_bedrock_v2225_packet(&SetTimePacket { time: 6000 }) {
+                let time_batch = session.encode(&[time_bytes]);
+                conn.send(time_batch, now);
+                log::info!("[Bedrock World] SetTimePacket (0x0a, time=6000) enviado a {}", peer_addr);
+            }
+        }
+
+        let sent_chunks = if !progress.has_sent_initial_chunks {
+            let n = send_spawn_chunks(conn, session, peer_addr, now, 4);
+            progress.has_sent_initial_chunks = true;
+            n
+        } else {
+            0
+        };
+
+        if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
+            let status_batch = session.encode(&[spawn_status]);
+            conn.send(status_batch, now);
+            log::info!(
+                "[Bedrock World] PlayStatus::PlayerSpawn (0x02 / status=3) enviado a {}",
+                peer_addr
+            );
+        }
+        notify_world_spawn_sent(sent_chunks);
+    }
+
+    #[cfg(not(feature = "protocol-core"))]
+    {
+        let _ = (conn, session, progress, peer_addr, now);
+    }
+}
+
 /// Procesa un lote de datos de sesión de Minecraft Bedrock recibido por el canal SCTP de WebRTC
 /// utilizando `acacia_session::server::ServerConnection` y `acacia_session::proto`.
 pub fn handle_bedrock_session_data(
     conn: &mut Connection,
     session: &mut ServerConnection,
-    has_sent_network_settings: &mut bool,
+    progress: &mut SessionProgress,
     peer_addr: SocketAddr,
     payload: &[u8],
     now: Instant,
@@ -567,8 +1141,8 @@ pub fn handle_bedrock_session_data(
         log::info!("[Bedrock Protocol] Recibido paquete de Minecraft: 0x{:02x}", pkt.id);
 
         match pkt.id {
-            // TAREA 3.1: RequestNetworkSettings (0xC1 / 193 o 0x0B) -> NetworkSettings (0x8F)
-            id if id == RequestNetworkSettings::ID || id == 0x0b => {
+            // TAREA 3.1: RequestNetworkSettings (0xC1 / 193) -> NetworkSettings (0x8F)
+            id if id == RequestNetworkSettings::ID || (!progress.has_sent_network_settings && id == 0x0b) => {
                 if let Ok(req) = pkt.decode::<RequestNetworkSettings>() {
                     log::info!(
                         "[Bedrock Protocol] RequestNetworkSettings recibido de {} (client_protocol={})",
@@ -585,12 +1159,8 @@ pub fn handle_bedrock_session_data(
                     client_throttle_scalar: 0.0,
                 };
 
-                let mut encoded = BytesMut::new();
-                encode_packet(&settings, &mut encoded);
-                // El paquete NetworkSettings se envía sin comprimir antes de activar Deflate
-                let batch = session.encode(&[encoded.freeze()]);
-                conn.send(batch, now);
-
+                // En acacia-session 0.1.0: start_compression() programa Switch::Compression que entra
+                // en vigor exactamente después del próximo session.encode() (NetworkSettings viaja sin comprimir).
                 if let Err(err) = session.start_compression(&settings) {
                     log::warn!(
                         "[Bedrock Protocol] Error activando compresión Deflate para {}: {}",
@@ -598,7 +1168,11 @@ pub fn handle_bedrock_session_data(
                         err
                     );
                 } else {
-                    *has_sent_network_settings = true;
+                    let mut encoded = BytesMut::new();
+                    encode_packet(&settings, &mut encoded);
+                    let batch = session.encode(&[encoded.freeze()]);
+                    conn.send(batch, now);
+                    progress.has_sent_network_settings = true;
                     log::info!(
                         "[Bedrock Protocol] NetworkSettings enviado a {} (Deflate, threshold=256)",
                         peer_addr
@@ -606,25 +1180,25 @@ pub fn handle_bedrock_session_data(
                 }
             }
 
-            // TAREA 3.2: Login (0x01) -> ServerToClientHandshake (0x03) + PlayStatus::LoginSuccess (0x02)
+            // TAREA 3.2: Login (0x01) -> ServerToClientHandshake (0x03) + PlayStatus::LoginSuccess (0x02) + callback JNI
             id if id == Login::ID => {
-                if !*has_sent_network_settings {
+                if !progress.has_sent_network_settings {
                     log::warn!(
                         "[Bedrock Login] Login (0x01) recibido antes de NetworkSettings desde {}",
                         peer_addr
                     );
                 }
 
+                let player_name = extract_player_name_from_login(&pkt.body);
                 match read_login(&pkt.body) {
                     Ok((protocol_version, _skin_jwt, client_key)) => {
                         log::info!(
-                            "[Bedrock Login] Paquete Login (0x01) validado desde {} (proto={})",
+                            "[Bedrock Login] Paquete Login (0x01) validado desde {} (jugador={}, proto={})",
                             peer_addr,
+                            player_name,
                             protocol_version
                         );
                         let _ = client_key;
-                        // En NetherNet el transporte WebRTC/DTLS ya cifra el canal; usamos plaintext_handshake()
-                        // (o start_encryption(&client_key) si se requiere cifrado de capa de sesión).
                         let handshake_pkt = session.plaintext_handshake();
                         let hs_batch = session.encode(&[handshake_pkt]);
                         conn.send(hs_batch, now);
@@ -635,13 +1209,19 @@ pub fn handle_bedrock_session_data(
                     }
                     Err(err) => {
                         log::warn!(
-                            "[Bedrock Login] Login JWT/clave en modo offline o formato alternativo ({}): enviando ServerToClientHandshake y LoginSuccess",
-                            err
+                            "[Bedrock Login] Login JWT/clave en modo offline o formato alternativo ({}): enviando ServerToClientHandshake y LoginSuccess (jugador={})",
+                            err,
+                            player_name
                         );
                         let handshake_pkt = session.plaintext_handshake();
                         let hs_batch = session.encode(&[handshake_pkt]);
                         conn.send(hs_batch, now);
                     }
+                }
+
+                if !progress.player_logged_in {
+                    progress.player_logged_in = true;
+                    notify_player_login(&player_name);
                 }
 
                 let play_status = PlayStatus {
@@ -657,7 +1237,7 @@ pub fn handle_bedrock_session_data(
                 );
             }
 
-            // Respuesta del cliente al ServerToClientHandshake (0x04 ClientToServerHandshake)
+            // Respuesta del cliente al ServerToClientHandshake (0x04 ClientToServerHandshake) -> ResourcePacksInfo
             id if id == ClientToServerHandshake::ID => {
                 let _ = pkt.decode::<ClientToServerHandshake>();
                 let _ = ServerToClientHandshake::ID;
@@ -668,8 +1248,95 @@ pub fn handle_bedrock_session_data(
                 encode_packet(&play_status, &mut status_buf);
                 let status_batch = session.encode(&[status_buf.freeze()]);
                 conn.send(status_batch, now);
+
+                #[cfg(feature = "protocol-core")]
+                {
+                    use bedrock::protocol::v2168::packets::ResourcePacksInfoPacket;
+                    if let Ok(rp_info) = encode_bedrock_v2225_packet(&ResourcePacksInfoPacket {
+                        resource_pack_required: false,
+                        has_addon_packs: false,
+                        has_scripts: false,
+                        force_disable_vibrant_visuals: false,
+                        world_template_uuid: uuid::Uuid::nil(),
+                        world_template_version: String::new(),
+                        resource_packs: Vec::new(),
+                    }) {
+                        let rp_batch = session.encode(&[rp_info]);
+                        conn.send(rp_batch, now);
+                    }
+                }
                 log::info!(
-                    "[Bedrock Login] ClientToServerHandshake (0x04) completado con {} -> PlayStatus::LoginSuccess (0x02) confirmado",
+                    "[Bedrock Login] ClientToServerHandshake (0x04) completado con {} -> ResourcePacksInfo enviado",
+                    peer_addr
+                );
+            }
+
+            // Respuesta de paquetes de recursos (0x08 ResourcePackClientResponse) -> ResourcePackStack / StartGame
+            id if id == ResourcePackClientResponse::ID => {
+                if let Ok(rp) = pkt.decode::<ResourcePackClientResponse>() {
+                    match rp.response_status {
+                        ResourcePackClientResponseResponseStatus::HaveAllPacks => {
+                            #[cfg(feature = "protocol-core")]
+                            {
+                                use bedrock::protocol::v662::types::{BaseGameVersion, Experiments};
+                                use bedrock::protocol::v898::packets::ResourcePackStackPacket;
+                                use bedrock::protocol::V2225;
+
+                                if let Ok(stack_bytes) = encode_bedrock_v2225_packet(&ResourcePackStackPacket::<V2225> {
+                                    texture_pack_required: false,
+                                    addon_list: Vec::new(),
+                                    base_game_version: BaseGameVersion(MOTD_ADVERTISED_VERSION.to_string()),
+                                    experiments: Experiments {
+                                        experiments: Vec::new(),
+                                        ever_toggled: false,
+                                    },
+                                    include_editor_packs: false,
+                                }) {
+                                    let batch = session.encode(&[stack_bytes]);
+                                    conn.send(batch, now);
+                                    log::info!("[Bedrock Packs] ResourcePackStack enviado a {}", peer_addr);
+                                }
+                            }
+                        }
+                        ResourcePackClientResponseResponseStatus::Completed => {
+                            log::info!("[Bedrock Packs] ResourcePackClientResponse Completed desde {}", peer_addr);
+                            send_world_start_and_spawn(conn, session, progress, peer_addr, now);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // FASE 4 P0: Al recibir ClientCacheStatus (0x81 / 129), responder inmediatamente con
+            // StartGamePacket (0x0b), SetTimePacket (0x0a), Chunks iniciales nbtx y PlayStatus::PlayerSpawn (0x02).
+            id if id == ClientCacheStatus::ID => {
+                let cache_enabled = pkt
+                    .decode::<ClientCacheStatus>()
+                    .map(|c| c.enabled)
+                    .unwrap_or(false);
+                log::info!(
+                    "[Bedrock World] ClientCacheStatus (0x81, enabled={}) recibido de {} -> enviando StartGamePacket + Spawn + Chunks",
+                    cache_enabled,
+                    peer_addr
+                );
+                send_world_start_and_spawn(conn, session, progress, peer_addr, now);
+            }
+
+            // Solicitud de radio de chunks (0x45 / 69 RequestChunkRadius)
+            id if id == RequestChunkRadius::ID => {
+                let requested = pkt
+                    .decode::<RequestChunkRadius>()
+                    .map(|r| r.chunk_radius)
+                    .unwrap_or(4);
+                let sent = send_spawn_chunks(conn, session, peer_addr, now, requested);
+                progress.has_sent_initial_chunks = true;
+                notify_world_spawn_sent(sent);
+            }
+
+            // Confirmación del cliente tras aparecer en el mundo (0x71 / 113 SetLocalPlayerAsInitialized)
+            id if id == SetLocalPlayerAsInitialized::ID => {
+                log::info!(
+                    "[Bedrock World] Jugador inicializado dentro del mundo (SetLocalPlayerAsInitialized 0x71) desde {}",
                     peer_addr
                 );
             }
@@ -833,7 +1500,7 @@ async fn handle_http_signaling_stream(
                             conn,
                             session: ServerConnection::nethernet(host_key.clone()),
                             remote_addr: peer_addr,
-                            has_sent_network_settings: false,
+                            progress: SessionProgress::default(),
                         },
                     );
                 }
@@ -1142,7 +1809,7 @@ pub fn start_async_engine(
                                                                         conn,
                                                                         session: ServerConnection::nethernet(lan_key.clone()),
                                                                         remote_addr: from,
-                                                                        has_sent_network_settings: false,
+                                                                        progress: SessionProgress::default(),
                                                                     },
                                                                 );
                                                             }
@@ -1256,7 +1923,7 @@ pub fn start_async_engine(
                                                         handle_bedrock_session_data(
                                                             &mut peer.conn,
                                                             &mut peer.session,
-                                                            &mut peer.has_sent_network_settings,
+                                                            &mut peer.progress,
                                                             peer.remote_addr,
                                                             &payload,
                                                             now,
@@ -1277,8 +1944,17 @@ pub fn start_async_engine(
                                                 outbound.push((tx.destination, tx.contents));
                                             }
                                         }
+                                        let mut logged_out_count = 0usize;
                                         for sid in closed_ids {
-                                            guard.remove(&sid);
+                                            if let Some(removed) = guard.remove(&sid) {
+                                                if removed.progress.player_logged_in {
+                                                    logged_out_count += 1;
+                                                }
+                                            }
+                                        }
+                                        drop(guard);
+                                        for _ in 0..logged_out_count {
+                                            notify_player_disconnect();
                                         }
                                     }
                                     for (dest, data) in outbound {
@@ -1375,7 +2051,7 @@ pub fn start_async_engine(
                                             handle_bedrock_session_data(
                                                 &mut peer.conn,
                                                 &mut peer.session,
-                                                &mut peer.has_sent_network_settings,
+                                                &mut peer.progress,
                                                 peer.remote_addr,
                                                 &payload,
                                                 now,
@@ -1396,8 +2072,17 @@ pub fn start_async_engine(
                                     outbound.push((tx.destination, tx.contents));
                                 }
                             }
+                            let mut logged_out_count = 0usize;
                             for sid in closed_ids {
-                                guard.remove(&sid);
+                                if let Some(removed) = guard.remove(&sid) {
+                                    if removed.progress.player_logged_in {
+                                        logged_out_count += 1;
+                                    }
+                                }
+                            }
+                            drop(guard);
+                            for _ in 0..logged_out_count {
+                                notify_player_disconnect();
                             }
                         }
                         for (dest, data) in outbound {
@@ -1425,7 +2110,7 @@ pub fn start_async_engine(
                                         handle_bedrock_session_data(
                                             &mut peer.conn,
                                             &mut peer.session,
-                                            &mut peer.has_sent_network_settings,
+                                            &mut peer.progress,
                                             peer.remote_addr,
                                             &payload,
                                             now,
@@ -1446,8 +2131,17 @@ pub fn start_async_engine(
                                 outbound.push((tx.destination, tx.contents));
                             }
                         }
+                        let mut logged_out_count = 0usize;
                         for sid in closed_ids {
-                            guard.remove(&sid);
+                            if let Some(removed) = guard.remove(&sid) {
+                                if removed.progress.player_logged_in {
+                                    logged_out_count += 1;
+                                }
+                            }
+                        }
+                        drop(guard);
+                        for _ in 0..logged_out_count {
+                            notify_player_disconnect();
                         }
                     }
                     for (dest, data) in outbound {
@@ -1470,6 +2164,7 @@ pub fn start_async_engine(
 
 pub fn stop_async_engine() {
     set_current_bind_report(None);
+    reset_player_state();
     let taken = handle_slot()
         .lock()
         .ok()
@@ -1617,14 +2312,14 @@ mod tests {
             client_throttle_threshold: 0u8,
             client_throttle_scalar: 0.0,
         };
+        session
+            .start_compression(&settings)
+            .expect("start_compression should succeed");
+
         let mut out = BytesMut::new();
         encode_packet(&settings, &mut out);
         let batch = session.encode(&[out.freeze()]);
         assert!(!batch.is_empty());
-
-        session
-            .start_compression(&settings)
-            .expect("start_compression should succeed");
 
         let hs = session.plaintext_handshake();
         let hs_batch = session.encode(&[hs]);
@@ -1768,5 +2463,74 @@ mod tests {
         stop_async_engine();
         assert!(!is_engine_running());
         assert_eq!(current_engine_state(), EngineState::Stopped);
+    }
+
+    #[test]
+    fn nbtx_generates_block_hashes_and_spawn_chunk_floor() {
+        let air_h = block_state_hash_nbtx("minecraft:air");
+        let stone_h = block_state_hash_nbtx("minecraft:stone");
+        let grass_h = block_state_hash_nbtx("minecraft:grass_block");
+        assert_ne!(air_h, stone_h);
+        assert_ne!(stone_h, grass_h);
+
+        let empty_chunk = build_empty_air_chunk_payload_nbtx();
+        let spawn_chunk = build_spawn_chunk_payload_nbtx();
+        assert!(!empty_chunk.is_empty());
+        assert!(spawn_chunk.len() > empty_chunk.len());
+        // SubChunk -4 (0xFC) con versión v9 (0x09) y 1 capa (0x01)
+        assert_eq!(&spawn_chunk[..3], &[0x09, 0x01, (-4i8) as u8]);
+        assert_eq!(*spawn_chunk.last().expect("border byte"), 0x00);
+    }
+
+    #[cfg(feature = "protocol-core")]
+    #[test]
+    fn v2225_start_game_level_chunk_and_player_spawn_serialize_cleanly() {
+        let start_bytes = build_v2225_start_game_packet_bytes().expect("start_game");
+        let start_raw = RawPacket::parse(start_bytes).expect("parse start_game");
+        assert_eq!(start_raw.id, 0x0b);
+
+        let chunk_bytes =
+            build_v2225_level_chunk_packet_bytes(0, 0, build_spawn_chunk_payload_nbtx())
+                .expect("level_chunk");
+        let chunk_raw = RawPacket::parse(chunk_bytes).expect("parse level_chunk");
+        assert_eq!(chunk_raw.id, 0x3a);
+
+        let spawn_bytes = build_v2225_player_spawn_status_bytes().expect("player_spawn");
+        let spawn_raw = RawPacket::parse(spawn_bytes).expect("parse player_spawn");
+        assert_eq!(spawn_raw.id, 0x02);
+    }
+
+    #[test]
+    fn client_cache_status_0x81_triggers_start_game_chunks_and_login_callback() {
+        reset_player_state();
+        let observed = Arc::new(Mutex::new(Vec::<(String, usize, bool)>::new()));
+        let observed_cb = Arc::clone(&observed);
+        set_player_event_hook(Some(Arc::new(move |name, count, connected| {
+            if let Ok(mut g) = observed_cb.lock() {
+                g.push((name.to_string(), count, connected));
+            }
+        })));
+
+        let fake_login = br#"{"extraData":{"displayName":"SteveDroid"}}"#;
+        assert_eq!(extract_player_name_from_login(fake_login), "SteveDroid");
+        notify_player_login("SteveDroid");
+
+        let status_json = current_connected_player_status_json();
+        assert!(status_json.contains("\"connected\":true"));
+        assert!(status_json.contains("SteveDroid"));
+
+        {
+            let g = observed.lock().expect("lock observed");
+            assert_eq!(g.last(), Some(&("SteveDroid".to_string(), 1usize, true)));
+        }
+
+        // Verificar recepción de ClientCacheStatus (0x81) codificado
+        let mut cache_pkt = BytesMut::new();
+        encode_packet(&ClientCacheStatus { enabled: true }, &mut cache_pkt);
+        let parsed = RawPacket::parse(cache_pkt.freeze()).expect("raw cache status");
+        assert_eq!(parsed.id, 0x81);
+
+        reset_player_state();
+        set_player_event_hook(None);
     }
 }

@@ -275,6 +275,12 @@ data class ServerStatusSnapshot(
     val locksAcquired: Boolean = false
 )
 
+data class ConnectedPlayerSnapshot(
+    val connected: Boolean = false,
+    val count: Int = 0,
+    val playerName: String = ""
+)
+
 object ServerRuntimeState {
     private val _serverStatus = MutableStateFlow(ServerStatusSnapshot())
     val serverStatus: StateFlow<ServerStatusSnapshot> = _serverStatus.asStateFlow()
@@ -284,6 +290,9 @@ object ServerRuntimeState {
 
     private val _locksAcquired = MutableStateFlow(false)
     val locksAcquired: StateFlow<Boolean> = _locksAcquired.asStateFlow()
+
+    private val _connectedPlayer = MutableStateFlow(ConnectedPlayerSnapshot())
+    val connectedPlayer: StateFlow<ConnectedPlayerSnapshot> = _connectedPlayer.asStateFlow()
 
     // Todos los ítems inicializan en PENDIENTE (false) hasta evaluar APIs reales de Android
     private val _checklistStatus = MutableStateFlow(SurvivalChecklistState())
@@ -307,10 +316,21 @@ object ServerRuntimeState {
     val logs: StateFlow<List<ConsoleLogLine>>
         get() = LogBuffer.logs
 
+    fun setPlayerConnected(connected: Boolean, count: Int, playerName: String) {
+        _connectedPlayer.value = ConnectedPlayerSnapshot(
+            connected = connected && count > 0,
+            count = count.coerceAtLeast(0),
+            playerName = if (connected && count > 0) playerName.ifBlank { "Jugador Bedrock" } else ""
+        )
+    }
+
     fun setRunning(running: Boolean) {
         _isRunning.value = running
         val nextLocks = if (running) _serverStatus.value.locksAcquired else false
         _locksAcquired.value = nextLocks
+        if (!running) {
+            _connectedPlayer.value = ConnectedPlayerSnapshot()
+        }
         _serverStatus.value = ServerStatusSnapshot(
             isRunning = running,
             locksAcquired = nextLocks

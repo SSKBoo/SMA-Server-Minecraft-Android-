@@ -4,14 +4,74 @@ pub mod net;
 pub mod perf;
 pub mod runtime;
 
-use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jint, jstring, JNI_TRUE};
+use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
+use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
+use std::sync::Arc;
 
 fn into_jstring_or_null(env: &JNIEnv, text: String) -> jstring {
     env.new_string(text)
         .map(JString::into_raw)
         .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_registerPlayerCallback(
+    env: JNIEnv,
+    _class: JClass,
+    listener: JObject,
+) {
+    if listener.is_null() {
+        runtime::set_player_event_hook(None);
+        return;
+    }
+    let vm = match env.get_java_vm() {
+        Ok(vm) => vm,
+        Err(err) => {
+            log::warn!("[RustJNI] No se pudo obtener JavaVM para callback de jugadores: {}", err);
+            return;
+        }
+    };
+    let global_listener: GlobalRef = match env.new_global_ref(&listener) {
+        Ok(r) => r,
+        Err(err) => {
+            log::warn!("[RustJNI] No se pudo fijar GlobalRef para listener de jugadores: {}", err);
+            return;
+        }
+    };
+    runtime::set_player_event_hook(Some(Arc::new(move |player_name: &str, connected_count: usize, connected: bool| {
+        if let Ok(mut attach_env) = vm.attach_current_thread() {
+            if let Ok(jname) = attach_env.new_string(player_name) {
+                let jname_obj: JObject = jname.into();
+                let count_arg = connected_count.min(i32::MAX as usize) as jint;
+                let connected_arg: jboolean = if connected { JNI_TRUE } else { JNI_FALSE };
+                let call_res = attach_env.call_method(
+                    global_listener.as_obj(),
+                    "onPlayerLoginStateChanged",
+                    "(Ljava/lang/String;IZ)V",
+                    &[
+                        JValue::Object(&jname_obj),
+                        JValue::Int(count_arg),
+                        JValue::Bool(connected_arg),
+                    ],
+                );
+                if let Err(err) = call_res {
+                    log::warn!("[RustJNI] Fallo invocando onPlayerLoginStateChanged: {}", err);
+                }
+                if attach_env.exception_check().unwrap_or(false) {
+                    let _ = attach_env.exception_clear();
+                }
+            }
+        }
+    })));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_pollConnectedPlayerStatus(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    into_jstring_or_null(&env, runtime::current_connected_player_status_json())
 }
 
 #[no_mangle]

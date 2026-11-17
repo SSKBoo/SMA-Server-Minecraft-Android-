@@ -85,6 +85,7 @@ fun StatusCard(
     val liveNetwork by ServerRuntimeState.networkReport.collectAsState()
     val isScanningHardware by ServerRuntimeState.isScanningHardware.collectAsState()
     val isProbingNetwork by ServerRuntimeState.isProbingNetwork.collectAsState()
+    val connectedPlayer by ServerRuntimeState.connectedPlayer.collectAsState()
 
     val effectiveHardware = liveHardware ?: hardwareReport
     val effectiveNetwork = liveNetwork ?: networkReport
@@ -191,6 +192,34 @@ fun StatusCard(
                         Text("stop", fontSize = 12.sp, maxLines = 1)
                     }
                 }
+            }
+
+            // Indicador/botón en vivo expuesto vía callback Rust -> Kotlin al recibir Login
+            FilledTonalButton(
+                onClick = {
+                    val statusJson = com.bedrockdroid.rs.nativebridge.RustCoreBridge.pollConnectedPlayerStatusSafe()
+                    Toast.makeText(context, statusJson, Toast.LENGTH_SHORT).show()
+                },
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = if (connectedPlayer.connected) Color(0xFFD1FAE5) else Color(0xFFF1F5F9),
+                    contentColor = if (connectedPlayer.connected) Color(0xFF065F46) else Color(0xFF475569)
+                ),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = when {
+                        connectedPlayer.connected ->
+                            "Jugador conectado: ${connectedPlayer.playerName} (${connectedPlayer.count})"
+                        isServerRunning -> "Sin jugadores · Esperando Login"
+                        else -> "Sin jugadores · Servidor detenido"
+                    },
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
 
             // Inputs RAM (MB) y Threads bloqueados mientras isRunning == true

@@ -145,6 +145,23 @@ class ServerForegroundService : Service() {
                         }
                     }
 
+                    RustCoreBridge.registerPlayerCallbackSafe { playerName, count, connected ->
+                        ServerRuntimeState.setPlayerConnected(connected, count, playerName)
+                        if (connected) {
+                            ServerRuntimeState.appendLog(
+                                LogStream.NET,
+                                "[Jugador conectado] $playerName (activos=$count)",
+                                "BedrockLogin"
+                            )
+                        } else {
+                            ServerRuntimeState.appendLog(
+                                LogStream.WARN,
+                                "[Jugador desconectado] activos=$count",
+                                "BedrockLogin"
+                            )
+                        }
+                    }
+
                     Trace.beginSection("nethernet.join")
                     val rustStatus = try {
                         RustCoreBridge.initRuntimeSafe(
@@ -239,6 +256,17 @@ class ServerForegroundService : Service() {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    RustCoreBridge.registerPlayerCallbackSafe { playerName, count, connected ->
+                        ServerRuntimeState.setPlayerConnected(connected, count, playerName)
+                        if (connected) {
+                            ServerRuntimeState.appendLog(
+                                LogStream.NET,
+                                "[Jugador conectado] $playerName (activos=$count)",
+                                "BedrockLogin"
+                            )
                         }
                     }
 
@@ -369,6 +397,7 @@ class ServerForegroundService : Service() {
             RustCoreBridge.shutdownRuntimeSafe()
             rustRuntimeStarted = false
         }
+        ServerRuntimeState.setPlayerConnected(false, 0, "")
         ServerRuntimeState.setLocksAcquired(false)
         ServerRuntimeState.setRunning(false)
         ServerRuntimeState.refreshChecklist(applicationContext)
