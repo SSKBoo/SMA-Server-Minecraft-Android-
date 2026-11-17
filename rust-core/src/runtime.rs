@@ -202,22 +202,24 @@ fn append_crash_to_disk(error: &str) {
     if !is_crash_protection_enabled() {
         return;
     }
-    let path_opt = crash_log_path_slot().lock().ok().and_then(|g| g.clone());
-    if let Some(path) = path_opt {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-            let epoch_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let _ = writeln!(file, "=== [epoch={}] RUST CRASH / PANIC ===", epoch_secs);
-            let _ = writeln!(file, "{}", error.trim_end());
-            let _ = writeln!(file);
-            let _ = file.flush();
-            let _ = file.sync_all();
-        }
+    let path = crash_log_path_slot()
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ANDROID_CRASH_LOG_PATH));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let epoch_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "=== [epoch={}] RUST CRASH / PANIC ===", epoch_secs);
+        let _ = writeln!(file, "{}", error.trim_end());
+        let _ = writeln!(file);
+        let _ = file.flush();
+        let _ = file.sync_all();
     }
 }
 
@@ -243,15 +245,62 @@ pub fn run_catch_unwind<F: FnOnce()>(context_label: &str, f: F) -> bool {
         Err(payload) => {
             let bt = std::backtrace::Backtrace::force_capture();
             let msg = format!(
-                "[Rust Panic] Excepción capturada en {}: {}\n--- Rust Backtrace ---\n{}",
-                context_label,
+                "PANIC DE RUST:\n{} en {}\n\n--- Rust Backtrace ---\n{}",
                 panic_payload_to_string(payload),
+                context_label,
                 bt
             );
             report_rust_crash(&msg);
             false
         }
     }
+}
+
+struct CatchUnwindFuture<F> {
+    label: &'static str,
+    inner: std::pin::Pin<Box<F>>,
+}
+
+impl<F: std::future::Future<Output = ()>> std::future::Future for CatchUnwindFuture<F> {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let label = self.label;
+        let res = if is_crash_protection_enabled() {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.inner.as_mut().poll(cx)
+            }))
+        } else {
+            Ok(self.inner.as_mut().poll(cx))
+        };
+        match res {
+            Ok(poll) => poll,
+            Err(payload) => {
+                let bt = std::backtrace::Backtrace::force_capture();
+                let msg = format!(
+                    "PANIC DE RUST (tokio::spawn):\n{} en {}\n\n--- Rust Backtrace ---\n{}",
+                    panic_payload_to_string(payload),
+                    label,
+                    bt
+                );
+                report_rust_crash(&msg);
+                std::task::Poll::Ready(())
+            }
+        }
+    }
+}
+
+fn spawn_protected<F>(label: &'static str, fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(CatchUnwindFuture {
+        label,
+        inner: Box::pin(fut),
+    })
 }
 
 pub fn set_player_event_hook(hook: Option<PlayerEventHook>) {
@@ -851,15 +900,22 @@ fn find_json_display_name(text: &str) -> Option<String> {
 }
 
 /// Extrae el gamertag del cliente desde el cuerpo del paquete `Login` (JWT en claro o cadena Base64URL).
+/// Copia/escanea de forma segura evitando decodificar tokens gigantes de skins (>16 KB).
 pub fn extract_player_name_from_login(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     if let Some(name) = find_json_display_name(&text) {
         return name;
     }
     for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '+' || c == '/' || c == '.')) {
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() == 3 {
-            if let Some(decoded) = decode_base64_segment(parts[1]) {
+        if token.len() < 16 || token.len() > 16_384 {
+            continue;
+        }
+        let mut parts = token.splitn(4, '.');
+        let _h = parts.next();
+        let payload_seg = parts.next();
+        let sig_seg = parts.next();
+        if payload_seg.is_some() && sig_seg.is_some() && parts.next().is_none() {
+            if let Some(decoded) = decode_base64_segment(payload_seg.unwrap_or_default()) {
                 let payload_str = String::from_utf8_lossy(&decoded);
                 if let Some(name) = find_json_display_name(&payload_str) {
                     return name;
@@ -1450,8 +1506,14 @@ pub fn handle_bedrock_session_data(
                     );
                 }
 
-                let player_name = extract_player_name_from_login(&pkt.body);
-                match read_login(&pkt.body) {
+                let login_bytes: Vec<u8> = pkt.body.to_vec();
+                log::info!(
+                    "[Bedrock Login] Procesando Login (0x01) de {} ({} bytes)",
+                    peer_addr,
+                    login_bytes.len()
+                );
+                let player_name = extract_player_name_from_login(&login_bytes);
+                match read_login(&login_bytes) {
                     Ok((protocol_version, _skin_jwt, client_key)) => {
                         log::info!(
                             "[Bedrock Login] Paquete Login (0x01) validado desde {} (jugador={}, proto={})",
@@ -1789,19 +1851,27 @@ pub fn init_android_logging() {
             );
         }
 
-        std::panic::set_hook(Box::new(|info| {
+        std::panic::set_hook(Box::new(|panic_info| {
+            let payload = panic_info.payload();
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Pánico desconocido".to_string()
+            };
+            let location = panic_info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "ubicacion_desconocida".to_string());
             if !is_crash_protection_enabled() {
-                log::error!("PANIC nativo en bedrock_android_core: {}", info);
+                log::error!("PANIC DE RUST:\n{} en {}", msg, location);
                 return;
             }
-            let location = info
-                .location()
-                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-                .unwrap_or_else(|| "unknown_location".to_string());
             let bt = std::backtrace::Backtrace::force_capture();
             let report = format!(
-                "PANIC nativo en bedrock_android_core ({}): {}\n--- Rust Backtrace ---\n{}",
-                location, info, bt
+                "PANIC DE RUST:\n{} en {}\n\n--- Rust Backtrace ---\n{}",
+                msg, location, bt
             );
             report_rust_crash(&report);
         }));
@@ -1954,7 +2024,9 @@ pub fn start_async_engine(
     let peers: Arc<Mutex<HashMap<u64, PeerSession>>> = Arc::new(Mutex::new(HashMap::new()));
     let udp_shared = Arc::new(udp_socket);
 
-    rt.spawn(async move {
+    rt.spawn(CatchUnwindFuture {
+        label: "nethernet_main_loop",
+        inner: Box::pin(async move {
         log::info!(
             "bind_v4 = {} | bind_v6 = {} | ipv6_v6only = {}",
             bind_report_for_log.bind_v4,
@@ -1975,7 +2047,7 @@ pub fn start_async_engine(
 
         // Watchdog de memoria nativa (OOM Guard)
         let mem_guard_cancel = task_cancel.child_token();
-        tokio::spawn(async move {
+        spawn_protected("memory_guard_watchdog", async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(15));
             loop {
                 tokio::select! {
@@ -2026,7 +2098,7 @@ pub fn start_async_engine(
             let lan_udp = Arc::clone(&udp_shared);
             let lan_key = host_key.clone();
             let lan_server_name = server_name_owned.clone();
-            tokio::spawn(async move {
+            spawn_protected("lan_discovery_udp_7551", async move {
                 log::info!(
                     "[NetherNet LAN] Discovery y señalización LAN activos en UDP {}",
                     lan_bind
@@ -2164,7 +2236,7 @@ pub fn start_async_engine(
                 let v6_peers = Arc::clone(&peers);
                 let v6_key = host_key.clone();
                 let v6_motd = motd_string.clone();
-                tokio::spawn(async move {
+                spawn_protected("ipv6_dual_stack_listener", async move {
                 log::info!(
                     "[NetherNet IPv6] Listener Dual-Stack activo en [::]:{} (TCP /v1/join + UDP WebRTC, ipv6_v6only={})",
                     effective_port,
@@ -2184,7 +2256,7 @@ pub fn start_async_engine(
                                 let udp_clone = Arc::clone(&udp_v6);
                                 let key_clone = v6_key.clone();
                                 let motd_clone = v6_motd.clone();
-                                tokio::spawn(async move {
+                                spawn_protected("http_signaling_v6", async move {
                                     handle_http_signaling_stream(
                                         stream,
                                         peer_addr,
@@ -2318,7 +2390,7 @@ pub fn start_async_engine(
                             let udp_clone = Arc::clone(&udp_shared);
                             let key_clone = host_key.clone();
                             let motd_clone = motd_string.clone();
-                            tokio::spawn(async move {
+                            spawn_protected("http_signaling_v4", async move {
                                 handle_http_signaling_stream(
                                     stream,
                                     peer_addr,
@@ -2507,7 +2579,7 @@ pub fn start_async_engine(
                 }
             }
         }
-    });
+    }));
 
     *guard = Some(ServerHandle { rt, cancel, arena });
     Ok(format!("engine=running nethernet={}", bind_report_summary))
@@ -2929,10 +3001,12 @@ mod tests {
         {
             let g = captured.lock().expect("lock captured");
             assert_eq!(g.len(), 1);
-            assert!(g[0].contains("[Rust Panic] Excepción capturada en test_packet_join: simulated packet panic during join"));
+            assert!(g[0].contains("PANIC DE RUST:"));
+            assert!(g[0].contains("simulated packet panic during join en test_packet_join"));
         }
 
         let disk = std::fs::read_to_string(&tmp_path).expect("crash file must exist");
+        assert!(disk.contains("PANIC DE RUST:"));
         assert!(disk.contains("simulated packet panic during join"));
         assert!(disk.contains("CRASH NATIVO: SIGABRT (sig=6)"));
 

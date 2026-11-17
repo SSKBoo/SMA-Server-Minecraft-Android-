@@ -69,7 +69,8 @@ aes = { opt-level = 3 }
 ctr = { opt-level = 3 }
 
 [profile.release]
+panic = "unwind"
+debug = 1
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
