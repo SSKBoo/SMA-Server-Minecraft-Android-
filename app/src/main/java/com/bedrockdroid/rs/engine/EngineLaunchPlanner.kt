@@ -328,17 +328,17 @@ object EngineLaunchPlanner {
                 ServerRuntimeState.appendLog(LogStream.STDOUT, probe.guidance)
             }
             lower == "./launch bedrock" || lower == "./launch java" || lower == "./launch hybrid" || lower.startsWith("java ") -> {
+                if (ServerRuntimeState.isRunning.value) {
+                    ServerRuntimeState.appendLog(
+                        LogStream.WARN,
+                        "Server is already running. Stop it first. (Ejecuta 'stop' antes de relanzar o cambiar de perfil)."
+                    )
+                    return
+                }
                 val targetLane = when {
                     lower.contains("bedrock") -> EngineLane.BEDROCK
                     lower.contains("java") -> EngineLane.JAVA
                     else -> EngineLane.HYBRID
-                }
-                if (ServerRuntimeState.isRunning.value && targetLane != cfg.activeLane) {
-                    ServerRuntimeState.appendLog(
-                        LogStream.WARN,
-                        "Detén el servidor antes de cambiar de perfil (ejecuta 'stop' primero)."
-                    )
-                    return
                 }
                 val updated = cfg.copy(activeLane = targetLane)
                 LauncherPrefs.save(context, updated)

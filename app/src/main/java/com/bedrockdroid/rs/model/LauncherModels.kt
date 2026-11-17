@@ -130,6 +130,7 @@ data class AndroidLauncherConfig(
     val jvmXmsMb: Int,
     val jvmXmxMb: Int,
     val rustMaxRamMb: Int,
+    val rustBlockingThreads: Int,
     val eulaAccepted: Boolean,
     val localFastPath: Boolean,
     val tcpNoDelay: Boolean,
@@ -166,6 +167,7 @@ object LauncherPrefs {
         jvmXmsMb = 1024,
         jvmXmxMb = 3072,
         rustMaxRamMb = 12288,
+        rustBlockingThreads = 12,
         eulaAccepted = true,
         localFastPath = true,
         tcpNoDelay = true,
@@ -210,6 +212,7 @@ object LauncherPrefs {
             jvmXmsMb = prefs.getInt("jvmXmsMb", def.jvmXmsMb),
             jvmXmxMb = prefs.getInt("jvmXmxMb", def.jvmXmxMb),
             rustMaxRamMb = prefs.getInt("rustMaxRamMb", def.rustMaxRamMb),
+            rustBlockingThreads = prefs.getInt("rustBlockingThreads", def.rustBlockingThreads),
             eulaAccepted = prefs.getBoolean("eulaAccepted", def.eulaAccepted),
             localFastPath = prefs.getBoolean("localFastPath", def.localFastPath),
             tcpNoDelay = prefs.getBoolean("tcpNoDelay", def.tcpNoDelay),
@@ -245,6 +248,7 @@ object LauncherPrefs {
             .putInt("jvmXmsMb", cfg.jvmXmsMb)
             .putInt("jvmXmxMb", cfg.jvmXmxMb)
             .putInt("rustMaxRamMb", cfg.rustMaxRamMb)
+            .putInt("rustBlockingThreads", cfg.rustBlockingThreads)
             .putBoolean("eulaAccepted", cfg.eulaAccepted)
             .putBoolean("localFastPath", cfg.localFastPath)
             .putBoolean("tcpNoDelay", cfg.tcpNoDelay)

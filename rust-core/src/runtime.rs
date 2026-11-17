@@ -14,8 +14,10 @@ use acacia_session::proto::{
 };
 use acacia_session::server::{read_login, ServerConnection};
 use bytes::{Bytes, BytesMut};
+use flate2::read::{DeflateDecoder, ZlibDecoder};
 use p384::ecdsa::SigningKey;
 use rand_core::OsRng;
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
@@ -58,9 +60,63 @@ struct PeerSession {
     has_sent_network_settings: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineState {
+    Stopped,
+    Running,
+}
+
+/// Arena nativa de tamaño fijo asignada con `std::alloc` al arrancar el servidor.
+/// No implementa `realloc`: el tamaño queda bloqueado hasta detener y reiniciar el runtime.
+struct FixedNativeArena {
+    ptr: *mut u8,
+    layout: Layout,
+    budget_bytes: u64,
+    blocking_threads: usize,
+}
+
+unsafe impl Send for FixedNativeArena {}
+unsafe impl Sync for FixedNativeArena {}
+
+impl FixedNativeArena {
+    fn allocate_fixed(max_ram_mb: u32, blocking_threads: usize) -> Result<Self, String> {
+        let budget_mb = max_ram_mb.max(512);
+        let budget_bytes = (budget_mb as u64).saturating_mul(1024 * 1024);
+        let slab_bytes = ((budget_mb as usize).clamp(512, 16384) / 512) * 64 * 1024;
+        let layout = Layout::from_size_align(slab_bytes, 4096)
+            .map_err(|e| format!("invalid std::alloc layout: {}", e))?;
+        // Safety: `slab_bytes` >= 64 KiB y alineado a página de 4096 bytes.
+        let ptr = unsafe { alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Err(format!("std::alloc failed for {} bytes", slab_bytes));
+        }
+        Ok(Self {
+            ptr,
+            layout,
+            budget_bytes,
+            blocking_threads,
+        })
+    }
+
+    fn summary(&self) -> (usize, u64, usize) {
+        (self.layout.size(), self.budget_bytes, self.blocking_threads)
+    }
+}
+
+impl Drop for FixedNativeArena {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // Safety: `self.ptr` fue asignado con el mismo `self.layout` en `allocate_fixed`.
+            unsafe { dealloc(self.ptr, self.layout) };
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
 struct ServerHandle {
     rt: Runtime,
     cancel: CancellationToken,
+    arena: FixedNativeArena,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +186,138 @@ fn encode_varuint32(mut value: u32, out: &mut Vec<u8>) {
         if value == 0 {
             break;
         }
+    }
+}
+
+/// Divide el contenido descomprimido o raw de un Batch Bedrock (`[varint len][subpkt]...`) en subpaquetes.
+pub fn split_batch_subpackets(data: &[u8]) -> Result<Vec<Bytes>, String> {
+    if data.is_empty() {
+        return Err("malformed batch framing: empty batch payload".to_string());
+    }
+    let mut subpackets = Vec::new();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let slice = &data[offset..];
+        let (pkt_len, len_bytes) = decode_varuint32(slice).ok_or_else(|| {
+            format!("malformed batch framing: invalid subpacket varint at offset {}", offset)
+        })?;
+        let pkt_len = pkt_len as usize;
+        let start = offset.saturating_add(len_bytes);
+        let end = start.saturating_add(pkt_len);
+        if pkt_len == 0 || end > data.len() {
+            return Err(format!(
+                "malformed batch framing: subpacket_len={} exceeds remaining={}",
+                pkt_len,
+                data.len().saturating_sub(start)
+            ));
+        }
+        subpackets.push(Bytes::copy_from_slice(&data[start..end]));
+        offset = end;
+    }
+    Ok(subpackets)
+}
+
+fn decompress_zlib_payload(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut decoder = ZlibDecoder::new(input);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| format!("zlib decode error: {}", e))?;
+    Ok(out)
+}
+
+fn decompress_deflate_payload(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut decoder = DeflateDecoder::new(input);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| format!("deflate decode error: {}", e))?;
+    Ok(out)
+}
+
+/// Decodifica un Batch Bedrock evaluando el header de compresión de 1 byte:
+/// - `0x00` = raw (sin comprimir) o algoritmo Zlib en framing 1.20.60+ si continúa con `0x78`
+/// - `0x78` = Zlib/Deflate vía `flate2::read::ZlibDecoder`
+/// - `0xFF` = sin compresión explícita
+pub fn decode_bedrock_batch_with_header(payload: &[u8]) -> Result<Vec<Bytes>, String> {
+    if payload.is_empty() {
+        return Err("malformed batch framing: empty payload".to_string());
+    }
+    let body = if payload.first().copied() == Some(0xfe) && payload.len() > 1 {
+        &payload[1..]
+    } else {
+        payload
+    };
+
+    match body[0] {
+        0x78 => {
+            if let Ok(decompressed) = decompress_zlib_payload(body) {
+                if let Ok(pkts) = split_batch_subpackets(&decompressed) {
+                    return Ok(pkts);
+                }
+            }
+            if body.len() > 1 {
+                if let Ok(decompressed) = decompress_zlib_payload(&body[1..]) {
+                    if let Ok(pkts) = split_batch_subpackets(&decompressed) {
+                        return Ok(pkts);
+                    }
+                }
+                if let Ok(decompressed) = decompress_deflate_payload(&body[1..]) {
+                    if let Ok(pkts) = split_batch_subpackets(&decompressed) {
+                        return Ok(pkts);
+                    }
+                }
+            }
+            Err(format!(
+                "malformed batch framing: failed to decode 0x78 zlib batch ({} bytes)",
+                body.len()
+            ))
+        }
+        0x00 => {
+            let rest = &body[1..];
+            if let Ok(pkts) = split_batch_subpackets(rest) {
+                return Ok(pkts);
+            }
+            if rest.first().copied() == Some(0x78) {
+                if let Ok(decompressed) = decompress_zlib_payload(rest) {
+                    if let Ok(pkts) = split_batch_subpackets(&decompressed) {
+                        return Ok(pkts);
+                    }
+                }
+            }
+            if let Ok(decompressed) = decompress_deflate_payload(rest) {
+                if let Ok(pkts) = split_batch_subpackets(&decompressed) {
+                    return Ok(pkts);
+                }
+            }
+            Err(format!(
+                "malformed batch framing: failed to decode 0x00 batch ({} bytes)",
+                body.len()
+            ))
+        }
+        0xff => split_batch_subpackets(&body[1..]),
+        _ => split_batch_subpackets(body),
+    }
+}
+
+/// Decodifica batches usando `acacia_session` y recurre al decoder explícito de cabecera `0x00` / `0x78`
+/// cuando el cliente envía framing Zlib/raw directo que produce `malformed batch framing`.
+pub fn decode_bedrock_batch_frames(
+    session: &mut ServerConnection,
+    payload: &[u8],
+) -> Result<Vec<Bytes>, String> {
+    let normalized = if payload.first().copied() == Some(0xfe) && payload.len() > 1 {
+        &payload[1..]
+    } else {
+        payload
+    };
+
+    match session.decode(normalized) {
+        Ok(pkts) => Ok(pkts),
+        Err(session_err) => match decode_bedrock_batch_with_header(payload) {
+            Ok(pkts) => Ok(pkts),
+            Err(header_err) => Err(format!("{} | {}", session_err, header_err)),
+        },
     }
 }
 
@@ -341,14 +529,8 @@ pub fn handle_bedrock_session_data(
     payload: &[u8],
     now: Instant,
 ) {
-    // 1. Decodificar el batch de Bedrock con acacia-session (soporta paquetes sin cabecera 0xFE o con 0xFE)
-    let normalized = if payload.first().copied() == Some(0xfe) && payload.len() > 1 {
-        &payload[1..]
-    } else {
-        payload
-    };
-
-    let packets = match session.decode(normalized) {
+    // 1. Decodificar el batch de Bedrock con soporte para framing acacia-session y header 0x00 (raw) / 0x78 (ZlibDecoder)
+    let packets = match decode_bedrock_batch_frames(session, payload) {
         Ok(pkts) => pkts,
         Err(err) => {
             log::warn!(
@@ -693,12 +875,43 @@ pub fn init_android_logging() {
     });
 }
 
+pub fn current_engine_state() -> EngineState {
+    if is_engine_running() {
+        EngineState::Running
+    } else {
+        EngineState::Stopped
+    }
+}
+
+pub fn start_runtime(max_ram_mb: u32, blocking_threads: usize) -> Result<String, String> {
+    if current_engine_state() == EngineState::Running {
+        return Err("Server is already running. Stop it first.".to_string());
+    }
+    let net_cfg = LowLatencyConfig {
+        local_fast_path: true,
+        tcp_no_delay: true,
+        ip_tos_low_delay: true,
+        local_jitter_ms: 0,
+        wan_mtu_bytes: 1400,
+    };
+    start_async_engine(
+        "/data/local/tmp",
+        "BedrockDroid RS",
+        "BEDROCK",
+        19132,
+        max_ram_mb,
+        blocking_threads,
+        net_cfg,
+    )
+}
+
 pub fn start_async_engine(
     data_dir: &str,
     server_name: &str,
     lane_name: &str,
     bedrock_port: u16,
     max_ram_mb: u32,
+    blocking_threads: usize,
     net_cfg: LowLatencyConfig,
 ) -> Result<String, String> {
     init_android_logging();
@@ -707,15 +920,30 @@ pub fn start_async_engine(
         .lock()
         .map_err(|_| "runtime mutex poisoned".to_string())?;
 
-    if guard.is_some() {
-        return Ok("engine=already_running".to_string());
+    let engine_state = if guard.is_some() {
+        EngineState::Running
+    } else {
+        EngineState::Stopped
+    };
+    if engine_state == EngineState::Running {
+        return Err("Server is already running. Stop it first.".to_string());
     }
 
     let budget_mb = max_ram_mb.max(512);
-    let budget_bytes = (budget_mb as u64).saturating_mul(1024 * 1024);
+    let max_blocking = if blocking_threads == 0 {
+        ((budget_mb / 1024).clamp(4, 32)) as usize
+    } else {
+        blocking_threads.clamp(1, 64)
+    };
+    let arena = FixedNativeArena::allocate_fixed(budget_mb, max_blocking)?;
+    let (arena_slab_bytes, budget_bytes, locked_threads) = arena.summary();
     MAX_RUST_RAM_BYTES.store(budget_bytes, Ordering::Relaxed);
-
-    let max_blocking = ((budget_mb / 1024).clamp(4, 32)) as usize;
+    log::info!(
+        "[MemoryArena] Slab fijo std::alloc={} bytes (budget={} MB, blocking_threads={}) bloqueado hasta detener servidor",
+        arena_slab_bytes,
+        budget_mb,
+        locked_threads
+    );
 
     let rt = Builder::new_multi_thread()
         .worker_threads(4)
@@ -1236,7 +1464,7 @@ pub fn start_async_engine(
         }
     });
 
-    *guard = Some(ServerHandle { rt, cancel });
+    *guard = Some(ServerHandle { rt, cancel, arena });
     Ok(format!("engine=running nethernet={}", bind_report_summary))
 }
 
@@ -1425,6 +1653,55 @@ mod tests {
     }
 
     #[test]
+    fn decodes_bedrock_batch_header_0x00_raw_and_0x78_zlib_26038_bytes() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+
+        // 1. Header 0x00 = raw sin comprimir
+        let raw_subpkt = [0xc1u8, 0x01, 0x00, 0x00, 0x08, 0xb1];
+        let mut raw_batch = vec![0x00u8];
+        encode_varuint32(raw_subpkt.len() as u32, &mut raw_batch);
+        raw_batch.extend_from_slice(&raw_subpkt);
+        let decoded_raw = decode_bedrock_batch_with_header(&raw_batch)
+            .expect("0x00 raw batch should decode");
+        assert_eq!(decoded_raw.len(), 1);
+        assert_eq!(decoded_raw[0].as_ref(), &raw_subpkt);
+
+        // 2. Payload realista Login de 26038 bytes comprimido con Zlib (header 0x78)
+        let mut login_subpkt = Vec::with_capacity(26038);
+        encode_varuint32(0x01, &mut login_subpkt); // Login packet ID
+        while login_subpkt.len() < 26038 {
+            login_subpkt.push(((login_subpkt.len() * 31) & 0xff) as u8);
+        }
+        assert_eq!(login_subpkt.len(), 26038);
+
+        let mut uncompressed_frame = Vec::with_capacity(26045);
+        encode_varuint32(login_subpkt.len() as u32, &mut uncompressed_frame);
+        uncompressed_frame.extend_from_slice(&login_subpkt);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&uncompressed_frame).expect("zlib write");
+        let zlib_payload = encoder.finish().expect("zlib finish");
+        assert_eq!(zlib_payload[0], 0x78);
+
+        let decoded_zlib = decode_bedrock_batch_with_header(&zlib_payload)
+            .expect("0x78 zlib 26038-byte payload should decode");
+        assert_eq!(decoded_zlib.len(), 1);
+        assert_eq!(decoded_zlib[0].len(), 26038);
+        assert_eq!(decoded_zlib[0].as_ref(), login_subpkt.as_slice());
+
+        // También probar con cabecera explícita 0x78 precediendo al stream y wrapper 0xFE
+        let mut prefixed = vec![0xfeu8, 0x78];
+        prefixed.extend_from_slice(&zlib_payload);
+        let key = SigningKey::random(&mut OsRng);
+        let mut session = ServerConnection::nethernet(key);
+        let decoded_session = decode_bedrock_batch_frames(&mut session, &prefixed)
+            .expect("decode_bedrock_batch_frames should handle 0xFE + 0x78 zlib");
+        assert_eq!(decoded_session.len(), 1);
+        assert_eq!(decoded_session[0].len(), 26038);
+    }
+
+    #[test]
     fn ipv6_dual_stack_socket_reports_real_fd_only_v6_and_responds_to_loopback_ping() {
         let rt = Builder::new_current_thread().enable_all().build().expect("rt");
         let bound = rt.block_on(async { bind_optional_ipv6_sockets(0) });
@@ -1444,10 +1721,20 @@ mod tests {
             local_jitter_ms: 0,
             wan_mtu_bytes: 1400,
         };
-        let status = start_async_engine("/tmp/bedrock_test", "BedrockDroid RS", "BEDROCK", 0, 8192, cfg)
+        let status = start_async_engine("/tmp/bedrock_test", "BedrockDroid RS", "BEDROCK", 0, 8192, 8, cfg)
             .expect("start failed");
         assert!(status.starts_with("engine=running nethernet="));
         assert!(is_engine_running());
+        assert_eq!(current_engine_state(), EngineState::Running);
+
+        // P2: Bloqueo en Rust mientras el servidor está RUNNING (sin redimensionar en caliente)
+        let second_err = start_async_engine("/tmp/bedrock_test", "BedrockDroid RS", "BEDROCK", 0, 4096, 4, cfg)
+            .expect_err("re-starting while running must fail");
+        assert_eq!(second_err, "Server is already running. Stop it first.");
+        assert_eq!(
+            start_runtime(4096, 4).expect_err("start_runtime while running must fail"),
+            "Server is already running. Stop it first."
+        );
 
         let report = current_bind_report().expect("bind report should exist while running");
         assert!(report.bind_v4.starts_with("0.0.0.0:"));
@@ -1480,5 +1767,6 @@ mod tests {
 
         stop_async_engine();
         assert!(!is_engine_running());
+        assert_eq!(current_engine_state(), EngineState::Stopped);
     }
 }

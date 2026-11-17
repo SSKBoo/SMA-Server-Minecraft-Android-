@@ -99,10 +99,16 @@ class MainActivity : ComponentActivity() {
                 }
 
                 val updateConfig: (com.bedrockdroid.rs.model.AndroidLauncherConfig) -> Unit = { next ->
-                    if (isRunning && next.activeLane != config.activeLane) {
+                    val locksRuntimeConfig = next.activeLane != config.activeLane ||
+                        next.rustMaxRamMb != config.rustMaxRamMb ||
+                        next.rustBlockingThreads != config.rustBlockingThreads ||
+                        next.jvmXmxMb != config.jvmXmxMb ||
+                        next.jvmXmsMb != config.jvmXmsMb ||
+                        next.bedrockPort != config.bedrockPort
+                    if (isRunning && locksRuntimeConfig) {
                         android.widget.Toast.makeText(
                             this@MainActivity,
-                            "Detén el servidor antes de cambiar de perfil",
+                            "Detén el servidor antes de cambiar de perfil, RAM o Threads",
                             android.widget.Toast.LENGTH_SHORT
                         ).show()
                     } else {
@@ -168,6 +174,7 @@ class MainActivity : ComponentActivity() {
                             hardwareReport = hardwareReport,
                             networkReport = networkReport,
                             onSelectLane = { lane -> updateConfig(config.copy(activeLane = lane)) },
+                            onUpdateConfig = updateConfig,
                             onStartOrStop = {
                                 if (isRunning) {
                                     stopService(Intent(this@MainActivity, ServerForegroundService::class.java))
@@ -251,6 +258,7 @@ class MainActivity : ComponentActivity() {
 
                         AppTab.SETTINGS -> SettingsScreen(
                             config = config,
+                            isRunning = isRunning,
                             onUpdateConfig = updateConfig,
                             modifier = contentModifier
                         )

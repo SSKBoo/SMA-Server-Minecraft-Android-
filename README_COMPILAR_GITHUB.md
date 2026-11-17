@@ -15,8 +15,8 @@
 4. Al finalizar, descarga el artefacto **bedrockdroid-rs-apk** con los binarios nativos `libbedrock_android_core.so` ya incluidos.
 
 ## Correcciones integradas contra fallos comunes
-- **Rust NDK puro**: Sin `openssl-sys` ni `zlib-ng-sys`; usa `rustls` + `miniz_oxide`.
-- **Builds reproducibles (`--locked`) automáticos dentro del `.zip`**: El proyecto incluye `rust-core/ensure-cargo-lock.sh`, la regla `!rust-core/Cargo.lock` en `.gitignore`, ejecución automática en CI antes de `Swatinem/rust-cache@v2` (usando `--locked` estricto en `cargo test` y `cargo ndk`) y publicación del artefacto `bedrockdroid-rs-cargo-lock`. No requiere pasos manuales en futuras pruebas.
+- **Rust NDK puro sin warnings**: Sin `openssl-sys`, `zlib-ng-sys`, `rustls` ni `webpki-roots`; usa `flate2` (`rust_backend` / `miniz_oxide`).
+- **Builds reproducibles (`--locked`)**: `.gitignore` mantiene `!rust-core/Cargo.lock` visible y el workflow de CI usa `--locked` automáticamente cuando `rust-core/Cargo.lock` está presente en el repositorio. Recuerda tener `rust-core/Cargo.lock` commiteado en tu repo (`git add rust-core/Cargo.lock`).
 - **Página de memoria 16 KB (Android 15+)**: `-Wl,-z,max-page-size=16384` en `.cargo/config.toml`.
 - **JNI + R8/ProGuard**: Reglas `-keep` explícitas para `RustCoreBridge`.
 - **Android 14/15 24/7**: `foregroundServiceType="dataSync"` + `PARTIAL_WAKE_LOCK` + `WIFI_MODE_FULL_LOW_LATENCY` + `MulticastLock`.

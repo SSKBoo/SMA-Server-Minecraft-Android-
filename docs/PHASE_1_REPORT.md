@@ -10,10 +10,9 @@
   - Criptografía pura Rust (`p384`, `rsa`, `aes`, `ctr`, `chacha20`, `sha2`, `ring`) sin dependencia de `openssl-sys` ni `zlib-ng` en C.
 - **Compatibilidad 16 KB (Android 15+)**: `rust-core/.cargo/config.toml` aplica `-Wl,-z,max-page-size=16384`.
 
-## 2. Warnings conocidos (no bloqueantes)
-1. **`rustls` sin invocación directa en Fase 1**:
-   - *Motivo*: `rustls` + `webpki-roots` están declarados en `Cargo.toml` para el cliente HTTP/TLS de autenticación Xbox Live (Fase 3 / `auth-xbl` con `ureq`). Mientras no se compile la Fase 3, Rust puede emitir aviso de dependencia declarada sin uso directo en `lib.rs`.
-   - *Por qué no bloquea*: No afecta al enlazado de `libbedrock_android_core.so` ni añade símbolos C nativos.
+## 2. Notas de compilación NDK resueltas
+1. **Limpieza de `Cargo.toml` (P3)**:
+   - Eliminadas `rustls` y `webpki-roots` al no invocarse directamente; se mantiene únicamente `flate2` con `rust_backend` (`miniz_oxide`) usado por el decoder Zlib de batches Bedrock, eliminando warnings de dependencias sin uso.
 2. **Mismatch histórico de variables NDK en runner CI**:
    - *Motivo*: Las imágenes `ubuntu-latest` predefinen `ANDROID_NDK_HOME`/`ANDROID_NDK_LATEST_HOME` con versiones previas mientras `setup-android` instala `27.2.12479018`.
    - *Solución aplicada en Fase 1.5*: `android-rust-ci.yml` exporta `ANDROID_NDK_HOME`, `ANDROID_NDK`, `ANDROID_NDK_ROOT` y `NDK_HOME` apuntando todos a `${ANDROID_HOME}/ndk/27.2.12479018`.

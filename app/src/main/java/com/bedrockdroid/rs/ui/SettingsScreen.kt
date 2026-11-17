@@ -30,6 +30,7 @@ import com.bedrockdroid.rs.model.ServerRuntimeState
 @Composable
 fun SettingsScreen(
     config: AndroidLauncherConfig,
+    isRunning: Boolean = false,
     onUpdateConfig: (AndroidLauncherConfig) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -93,6 +94,7 @@ fun SettingsScreen(
                 }
                 OutlinedTextField(
                     value = portInput,
+                    enabled = !isRunning,
                     onValueChange = { raw ->
                         val digits = raw.filter { it.isDigit() }.take(5)
                         portInput = digits
@@ -103,7 +105,13 @@ fun SettingsScreen(
                     },
                     label = { Text("Puerto UDP Bedrock (19132 / 19133 / 25566)") },
                     supportingText = {
-                        Text("Si tu ROM bloquea el 19132, prueba 19133 o 25566 y reinicia el servidor.")
+                        Text(
+                            if (isRunning) {
+                                "Servidor activo: detén el servidor para modificar puerto, RAM o Threads."
+                            } else {
+                                "Si tu ROM bloquea el 19132, prueba 19133 o 25566 y reinicia el servidor."
+                            }
+                        )
                     },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     singleLine = true,
@@ -116,6 +124,7 @@ fun SettingsScreen(
                     listOf(19132, 19133, 25566).forEach { presetPort ->
                         FilterChip(
                             selected = config.bedrockPort == presetPort,
+                            enabled = !isRunning,
                             onClick = {
                                 portInput = presetPort.toString()
                                 onUpdateConfig(config.copy(bedrockPort = presetPort))
@@ -175,6 +184,7 @@ fun SettingsScreen(
                 )
                 Slider(
                     value = effectiveJvmXmx.toFloat(),
+                    enabled = !isRunning,
                     onValueChange = {
                         val nextXmx = ((it.toInt() / 64) * 64).coerceIn(jvmSliderMinMb, jvmSliderMaxMb)
                         val nextXms = config.jvmXmsMb.coerceAtMost(nextXmx)
@@ -192,11 +202,26 @@ fun SettingsScreen(
                 )
                 Slider(
                     value = effectiveRustRamMb.toFloat(),
+                    enabled = !isRunning,
                     onValueChange = {
                         val nextRustMb = ((it.toInt() / 512) * 512).coerceIn(1024, rustSliderMaxMb)
                         onUpdateConfig(config.copy(rustMaxRamMb = nextRustMb))
                     },
                     valueRange = 1024f..rustSliderMaxMb.toFloat()
+                )
+
+                Text(
+                    "Blocking Threads Rust (Tokio) — ${config.rustBlockingThreads} hilos (bloqueado en ejecución)",
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp
+                )
+                Slider(
+                    value = config.rustBlockingThreads.coerceIn(2, 32).toFloat(),
+                    enabled = !isRunning,
+                    onValueChange = {
+                        onUpdateConfig(config.copy(rustBlockingThreads = it.toInt().coerceIn(2, 32)))
+                    },
+                    valueRange = 2f..32f
                 )
 
                 SettingSwitch("Aceptar EULA automáticamente", config.eulaAccepted) {

@@ -23,6 +23,7 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
     lane_name: JString,
     bedrock_port: jint,
     max_ram_mb: jint,
+    blocking_threads: jint,
     local_fast_path: jboolean,
     tcp_no_delay: jboolean,
     ip_tos_low_delay: jboolean,
@@ -64,6 +65,12 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
         max_ram_mb as u32
     };
 
+    let threads = if blocking_threads <= 0 {
+        ((rust_ram_mb / 1024).clamp(4, 32)) as usize
+    } else {
+        (blocking_threads as usize).clamp(1, 64)
+    };
+
     let net_cfg = net::low_latency::LowLatencyConfig {
         local_fast_path: local_fast_path == JNI_TRUE,
         tcp_no_delay: tcp_no_delay == JNI_TRUE,
@@ -78,25 +85,24 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_init
         thermal_guard_c,
     );
 
-    let engine_state = match runtime::start_async_engine(&dir, &motd_name, &lane, udp_port, rust_ram_mb, net_cfg) {
-        Ok(summary) => summary,
-        Err(err) => format!("engine_err={}", err),
+    let msg = match runtime::start_async_engine(&dir, &motd_name, &lane, udp_port, rust_ram_mb, threads, net_cfg) {
+        Ok(summary) => format!(
+            "OK bedrock={} motd={} proto={} {} max_ram={}MB blocking_threads={} dir={} fast_path={} nodelay={} jitter={}ms mtu={} {}",
+            runtime::TARGET_BEDROCK_VERSION,
+            runtime::MOTD_ADVERTISED_VERSION,
+            runtime::TARGET_BEDROCK_PROTOCOL,
+            summary,
+            rust_ram_mb,
+            threads,
+            dir,
+            net_cfg.local_fast_path,
+            net_cfg.tcp_no_delay,
+            net_cfg.local_jitter_ms,
+            net_cfg.wan_mtu_bytes,
+            aff
+        ),
+        Err(err) => format!("ERR engine_err={}", err),
     };
-
-    let msg = format!(
-        "OK bedrock={} motd={} proto={} {} max_ram={}MB dir={} fast_path={} nodelay={} jitter={}ms mtu={} {}",
-        runtime::TARGET_BEDROCK_VERSION,
-        runtime::MOTD_ADVERTISED_VERSION,
-        runtime::TARGET_BEDROCK_PROTOCOL,
-        engine_state,
-        rust_ram_mb,
-        dir,
-        net_cfg.local_fast_path,
-        net_cfg.tcp_no_delay,
-        net_cfg.local_jitter_ms,
-        net_cfg.wan_mtu_bytes,
-        aff
-    );
     into_jstring_or_null(&env, msg)
 }
 

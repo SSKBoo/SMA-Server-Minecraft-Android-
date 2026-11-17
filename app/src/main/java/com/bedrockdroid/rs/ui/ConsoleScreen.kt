@@ -46,6 +46,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -75,6 +76,7 @@ fun StatusCard(
     hardwareReport: HardwareScanReport?,
     networkReport: NetworkProbeReport?,
     onSelectLane: (EngineLane) -> Unit,
+    onUpdateConfig: (AndroidLauncherConfig) -> Unit = {},
     onStartOrStop: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -144,22 +146,110 @@ fun StatusCard(
                     )
                 }
 
-                Button(
-                    onClick = onStartOrStop,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isServerRunning) Color(0xFFDC2626) else Color(0xFF047857)
-                    ),
-                    shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                ) {
-                    Icon(
-                        imageVector = if (isServerRunning) Icons.Default.Close else Icons.Default.PlayArrow,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text(if (isServerRunning) "Detener" else "Iniciar", fontSize = 12.sp, maxLines = 1)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Button(
+                        onClick = {
+                            if (!isServerRunning) {
+                                onStartOrStop()
+                            }
+                        },
+                        enabled = !isServerRunning,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF047857)
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PlayArrow,
+                            contentDescription = "Iniciar servidor",
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("launch", fontSize = 12.sp, maxLines = 1)
+                    }
+
+                    Button(
+                        onClick = {
+                            if (isServerRunning) {
+                                onStartOrStop()
+                            }
+                        },
+                        enabled = isServerRunning,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFFDC2626)
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Detener servidor",
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("stop", fontSize = 12.sp, maxLines = 1)
+                    }
                 }
+            }
+
+            // Inputs RAM (MB) y Threads bloqueados mientras isRunning == true
+            var ramDraft by remember(config.rustMaxRamMb) { mutableStateOf(config.rustMaxRamMb.toString()) }
+            var threadsDraft by remember(config.rustBlockingThreads) { mutableStateOf(config.rustBlockingThreads.toString()) }
+            LaunchedEffect(config.rustMaxRamMb) {
+                if (ramDraft != config.rustMaxRamMb.toString()) {
+                    ramDraft = config.rustMaxRamMb.toString()
+                }
+            }
+            LaunchedEffect(config.rustBlockingThreads) {
+                if (threadsDraft != config.rustBlockingThreads.toString()) {
+                    threadsDraft = config.rustBlockingThreads.toString()
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = ramDraft,
+                    onValueChange = { raw ->
+                        if (!isServerRunning) {
+                            val digits = raw.filter { it.isDigit() }.take(5)
+                            ramDraft = digits
+                            digits.toIntOrNull()?.let { parsed ->
+                                if (parsed in 512..32768) {
+                                    onUpdateConfig(config.copy(rustMaxRamMb = parsed))
+                                }
+                            }
+                        }
+                    },
+                    enabled = !isServerRunning,
+                    label = { Text("RAM (MB)", fontSize = 10.sp) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp),
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = threadsDraft,
+                    onValueChange = { raw ->
+                        if (!isServerRunning) {
+                            val digits = raw.filter { it.isDigit() }.take(2)
+                            threadsDraft = digits
+                            digits.toIntOrNull()?.let { parsed ->
+                                if (parsed in 1..64) {
+                                    onUpdateConfig(config.copy(rustBlockingThreads = parsed))
+                                }
+                            }
+                        }
+                    },
+                    enabled = !isServerRunning,
+                    label = { Text("Threads", fontSize = 10.sp) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp),
+                    modifier = Modifier.weight(1f)
+                )
             }
 
             // Chips bloqueados si isServerRunning == true + Toast si se pulsan activos
@@ -322,6 +412,7 @@ fun ConsoleScreen(
     hardwareReport: HardwareScanReport?,
     networkReport: NetworkProbeReport?,
     onSelectLane: (EngineLane) -> Unit,
+    onUpdateConfig: (AndroidLauncherConfig) -> Unit = {},
     onStartOrStop: () -> Unit,
     onRunCommand: (String) -> Unit,
     onClearLogs: () -> Unit,
@@ -438,6 +529,7 @@ fun ConsoleScreen(
                 hardwareReport = hardwareReport,
                 networkReport = networkReport,
                 onSelectLane = onSelectLane,
+                onUpdateConfig = onUpdateConfig,
                 onStartOrStop = onStartOrStop
             )
         }
@@ -714,20 +806,29 @@ fun ConsoleScreen(
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     quickCmds.forEach { qc ->
+                        val isLaunchCmd = qc.startsWith("./launch")
+                        val isStopCmd = qc == "stop"
+                        val chipEnabled = when {
+                            isLaunchCmd -> !isRunning
+                            isStopCmd -> isRunning
+                            else -> true
+                        }
                         SuggestionChip(
                             onClick = { onRunCommand(qc) },
+                            enabled = chipEnabled,
                             label = {
                                 Text(
                                     text = qc,
                                     fontFamily = FontFamily.Monospace,
                                     fontSize = 11.sp,
-                                    color = Color(0xFFE2E8F0),
+                                    color = if (chipEnabled) Color(0xFFE2E8F0) else Color(0xFF64748B),
                                     maxLines = 1,
                                     softWrap = false
                                 )
                             },
                             colors = SuggestionChipDefaults.suggestionChipColors(
-                                containerColor = Color(0xFF1E293B)
+                                containerColor = Color(0xFF1E293B),
+                                disabledContainerColor = Color(0xFF0F172A)
                             ),
                             border = null,
                             modifier = Modifier.height(28.dp)
