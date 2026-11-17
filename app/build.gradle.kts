@@ -54,7 +54,8 @@ android {
 
     packaging {
         jniLibs {
-            keepDebugSymbols += setOf("**/*.so")
+            // Equivalente AGP 8.7 Kotlin DSL de packagingOptions { doNotStrip "**/*.so" }
+            keepDebugSymbols.add("**/*.so")
         }
     }
 

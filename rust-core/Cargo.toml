@@ -71,7 +71,7 @@ ctr = { opt-level = 3 }
 
 [profile.release]
 panic = "unwind"
-debug = 2
+debug = 1
 strip = false
 opt-level = 3
 lto = "thin"
