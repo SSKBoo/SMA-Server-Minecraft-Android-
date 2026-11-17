@@ -60,6 +60,10 @@ pub fn poll_connection_event(conn: &mut Connection) -> Option<Event> {
 pub struct SessionProgress {
     pub has_sent_network_settings: bool,
     pub player_logged_in: bool,
+    pub has_sent_login_success: bool,
+    pub has_sent_resource_packs_info: bool,
+    pub has_sent_resource_packs_stack: bool,
+    pub has_received_client_cache_status: bool,
     pub has_sent_start_game: bool,
     pub has_sent_initial_chunks: bool,
 }
@@ -1034,7 +1038,54 @@ pub fn send_spawn_chunks(
     0
 }
 
-pub fn send_world_start_and_spawn(
+#[cfg(feature = "protocol-core")]
+pub fn build_v2225_resource_packs_info_bytes() -> Result<Bytes, String> {
+    use bedrock::protocol::v2168::packets::ResourcePacksInfoPacket;
+
+    let pkt = ResourcePacksInfoPacket {
+        resource_pack_required: false,
+        has_addon_packs: false,
+        has_scripts: false,
+        force_disable_vibrant_visuals: false,
+        world_template_uuid: uuid::Uuid::nil(),
+        world_template_version: String::new(),
+        resource_packs: Vec::new(),
+    };
+    encode_bedrock_v2225_packet(&pkt)
+}
+
+#[cfg(feature = "protocol-core")]
+pub fn build_v2225_resource_pack_stack_bytes() -> Result<Bytes, String> {
+    use bedrock::protocol::v662::types::{BaseGameVersion, Experiments};
+    use bedrock::protocol::v898::packets::ResourcePackStackPacket;
+    use bedrock::protocol::V2225;
+
+    let pkt = ResourcePackStackPacket::<V2225> {
+        texture_pack_required: false,
+        addon_list: Vec::new(),
+        base_game_version: BaseGameVersion(MOTD_ADVERTISED_VERSION.to_string()),
+        experiments: Experiments {
+            experiments: Vec::new(),
+            ever_toggled: false,
+        },
+        include_editor_packs: false,
+    };
+    encode_bedrock_v2225_packet(&pkt)
+}
+
+#[cfg(feature = "protocol-core")]
+pub fn build_v2225_voxel_shapes_bytes() -> Result<Bytes, String> {
+    use bedrock::protocol::v944::packets::VoxelShapesPacket;
+
+    let pkt = VoxelShapesPacket {
+        shapes: Vec::new(),
+        names: Vec::new(),
+        custom_shape_count: 0,
+    };
+    encode_bedrock_v2225_packet(&pkt)
+}
+
+pub fn send_resource_packs_sequence(
     conn: &mut Connection,
     session: &mut ServerConnection,
     progress: &mut SessionProgress,
@@ -1043,28 +1094,78 @@ pub fn send_world_start_and_spawn(
 ) {
     #[cfg(feature = "protocol-core")]
     {
+        if !progress.has_sent_resource_packs_info {
+            match build_v2225_resource_packs_info_bytes() {
+                Ok(rp_info) => {
+                    let batch = session.encode(&[rp_info]);
+                    conn.send(batch, now);
+                    progress.has_sent_resource_packs_info = true;
+                    log::info!("[Bedrock Packs] ResourcePacksInfo (0x06) enviado a {}", peer_addr);
+                }
+                Err(err) => {
+                    log::warn!("[Bedrock Packs] Error codificando ResourcePacksInfo: {}", err);
+                }
+            }
+        }
+        if !progress.has_sent_resource_packs_stack {
+            match build_v2225_resource_pack_stack_bytes() {
+                Ok(rp_stack) => {
+                    let batch = session.encode(&[rp_stack]);
+                    conn.send(batch, now);
+                    progress.has_sent_resource_packs_stack = true;
+                    log::info!("[Bedrock Packs] ResourcePackStack (0x07) enviado a {}", peer_addr);
+                }
+                Err(err) => {
+                    log::warn!("[Bedrock Packs] Error codificando ResourcePackStack: {}", err);
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "protocol-core"))]
+    {
+        let _ = (conn, session, progress, peer_addr, now);
+    }
+}
+
+pub fn send_world_start_and_spawn(
+    conn: &mut Connection,
+    session: &mut ServerConnection,
+    progress: &mut SessionProgress,
+    peer_addr: SocketAddr,
+    now: Instant,
+) {
+    // Asegurar secuencia oficial de bedrock-rs: ResourcePacksInfo -> ResourcePackStack -> VoxelShapes -> StartGamePacket
+    send_resource_packs_sequence(conn, session, progress, peer_addr, now);
+
+    #[cfg(feature = "protocol-core")]
+    {
         use bedrock::protocol::v662::packets::SetTimePacket;
 
         if !progress.has_sent_start_game {
+            if let Ok(voxel_bytes) = build_v2225_voxel_shapes_bytes() {
+                let voxel_batch = session.encode(&[voxel_bytes]);
+                conn.send(voxel_batch, now);
+            }
+
             match build_v2225_start_game_packet_bytes() {
                 Ok(start_bytes) => {
                     let start_batch = session.encode(&[start_bytes]);
                     conn.send(start_batch, now);
                     progress.has_sent_start_game = true;
                     log::info!(
-                        "[Bedrock World] StartGamePacket (0x0b) enviado a {} (spawn=0,64,0)",
+                        "[Bedrock Session] StartGamePacket enviado a {} (spawn=0,64,0)",
                         peer_addr
                     );
                 }
                 Err(err) => {
-                    log::warn!("[Bedrock World] Error codificando StartGamePacket: {}", err);
+                    log::warn!("[Bedrock Session] Error codificando StartGamePacket: {}", err);
                 }
             }
 
             if let Ok(time_bytes) = encode_bedrock_v2225_packet(&SetTimePacket { time: 6000 }) {
                 let time_batch = session.encode(&[time_bytes]);
                 conn.send(time_batch, now);
-                log::info!("[Bedrock World] SetTimePacket (0x0a, time=6000) enviado a {}", peer_addr);
+                log::info!("[Bedrock Session] SetTimePacket (0x0a, time=6000) enviado a {}", peer_addr);
             }
         }
 
@@ -1080,7 +1181,7 @@ pub fn send_world_start_and_spawn(
             let status_batch = session.encode(&[spawn_status]);
             conn.send(status_batch, now);
             log::info!(
-                "[Bedrock World] PlayStatus::PlayerSpawn (0x02 / status=3) enviado a {}",
+                "[Bedrock Session] PlayStatus::PlayerSpawn (0x02 / status=3) enviado a {}",
                 peer_addr
             );
         }
@@ -1231,13 +1332,14 @@ pub fn handle_bedrock_session_data(
                 encode_packet(&play_status, &mut status_buf);
                 let status_batch = session.encode(&[status_buf.freeze()]);
                 conn.send(status_batch, now);
+                progress.has_sent_login_success = true;
                 log::info!(
                     "[Bedrock Login] PlayStatus (0x02 LoginSuccess) enviado a {}",
                     peer_addr
                 );
             }
 
-            // Respuesta del cliente al ServerToClientHandshake (0x04 ClientToServerHandshake) -> ResourcePacksInfo
+            // Respuesta del cliente al ServerToClientHandshake (0x04 ClientToServerHandshake) -> ResourcePacksInfo + ResourcePackStack
             id if id == ClientToServerHandshake::ID => {
                 let _ = pkt.decode::<ClientToServerHandshake>();
                 let _ = ServerToClientHandshake::ID;
@@ -1248,25 +1350,11 @@ pub fn handle_bedrock_session_data(
                 encode_packet(&play_status, &mut status_buf);
                 let status_batch = session.encode(&[status_buf.freeze()]);
                 conn.send(status_batch, now);
+                progress.has_sent_login_success = true;
 
-                #[cfg(feature = "protocol-core")]
-                {
-                    use bedrock::protocol::v2168::packets::ResourcePacksInfoPacket;
-                    if let Ok(rp_info) = encode_bedrock_v2225_packet(&ResourcePacksInfoPacket {
-                        resource_pack_required: false,
-                        has_addon_packs: false,
-                        has_scripts: false,
-                        force_disable_vibrant_visuals: false,
-                        world_template_uuid: uuid::Uuid::nil(),
-                        world_template_version: String::new(),
-                        resource_packs: Vec::new(),
-                    }) {
-                        let rp_batch = session.encode(&[rp_info]);
-                        conn.send(rp_batch, now);
-                    }
-                }
+                send_resource_packs_sequence(conn, session, progress, peer_addr, now);
                 log::info!(
-                    "[Bedrock Login] ClientToServerHandshake (0x04) completado con {} -> ResourcePacksInfo enviado",
+                    "[Bedrock Login] ClientToServerHandshake (0x04) completado con {} -> ResourcePacksInfo + ResourcePackStack enviados",
                     peer_addr
                 );
             }
@@ -1276,27 +1364,7 @@ pub fn handle_bedrock_session_data(
                 if let Ok(rp) = pkt.decode::<ResourcePackClientResponse>() {
                     match rp.response_status {
                         ResourcePackClientResponseResponseStatus::HaveAllPacks => {
-                            #[cfg(feature = "protocol-core")]
-                            {
-                                use bedrock::protocol::v662::types::{BaseGameVersion, Experiments};
-                                use bedrock::protocol::v898::packets::ResourcePackStackPacket;
-                                use bedrock::protocol::V2225;
-
-                                if let Ok(stack_bytes) = encode_bedrock_v2225_packet(&ResourcePackStackPacket::<V2225> {
-                                    texture_pack_required: false,
-                                    addon_list: Vec::new(),
-                                    base_game_version: BaseGameVersion(MOTD_ADVERTISED_VERSION.to_string()),
-                                    experiments: Experiments {
-                                        experiments: Vec::new(),
-                                        ever_toggled: false,
-                                    },
-                                    include_editor_packs: false,
-                                }) {
-                                    let batch = session.encode(&[stack_bytes]);
-                                    conn.send(batch, now);
-                                    log::info!("[Bedrock Packs] ResourcePackStack enviado a {}", peer_addr);
-                                }
-                            }
+                            send_resource_packs_sequence(conn, session, progress, peer_addr, now);
                         }
                         ResourcePackClientResponseResponseStatus::Completed => {
                             log::info!("[Bedrock Packs] ResourcePackClientResponse Completed desde {}", peer_addr);
@@ -1307,15 +1375,16 @@ pub fn handle_bedrock_session_data(
                 }
             }
 
-            // FASE 4 P0: Al recibir ClientCacheStatus (0x81 / 129), responder inmediatamente con
-            // StartGamePacket (0x0b), SetTimePacket (0x0a), Chunks iniciales nbtx y PlayStatus::PlayerSpawn (0x02).
-            id if id == ClientCacheStatus::ID => {
+            // FASE 4 P0/P1: Al recibir ClientCacheStatus (0x81 / 129), enviar secuencia de recursos si falta,
+            // VoxelShapesPacket, StartGamePacket (0x0b), SetTimePacket (0x0a), Chunks iniciales nbtx y PlayStatus::PlayerSpawn (0x02).
+            id if id == ClientCacheStatus::ID || id == 0x81 => {
+                progress.has_received_client_cache_status = true;
                 let cache_enabled = pkt
                     .decode::<ClientCacheStatus>()
                     .map(|c| c.enabled)
                     .unwrap_or(false);
                 log::info!(
-                    "[Bedrock World] ClientCacheStatus (0x81, enabled={}) recibido de {} -> enviando StartGamePacket + Spawn + Chunks",
+                    "[Bedrock Session] ClientCacheStatus (0x81, enabled={}) recibido de {} -> disparando StartGamePacket + Spawn + Chunks",
                     cache_enabled,
                     peer_addr
                 );
@@ -1930,12 +1999,22 @@ pub fn start_async_engine(
                                                         );
                                                     }
                                                     Event::Disconnected(reason) => {
-                                                        log::info!(
-                                                            "Conexión WebRTC IPv6 cerrada con {} (session={}): {}",
-                                                            peer.remote_addr,
-                                                            sid,
-                                                            reason
-                                                        );
+                                                        if peer.progress.has_sent_login_success && !peer.progress.has_sent_start_game {
+                                                            log::warn!(
+                                                                "[Bedrock Session] Cliente {} desconectado inesperadamente después de PlayStatus (reason={}, session={}, client_cache_received={})",
+                                                                peer.remote_addr,
+                                                                reason,
+                                                                sid,
+                                                                peer.progress.has_received_client_cache_status
+                                                            );
+                                                        } else {
+                                                            log::info!(
+                                                                "Conexión WebRTC IPv6 cerrada con {} (session={}): {}",
+                                                                peer.remote_addr,
+                                                                sid,
+                                                                reason
+                                                            );
+                                                        }
                                                         closed_ids.push(sid);
                                                     }
                                                 }
@@ -2058,12 +2137,22 @@ pub fn start_async_engine(
                                             );
                                         }
                                         Event::Disconnected(reason) => {
-                                            log::info!(
-                                                "Conexión WebRTC cerrada con {} (session={}): {}",
-                                                peer.remote_addr,
-                                                sid,
-                                                reason
-                                            );
+                                            if peer.progress.has_sent_login_success && !peer.progress.has_sent_start_game {
+                                                log::warn!(
+                                                    "[Bedrock Session] Cliente {} desconectado inesperadamente después de PlayStatus (reason={}, session={}, client_cache_received={})",
+                                                    peer.remote_addr,
+                                                    reason,
+                                                    sid,
+                                                    peer.progress.has_received_client_cache_status
+                                                );
+                                            } else {
+                                                log::info!(
+                                                    "Conexión WebRTC cerrada con {} (session={}): {}",
+                                                    peer.remote_addr,
+                                                    sid,
+                                                    reason
+                                                );
+                                            }
                                             closed_ids.push(sid);
                                         }
                                     }
@@ -2117,12 +2206,22 @@ pub fn start_async_engine(
                                         );
                                     }
                                     Event::Disconnected(reason) => {
-                                        log::info!(
-                                            "Conexión WebRTC cerrada con {} (session={}): {}",
-                                            peer.remote_addr,
-                                            sid,
-                                            reason
-                                        );
+                                        if peer.progress.has_sent_login_success && !peer.progress.has_sent_start_game {
+                                            log::warn!(
+                                                "[Bedrock Session] Cliente {} desconectado inesperadamente después de PlayStatus (reason={}, session={}, client_cache_received={})",
+                                                peer.remote_addr,
+                                                reason,
+                                                sid,
+                                                peer.progress.has_received_client_cache_status
+                                            );
+                                        } else {
+                                            log::info!(
+                                                "Conexión WebRTC cerrada con {} (session={}): {}",
+                                                peer.remote_addr,
+                                                sid,
+                                                reason
+                                            );
+                                        }
                                         closed_ids.push(sid);
                                     }
                                 }
@@ -2485,6 +2584,15 @@ mod tests {
     #[cfg(feature = "protocol-core")]
     #[test]
     fn v2225_start_game_level_chunk_and_player_spawn_serialize_cleanly() {
+        let rp_info = build_v2225_resource_packs_info_bytes().expect("resource_packs_info");
+        assert_eq!(RawPacket::parse(rp_info).expect("parse rp_info").id, 0x06);
+
+        let rp_stack = build_v2225_resource_pack_stack_bytes().expect("resource_pack_stack");
+        assert_eq!(RawPacket::parse(rp_stack).expect("parse rp_stack").id, 0x07);
+
+        let voxel = build_v2225_voxel_shapes_bytes().expect("voxel_shapes");
+        assert_eq!(RawPacket::parse(voxel).expect("parse voxel_shapes").id, 337);
+
         let start_bytes = build_v2225_start_game_packet_bytes().expect("start_game");
         let start_raw = RawPacket::parse(start_bytes).expect("parse start_game");
         assert_eq!(start_raw.id, 0x0b);
