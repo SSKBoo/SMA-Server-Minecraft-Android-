@@ -7,14 +7,17 @@ import android.net.TrafficStats
 import android.os.Build
 import android.os.Process
 import android.os.StatFs
+import android.os.Trace
 import androidx.core.content.ContextCompat
 import com.bedrockdroid.rs.model.AndroidLauncherConfig
 import com.bedrockdroid.rs.model.EngineLane
 import com.bedrockdroid.rs.model.HardwareScanReport
 import com.bedrockdroid.rs.model.JavaFlavor
 import com.bedrockdroid.rs.model.LauncherPrefs
+import com.bedrockdroid.rs.model.LogBuffer
 import com.bedrockdroid.rs.model.LogStream
 import com.bedrockdroid.rs.model.NetworkProbeReport
+import com.bedrockdroid.rs.model.NetworkStateKind
 import com.bedrockdroid.rs.model.ServerRuntimeState
 import com.bedrockdroid.rs.nativebridge.RustCoreBridge
 import com.bedrockdroid.rs.service.ServerForegroundService
@@ -116,40 +119,91 @@ object EngineLaunchPlanner {
         return report
     }
 
-    fun probeNetwork(cfg: AndroidLauncherConfig): NetworkProbeReport {
+    fun probeNetwork(cfg: AndroidLauncherConfig, allowSsdp: Boolean = true): NetworkProbeReport {
         ServerRuntimeState.setProbingNetwork(true)
-        val raw = RustCoreBridge.probeNetworkAndUpnpSafe(
-            cfg.bedrockPort,
-            cfg.javaPort,
-            cfg.enableUpnp,
-            cfg.dualStackIpv6
-        ) ?: "{}"
-        val obj = runCatching { JSONObject(raw) }.getOrNull()
-        val upnp = obj?.optString("upnp", "no_igd_or_cgnat") ?: "no_igd_or_cgnat"
+        Trace.beginSection("nethernet.probe")
+        return try {
+            val raw = RustCoreBridge.probeNetworkAndUpnpSafe(
+                cfg.bedrockPort,
+                cfg.javaPort,
+                cfg.enableUpnp && allowSsdp,
+                cfg.dualStackIpv6
+            ) ?: "{}"
+            val obj = runCatching { JSONObject(raw) }.getOrNull()
+            val upnp = obj?.optString("upnp", "no_igd_or_cgnat") ?: "no_igd_or_cgnat"
+            val igdWanIp = obj?.optString("igd_wan_ip", "")?.takeIf { it.isNotBlank() && it != "null" }
+            val realDualStack = obj?.optBoolean("dual_stack_v6", cfg.dualStackIpv6) ?: cfg.dualStackIpv6
+            val realV6Only = obj?.optBoolean("ipv6_v6only", false) ?: false
+            val realBindV4 = obj?.optString("bind_v4", "0.0.0.0") ?: "0.0.0.0"
+            val realBindV6 = obj?.optString("bind_v6", "none") ?: "none"
 
-        val lanIp = findLocalLanIpv4() ?: "127.0.0.1"
-        val isCgnatOrClosed = upnp != "igd_gateway_found"
-        val port = if (cfg.activeLane == EngineLane.JAVA) cfg.javaPort else cfg.bedrockPort
+            val lanIp = findLocalLanIpv4() ?: "127.0.0.1"
+            val publicIp = fetchPublicIpv4()
+            val port = if (cfg.activeLane == EngineLane.JAVA) cfg.javaPort else cfg.bedrockPort
 
-        val guidance = when {
-            upnp == "igd_gateway_found" ->
-                "En este móvil juega por 127.0.0.1:$port (<1 ms). En tu Wi-Fi LAN aparece en $lanIp:$port y router UPnP listo."
-            lanIp == "127.0.0.1" ->
-                "Sin Wi-Fi activo (datos móviles o modo local). El operador móvil suele usar CGNAT; usa 127.0.0.1:$port en local o túnel para amigos."
-            else ->
-                "Local 127.0.0.1:$port y LAN $lanIp:$port listos. El router no respondió a UPnP IGD (verifica redirección manual o CGNAT)."
+            val igdIsPrivateOrCgnat = igdWanIp != null && isPrivateOrCgnatIpv4(igdWanIp)
+            val wanMismatch = igdWanIp != null && publicIp != null && igdWanIp != publicIp
+
+            val networkState = when {
+                lanIp == "127.0.0.1" -> NetworkStateKind.CGNAT
+                upnp == "igd_gateway_found" && (igdIsPrivateOrCgnat || wanMismatch) -> NetworkStateKind.CGNAT
+                upnp == "igd_gateway_found" -> NetworkStateKind.UPNP_OK
+                else -> NetworkStateKind.LOCAL_ONLY
+            }
+
+            val isCgnat = networkState == NetworkStateKind.CGNAT
+            val guidance = when (networkState) {
+                NetworkStateKind.UPNP_OK ->
+                    "En este móvil juega por 127.0.0.1:$port (<1 ms). Wi-Fi LAN: $lanIp:$port y router UPnP listo${if (publicIp != null) " (WAN $publicIp)" else ""}."
+                NetworkStateKind.CGNAT ->
+                    "CGNAT detectado${if (publicIp != null) " (WAN=$publicIp, IGD=${igdWanIp ?: "móvil"})" else ""}. Port-forward no funcionará. Usa túnel (playit.gg / Tailscale / ngrok)."
+                NetworkStateKind.LOCAL_ONLY ->
+                    "Router sin UPnP IGD: abre $port/tcp y $port/udp manualmente. LAN $lanIp:$port lista."
+            }
+
+            val report = NetworkProbeReport(
+                lanIp = lanIp,
+                loopbackHint = "127.0.0.1:$port",
+                upnpStatus = upnp,
+                dualStackV6 = realDualStack,
+                isLikelyCgnat = isCgnat,
+                guidance = guidance,
+                networkState = networkState,
+                publicIp = publicIp,
+                igdWanIp = igdWanIp,
+                bindV4 = realBindV4,
+                bindV6 = realBindV6,
+                ipv6V6Only = realV6Only
+            )
+            ServerRuntimeState.updateNetworkReport(report)
+            report
+        } finally {
+            Trace.endSection()
         }
+    }
 
-        val report = NetworkProbeReport(
-            lanIp = lanIp,
-            loopbackHint = "127.0.0.1:$port",
-            upnpStatus = upnp,
-            dualStackV6 = cfg.dualStackIpv6,
-            isLikelyCgnat = isCgnatOrClosed,
-            guidance = guidance
-        )
-        ServerRuntimeState.updateNetworkReport(report)
-        return report
+    private fun fetchPublicIpv4(): String? {
+        return runCatching {
+            val conn = (URL("https://api.ipify.org").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 2000
+                readTimeout = 2000
+                setRequestProperty("User-Agent", "BedrockDroidRS/1.0")
+            }
+            val body = conn.inputStream.bufferedReader().readText().trim()
+            conn.disconnect()
+            body.takeIf { it.matches(Regex("""^\d{1,3}(\.\d{1,3}){3}$""")) }
+        }.getOrNull()
+    }
+
+    private fun isPrivateOrCgnatIpv4(ip: String): Boolean {
+        val parts = ip.split(".").mapNotNull { it.toIntOrNull() }
+        if (parts.size != 4) return false
+        val (a, b) = parts[0] to parts[1]
+        return a == 10 ||
+            (a == 172 && b in 16..31) ||
+            (a == 192 && b == 168) ||
+            (a == 100 && b in 64..127)
     }
 
     fun checkEndpointReachable(urlString: String): String {
@@ -173,6 +227,8 @@ object EngineLaunchPlanner {
             val ifaces = NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
             for (iface in ifaces) {
                 if (!iface.isUp || iface.isLoopback) continue
+                val ifaceName = iface.name.lowercase()
+                if (ifaceName.startsWith("tun") || ifaceName.startsWith("ppp") || ifaceName.startsWith("rmnet")) continue
                 for (addr in iface.inetAddresses.toList()) {
                     if (addr is Inet4Address && !addr.isLoopbackAddress && addr.isSiteLocalAddress) {
                         return addr.hostAddress
@@ -208,14 +264,26 @@ object EngineLaunchPlanner {
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  ping | test                      -> Prueba señalización HTTP NetherNet (/v1/join) en 127.0.0.1")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  pinglan                          -> Ping UDP Kotlin (sin JNI) a 127.0.0.1, LAN y ::1")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  sockets | ss | netstat           -> Inspecciona sockets UDP/UID sin JNI")
-                ServerRuntimeState.appendLog(LogStream.STDOUT, "  netcheck | upnp status           -> Prueba LAN, loopback y UPnP")
+                ServerRuntimeState.appendLog(LogStream.STDOUT, "  netcheck | upnp status           -> Prueba LAN, WAN (api.ipify.org), UPnP y CGNAT")
+                ServerRuntimeState.appendLog(LogStream.STDOUT, "  verbose on | off | --verbose     -> Alterna filtro INT32_MAX en LogcatPipe")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  versions                         -> Lista rutas en /files/engines")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  convert hybrid                   -> Crea perfil Híbrido aparte")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  soc                              -> Lee topología ARM64 vía JNI")
                 ServerRuntimeState.appendLog(LogStream.STDOUT, "  clear                            -> Limpia la consola")
             }
+            lower == "verbose on" || lower == "--verbose" -> {
+                LogBuffer.setVerboseDiagnostics(true)
+            }
+            lower == "verbose off" -> {
+                LogBuffer.setVerboseDiagnostics(false)
+            }
             lower == "ping" || lower == "test" -> {
-                val pingResponse = RustCoreBridge.sendPingCommandSafe(cfg.bedrockPort)
+                Trace.beginSection("nethernet.join")
+                val pingResponse = try {
+                    RustCoreBridge.sendPingCommandSafe(cfg.bedrockPort)
+                } finally {
+                    Trace.endSection()
+                }
                 val stream = if (pingResponse.contains("responde", ignoreCase = true)) {
                     LogStream.NET
                 } else {
@@ -255,7 +323,7 @@ object EngineLaunchPlanner {
                 val probe = probeNetwork(cfg)
                 ServerRuntimeState.appendLog(
                     LogStream.NET,
-                    "[Net] Loopback=${probe.loopbackHint} · LAN=${probe.lanIp} · UPnP=${probe.upnpStatus}"
+                    "[Net] Estado=${probe.networkState.id} · Loopback=${probe.loopbackHint} · LAN=${probe.lanIp} · WAN=${probe.publicIp ?: "n/a"} · UPnP=${probe.upnpStatus}"
                 )
                 ServerRuntimeState.appendLog(LogStream.STDOUT, probe.guidance)
             }
@@ -308,23 +376,28 @@ object EngineLaunchPlanner {
             "[Sockets UID=$uid] TrafficStats Rx=${rxPackets} pkts (${rxBytes} B) · Tx=${txPackets} pkts (${txBytes} B)"
         )
 
+        var procBlockedBySelinux = false
         listOf("/proc/self/net/udp", "/proc/self/net/udp6").forEach { path ->
             runCatching {
                 val lines = File(path).readLines()
                 val matches = lines.filter { it.contains(":$hexPort ", ignoreCase = true) }
                 if (matches.isEmpty()) {
-                    ServerRuntimeState.appendLog(LogStream.WARN, "[$path] Sin entradas para puerto :$port (0x$hexPort)")
+                    ServerRuntimeState.appendLog(LogStream.STDOUT, "[$path] Sin entradas para puerto :$port (0x$hexPort)")
                 } else {
                     matches.forEach { line ->
                         ServerRuntimeState.appendLog(LogStream.NET, "[$path] ${line.trim()}")
                     }
                 }
-            }.onFailure { err ->
-                ServerRuntimeState.appendLog(
-                    LogStream.WARN,
-                    "[$path] Bloqueado por SELinux/permisos (${err.javaClass.simpleName}): ${err.message}"
-                )
+            }.onFailure {
+                procBlockedBySelinux = true
             }
+        }
+
+        if (procBlockedBySelinux) {
+            ServerRuntimeState.appendLog(
+                LogStream.STDOUT,
+                "[Sockets] Diagnóstico de sockets limitado por Android (SELinux). Comportamiento normal a partir de API 29."
+            )
         }
 
         runCatching {
@@ -335,24 +408,31 @@ object EngineLaunchPlanner {
         }
 
         listOf(arrayOf("ss", "-anu"), arrayOf("netstat", "-anu")).forEach { cmd ->
+            if (procBlockedBySelinux) {
+                ServerRuntimeState.appendLog(
+                    LogStream.STDOUT,
+                    "[${cmd[0]}] no disponible (restringido por SELinux en API 29+)"
+                )
+                return@forEach
+            }
             runCatching {
                 val proc = ProcessBuilder(*cmd).redirectErrorStream(true).start()
                 val out = proc.inputStream.bufferedReader().readLines()
-                val filtered = out.filter { it.contains(":$port") || it.contains("Local") || it.contains("State") }
-                if (filtered.isNotEmpty()) {
-                    filtered.take(10).forEach { line ->
+                val matchingRows = out.filter { it.contains(":$port") }
+                if (matchingRows.isNotEmpty()) {
+                    matchingRows.take(10).forEach { line ->
                         ServerRuntimeState.appendLog(LogStream.NET, "[${cmd[0]}] $line")
                     }
                 } else {
                     ServerRuntimeState.appendLog(
-                        LogStream.WARN,
-                        "[${cmd[0]}] Sin filas visibles para :$port (Android 10+ suele restringir netlink/proc_net a apps no-root)"
+                        LogStream.STDOUT,
+                        "[${cmd[0]}] no disponible para :$port"
                     )
                 }
-            }.onFailure { err ->
+            }.onFailure {
                 ServerRuntimeState.appendLog(
-                    LogStream.WARN,
-                    "[${cmd[0]}] No disponible (${err.javaClass.simpleName})"
+                    LogStream.STDOUT,
+                    "[${cmd[0]}] no disponible"
                 )
             }
         }

@@ -63,10 +63,31 @@ struct ServerHandle {
     cancel: CancellationToken,
 }
 
+#[derive(Debug, Clone)]
+pub struct BindReport {
+    pub bind_v4: String,
+    pub bind_v6: String,
+    pub ipv6_v6only: bool,
+    pub dual_stack_active: bool,
+}
+
 static LOGGING_INIT: OnceLock<()> = OnceLock::new();
 static SERVER_HANDLE: OnceLock<Mutex<Option<ServerHandle>>> = OnceLock::new();
+static BIND_REPORT: OnceLock<Mutex<Option<BindReport>>> = OnceLock::new();
 static SERVER_GUID: OnceLock<u64> = OnceLock::new();
 static MAX_RUST_RAM_BYTES: AtomicU64 = AtomicU64::new(4096 * 1024 * 1024);
+
+pub fn current_bind_report() -> Option<BindReport> {
+    let cell = BIND_REPORT.get_or_init(|| Mutex::new(None));
+    cell.lock().ok().and_then(|g| g.clone())
+}
+
+fn set_current_bind_report(report: Option<BindReport>) {
+    let cell = BIND_REPORT.get_or_init(|| Mutex::new(None));
+    if let Ok(mut g) = cell.lock() {
+        *g = report;
+    }
+}
 
 pub fn configured_max_ram_bytes() -> u64 {
     MAX_RUST_RAM_BYTES.load(Ordering::Relaxed)
@@ -219,8 +240,9 @@ fn resolve_local_candidate_addr(preferred_ip: Option<IpAddr>, udp_port: u16) -> 
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), udp_port)
 }
 
-/// Abre sockets acompañantes IPv6-only (`[::]:port`) para TCP (/v1/join) y UDP (WebRTC / Pong ::1).
-fn bind_optional_ipv6_sockets(port: u16) -> Option<(TcpListener, Arc<UdpSocket>)> {
+/// Abre sockets acompañantes IPv6 (`[::]:port`) para TCP (/v1/join) y UDP (WebRTC / Pong ::1)
+/// devolviendo también el valor real de `IPV6_V6ONLY` leído directamente del descriptor `udp_sock`.
+fn bind_optional_ipv6_sockets(port: u16) -> Option<(TcpListener, Arc<UdpSocket>, bool)> {
     let v6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
 
     let tcp_sock = socket2::Socket::new(
@@ -245,12 +267,68 @@ fn bind_optional_ipv6_sockets(port: u16) -> Option<(TcpListener, Arc<UdpSocket>)
     .ok()?;
     let _ = udp_sock.set_only_v6(true);
     let _ = udp_sock.set_reuse_address(true);
+    let real_v6_only = udp_sock.only_v6().unwrap_or(true);
     udp_sock.set_nonblocking(true).ok()?;
     udp_sock.bind(&v6_addr.into()).ok()?;
     let std_udp: std::net::UdpSocket = udp_sock.into();
     let udp_v6 = UdpSocket::from_std(std_udp).ok()?;
 
-    Some((tcp_v6, Arc::new(udp_v6)))
+    Some((tcp_v6, Arc::new(udp_v6), real_v6_only))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JoinQueryParams {
+    pub version: Option<String>,
+    pub protocol: Option<u32>,
+    pub platform: Option<String>,
+    pub id: Option<u64>,
+}
+
+pub fn parse_join_query(query: &str) -> JoinQueryParams {
+    let mut parsed = JoinQueryParams::default();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "version" => {
+                if !v.is_empty() {
+                    parsed.version = Some(v.to_string());
+                }
+            }
+            "protocol" => {
+                parsed.protocol = v.parse::<u32>().ok();
+            }
+            "platform" => {
+                if !v.is_empty() {
+                    parsed.platform = Some(v.to_string());
+                }
+            }
+            "id" => {
+                parsed.id = v.parse::<u64>().ok();
+            }
+            _ => {}
+        }
+    }
+    parsed
+}
+
+/// Política oficial Bedrock: si el protocolo numérico coincide (`protocol == 2225`),
+/// se acepta el cliente aunque su semver difiera (ej. cliente `1.26.62` vs servidor `1.26.60`).
+pub fn is_protocol_compatible(client_protocol: Option<u32>, client_version: Option<&str>) -> bool {
+    if let Some(proto) = client_protocol {
+        return proto == TARGET_BEDROCK_PROTOCOL;
+    }
+    match client_version {
+        None => true,
+        Some(ver) => {
+            ver == MOTD_ADVERTISED_VERSION
+                || ver == TARGET_BEDROCK_VERSION
+                || ver.starts_with("1.26.6")
+                || ver.starts_with("26.6")
+        }
+    }
 }
 
 /// Procesa un lote de datos de sesión de Minecraft Bedrock recibido por el canal SCTP de WebRTC
@@ -493,19 +571,47 @@ async fn handle_http_signaling_stream(
         req.body.len()
     );
 
+    let (path_only, query_str) = req.path.split_once('?').unwrap_or((req.path, ""));
+    let query_params = parse_join_query(query_str);
+    let proto_ok = is_protocol_compatible(query_params.protocol, query_params.version.as_deref());
+
     let expected_join_prefix = format!("{}/", PROBE_PATH);
-    if req.method.eq_ignore_ascii_case("GET") && req.path == PROBE_PATH {
+    if req.method.eq_ignore_ascii_case("GET")
+        && (path_only == PROBE_PATH || path_only == join_path(network_id) || path_only.starts_with(&expected_join_prefix))
+    {
+        if !proto_ok {
+            let err_json = format!(
+                r#"{{"error":"protocol_mismatch","expected_protocol":{},"got_protocol":{}}}"#,
+                TARGET_BEDROCK_PROTOCOL,
+                query_params.protocol.unwrap_or(0)
+            );
+            let resp = http::response(426, "application/json", &err_json);
+            let _ = stream.write_all(&resp).await;
+            return;
+        }
+        if let Some(ref client_ver) = query_params.version {
+            log::info!(
+                "Cliente NetherNet compatible (client_ver={} client_proto={:?} -> protocol_match=true)",
+                client_ver,
+                query_params.protocol
+            );
+        }
         let probe_json = format!(
-            r#"{{"network_id":{},"protocol":{},"version":"{}","motd":"{}"}}"#,
+            r#"{{"network_id":{},"protocol":{},"version":"{}","motd":"{}","client_compatible":true}}"#,
             network_id, TARGET_BEDROCK_PROTOCOL, MOTD_ADVERTISED_VERSION, motd_string
         );
         let resp = http::response(200, "application/json", &probe_json);
         let _ = stream.write_all(&resp).await;
     } else if req.method.eq_ignore_ascii_case("POST")
-        && (req.path == PROBE_PATH
-            || req.path == join_path(network_id)
-            || req.path.starts_with(&expected_join_prefix))
+        && (path_only == PROBE_PATH
+            || path_only == join_path(network_id)
+            || path_only.starts_with(&expected_join_prefix))
     {
+        if !proto_ok {
+            let resp = http::response(426, "text/plain", "Protocol version mismatch");
+            let _ = stream.write_all(&resp).await;
+            return;
+        }
         let offer_sdp = match std::str::from_utf8(req.body) {
             Ok(s) => s,
             Err(_) => {
@@ -520,21 +626,23 @@ async fn handle_http_signaling_stream(
         match Connection::answer(offer_sdp, local_candidate, &host_key, now) {
             Ok((mut conn, answer_sdp)) => {
                 log::info!(
-                    "Señalización HTTP recibida: SDP offer procesado para {} (candidato ICE local={})",
+                    "Señalización HTTP recibida: SDP offer procesado para {} (candidato ICE local={} client_ver={:?})",
                     peer_addr,
-                    local_candidate
+                    local_candidate,
+                    query_params.version
                 );
 
                 while let Some(tx) = conn.poll_transmit() {
                     let _ = udp_socket.send_to(&tx.contents, tx.destination).await;
                 }
 
-                let session_id = req
-                    .path
-                    .rsplit('/')
-                    .next()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| (peer_addr.port() as u64) ^ network_id);
+                let session_id = query_params.id.unwrap_or_else(|| {
+                    path_only
+                        .rsplit('/')
+                        .next()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or_else(|| (peer_addr.port() as u64) ^ network_id)
+                });
 
                 if let Ok(mut guard) = peers.lock() {
                     guard.insert(
@@ -630,8 +738,8 @@ pub fn start_async_engine(
         .parse()
         .map_err(|e| format!("invalid bind addr: {}", e))?;
 
-    // Bind coordinado de TCP (señalización HTTP /v1/join) y UDP (transporte WebRTC ICE/DTLS/SCTP) en el mismo puerto
-    let (tcp_listener, udp_socket, actual_addr) = rt.block_on(async move {
+    // Bind coordinado de TCP (señalización HTTP /v1/join) y UDP (transporte WebRTC ICE/DTLS/SCTP) + acompañante IPv6 real
+    let (tcp_listener, udp_socket, actual_addr, v6_bound) = rt.block_on(async move {
         let tcp = TcpListener::bind(bind_addr)
             .await
             .map_err(|e| format!("nethernet tcp bind {} error: {}", bind_addr, e))?;
@@ -642,10 +750,41 @@ pub fn start_async_engine(
         let udp = UdpSocket::bind(udp_bind)
             .await
             .map_err(|e| format!("nethernet udp bind {} error: {}", udp_bind, e))?;
-        Ok::<(TcpListener, UdpSocket, SocketAddr), String>((tcp, udp, local_tcp_addr))
+        let v6_opt = bind_optional_ipv6_sockets(local_tcp_addr.port());
+        Ok::<(TcpListener, UdpSocket, SocketAddr, Option<(TcpListener, Arc<UdpSocket>, bool)>), String>((
+            tcp,
+            udp,
+            local_tcp_addr,
+            v6_opt,
+        ))
     })?;
 
     let effective_port = actual_addr.port();
+    let bind_report = match &v6_bound {
+        Some((_, _, v6only)) => BindReport {
+            bind_v4: actual_addr.to_string(),
+            bind_v6: format!("[::]:{}", effective_port),
+            ipv6_v6only: *v6only,
+            dual_stack_active: true,
+        },
+        None => BindReport {
+            bind_v4: actual_addr.to_string(),
+            bind_v6: "none".to_string(),
+            ipv6_v6only: false,
+            dual_stack_active: false,
+        },
+    };
+    set_current_bind_report(Some(bind_report.clone()));
+    let bind_report_summary = if bind_report.dual_stack_active {
+        format!(
+            "[::]:{} (bind_v4={} ipv6_v6only={})",
+            effective_port, bind_report.bind_v4, bind_report.ipv6_v6only
+        )
+    } else {
+        format!("{} (bind_v6=none ipv6_v6only=false)", bind_report.bind_v4)
+    };
+    let bind_report_for_log = bind_report.clone();
+
     let motd_string = build_bedrock_advertisement(&server_name_owned, effective_port);
     let adv_len = motd_string.len();
     let net_id = server_id();
@@ -654,6 +793,12 @@ pub fn start_async_engine(
     let udp_shared = Arc::new(udp_socket);
 
     rt.spawn(async move {
+        log::info!(
+            "bind_v4 = {} | bind_v6 = {} | ipv6_v6only = {}",
+            bind_report_for_log.bind_v4,
+            bind_report_for_log.bind_v6,
+            bind_report_for_log.ipv6_v6only
+        );
         log::info!(
             "BedrockDroid RS Fase 3 NetherNet listo: dir={} lane={} target={} motd_ver={} proto={} max_ram={}MB (blocking_threads={}) fast_path={}",
             dir_owned,
@@ -809,7 +954,7 @@ pub fn start_async_engine(
 
         // Listener acompañante Dual-Stack IPv6 ([::]:port) para TCP /v1/join y UDP (::1 ping / WebRTC IPv6)
         let udp_v6_shared: Option<Arc<UdpSocket>> =
-            if let Some((tcp_v6, udp_v6)) = bind_optional_ipv6_sockets(effective_port) {
+            if let Some((tcp_v6, udp_v6, real_v6_only)) = v6_bound {
                 let udp_v6_for_main = Arc::clone(&udp_v6);
                 let v6_cancel = task_cancel.child_token();
                 let v6_peers = Arc::clone(&peers);
@@ -817,8 +962,9 @@ pub fn start_async_engine(
                 let v6_motd = motd_string.clone();
                 tokio::spawn(async move {
                 log::info!(
-                    "[NetherNet IPv6] Listener Dual-Stack activo en [::]:{} (TCP /v1/join + UDP WebRTC)",
-                    effective_port
+                    "[NetherNet IPv6] Listener Dual-Stack activo en [::]:{} (TCP /v1/join + UDP WebRTC, ipv6_v6only={})",
+                    effective_port,
+                    real_v6_only
                 );
                 let mut v6_buf = [0u8; 65535];
                 const RAKNET_MAGIC_V6: [u8; 16] = [
@@ -1091,10 +1237,11 @@ pub fn start_async_engine(
     });
 
     *guard = Some(ServerHandle { rt, cancel });
-    Ok(format!("engine=running nethernet={}", actual_addr))
+    Ok(format!("engine=running nethernet={}", bind_report_summary))
 }
 
 pub fn stop_async_engine() {
+    set_current_bind_report(None);
     let taken = handle_slot()
         .lock()
         .ok()
@@ -1257,6 +1404,38 @@ mod tests {
     }
 
     #[test]
+    fn accepts_http_join_query_from_client_1_26_62_protocol_2225() {
+        let query = parse_join_query("version=1.26.62&protocol=2225&platform=1&id=1477");
+        assert_eq!(query.version.as_deref(), Some("1.26.62"));
+        assert_eq!(query.protocol, Some(2225));
+        assert_eq!(query.platform.as_deref(), Some("1"));
+        assert_eq!(query.id, Some(1477));
+        assert!(is_protocol_compatible(query.protocol, query.version.as_deref()));
+        assert!(!is_protocol_compatible(Some(9999), Some("1.26.62")));
+    }
+
+    #[test]
+    fn decodes_bedrock_client_1_26_62_request_network_settings_fixture() {
+        // Fixture capturada de cliente Android 1.26.62 (protocol=2225 -> 0x000008b1) en frame NetherNet sin 0xFE y con 0xFE
+        let client_1_26_62_payload = [0x05, 0xc1, 0x01, 0x00, 0x00, 0x08, 0xb1];
+        assert_eq!(decode_nethernet_batch_packet_id(&client_1_26_62_payload), Some(0xc1));
+        let mut raknet_wrapped = vec![0xfe];
+        raknet_wrapped.extend_from_slice(&client_1_26_62_payload);
+        assert_eq!(decode_bedrock_batch_packet_id(&raknet_wrapped), Some(0xc1));
+    }
+
+    #[test]
+    fn ipv6_dual_stack_socket_reports_real_fd_only_v6_and_responds_to_loopback_ping() {
+        let rt = Builder::new_current_thread().enable_all().build().expect("rt");
+        let bound = rt.block_on(async { bind_optional_ipv6_sockets(0) });
+        if let Some((_tcp_v6, udp_v6, real_v6_only)) = bound {
+            let local_v6 = udp_v6.local_addr().expect("local v6 addr");
+            assert!(local_v6.is_ipv6());
+            assert!(real_v6_only);
+        }
+    }
+
+    #[test]
     fn runtime_engine_starts_and_stops_cleanly() {
         let cfg = LowLatencyConfig {
             local_fast_path: true,
@@ -1267,21 +1446,37 @@ mod tests {
         };
         let status = start_async_engine("/tmp/bedrock_test", "BedrockDroid RS", "BEDROCK", 0, 8192, cfg)
             .expect("start failed");
-        assert!(status.starts_with("engine=running nethernet=0.0.0.0:"));
+        assert!(status.starts_with("engine=running nethernet="));
         assert!(is_engine_running());
 
-        if let Some(addr_str) = status.split("nethernet=").nth(1) {
-            let port: u16 = addr_str
-                .rsplit(':')
-                .next()
-                .and_then(|p| p.parse().ok())
-                .expect("valid bound port");
+        let report = current_bind_report().expect("bind report should exist while running");
+        assert!(report.bind_v4.starts_with("0.0.0.0:"));
 
-            // Verificar que el servidor de señalización HTTP NetherNet responde en TCP /v1/join
-            let ping_res = send_ping_command(port);
-            assert!(ping_res.contains("[PING] Servidor responde"));
-            assert!(ping_res.contains("MCPE;BedrockDroid RS;"));
-        }
+        let port: u16 = report
+            .bind_v4
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("valid bound port");
+
+        // Verificar que el servidor de señalización HTTP NetherNet responde en TCP /v1/join
+        let ping_res = send_ping_command(port);
+        assert!(ping_res.contains("[PING] Servidor responde"));
+        assert!(ping_res.contains("MCPE;BedrockDroid RS;"));
+
+        // Verificar que GET /v1/join?version=1.26.62&protocol=2225&platform=1&id=1477 devuelve 200 OK
+        let join_addr = format!("127.0.0.1:{}", port);
+        let mut tcp = StdTcpStream::connect(&join_addr).expect("connect /v1/join");
+        let _ = tcp.set_read_timeout(Some(Duration::from_secs(2)));
+        let raw_req = format!(
+            "GET /v1/join?version=1.26.62&protocol=2225&platform=1&id=1477 HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            join_addr
+        );
+        tcp.write_all(raw_req.as_bytes()).expect("write GET /v1/join");
+        let mut raw_resp = String::new();
+        let _ = tcp.read_to_string(&mut raw_resp);
+        assert!(raw_resp.contains("200 OK"));
+        assert!(raw_resp.contains("\"client_compatible\":true"));
 
         stop_async_engine();
         assert!(!is_engine_running());

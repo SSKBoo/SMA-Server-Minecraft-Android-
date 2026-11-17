@@ -11,6 +11,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.Trace
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.bedrockdroid.rs.engine.EngineLaunchPlanner
@@ -39,6 +40,8 @@ class ServerForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile
     private var rustRuntimeStarted: Boolean = false
+    @Volatile
+    private var lastNetworkCallbackProbeMs: Long = 0L
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         LogBuffer.startProcessLogcatCollector()
@@ -97,61 +100,75 @@ class ServerForegroundService : Service() {
 
         when (cfg.activeLane) {
             EngineLane.BEDROCK -> {
-                // Carril Bedrock: SOLO motor nativo Rust + RakNet/mDNS UDP. NO iniciar JVM.
-                if (cfg.enableMdns) {
-                    lanDiscovery = LanDiscoveryManager(this).apply {
-                        runCatching { registerLanService(cfg.serverName, cfg.bedrockPort) }
-                            .onSuccess {
-                                ServerRuntimeState.appendLog(
-                                    LogStream.NET,
-                                    "[mDNS] Anunciando _minecraft._udp en puerto ${cfg.bedrockPort}"
-                                )
-                            }
-                            .onFailure { err ->
-                                ServerRuntimeState.appendLog(
-                                    LogStream.WARN,
-                                    "[mDNS] No se pudo iniciar anuncio NsdManager: ${err.message}"
-                                )
-                            }
+                // Carril Bedrock: SOLO motor nativo Rust + NetherNet/mDNS en Dispatchers.IO para no bloquear UI (<16ms)
+                serviceScope.launch(Dispatchers.IO) {
+                    if (cfg.enableMdns) {
+                        lanDiscovery = LanDiscoveryManager(this@ServerForegroundService).apply {
+                            runCatching { registerLanService(cfg.serverName, cfg.bedrockPort) }
+                                .onSuccess {
+                                    ServerRuntimeState.appendLog(
+                                        LogStream.NET,
+                                        "[mDNS] Anunciando _minecraft._udp en puerto ${cfg.bedrockPort}"
+                                    )
+                                }
+                                .onFailure { err ->
+                                    ServerRuntimeState.appendLog(
+                                        LogStream.WARN,
+                                        "[mDNS] No se pudo iniciar anuncio NsdManager: ${err.message}"
+                                    )
+                                }
+                        }
                     }
-                }
 
-                if (cfg.networkCallbackEnabled) {
-                    networkMonitor = NetworkMonitor(this).apply {
-                        startObserving {
-                            val probe = EngineLaunchPlanner.probeNetwork(cfg)
-                            ServerRuntimeState.updateNetworkReport(probe)
-                            val probeJson = RustCoreBridge.probeNetworkAndUpnpSafe(
-                                cfg.bedrockPort,
-                                cfg.javaPort,
-                                cfg.enableUpnp,
-                                cfg.dualStackIpv6
-                            )
-                            if (probeJson != null) {
-                                ServerRuntimeState.appendLog(LogStream.NET, "[NetworkCallback] $probeJson")
+                    if (cfg.networkCallbackEnabled) {
+                        networkMonitor = NetworkMonitor(this@ServerForegroundService).apply {
+                            startObserving {
+                                serviceScope.launch(Dispatchers.IO) {
+                                    val nowMs = System.currentTimeMillis()
+                                    val allowSsdp = (nowMs - lastNetworkCallbackProbeMs) >= 30_000L
+                                    if (allowSsdp) {
+                                        lastNetworkCallbackProbeMs = nowMs
+                                    }
+                                    val probe = EngineLaunchPlanner.probeNetwork(cfg, allowSsdp = allowSsdp)
+                                    ServerRuntimeState.updateNetworkReport(probe)
+                                    val probeJson = RustCoreBridge.probeNetworkAndUpnpSafe(
+                                        cfg.bedrockPort,
+                                        cfg.javaPort,
+                                        cfg.enableUpnp && allowSsdp,
+                                        cfg.dualStackIpv6
+                                    )
+                                    if (probeJson != null) {
+                                        ServerRuntimeState.appendLog(LogStream.NET, "[NetworkCallback] $probeJson")
+                                    }
+                                }
                             }
                         }
                     }
-                }
 
-                val rustStatus = RustCoreBridge.initRuntimeSafe(
-                    laneDir.absolutePath,
-                    cfg.serverName,
-                    cfg.activeLane.name,
-                    cfg.bedrockPort,
-                    cfg.rustMaxRamMb,
-                    cfg.localFastPath,
-                    cfg.tcpNoDelay,
-                    cfg.ipTosLowDelay,
-                    cfg.localJitterMs,
-                    cfg.wanMtuBytes,
-                    cfg.snapdragonPinning,
-                    cfg.ioPriorityBe,
-                    cfg.thermalGuardC
-                )
-                rustRuntimeStarted = rustStatus.startsWith("OK")
-                val rustStream = if (rustRuntimeStarted) LogStream.STDOUT else LogStream.ERR
-                ServerRuntimeState.appendLog(rustStream, "[Rust JNI] $rustStatus", "RustJNI")
+                    Trace.beginSection("nethernet.join")
+                    val rustStatus = try {
+                        RustCoreBridge.initRuntimeSafe(
+                            laneDir.absolutePath,
+                            cfg.serverName,
+                            cfg.activeLane.name,
+                            cfg.bedrockPort,
+                            cfg.rustMaxRamMb,
+                            cfg.localFastPath,
+                            cfg.tcpNoDelay,
+                            cfg.ipTosLowDelay,
+                            cfg.localJitterMs,
+                            cfg.wanMtuBytes,
+                            cfg.snapdragonPinning,
+                            cfg.ioPriorityBe,
+                            cfg.thermalGuardC
+                        )
+                    } finally {
+                        Trace.endSection()
+                    }
+                    rustRuntimeStarted = rustStatus.startsWith("OK")
+                    val rustStream = if (rustRuntimeStarted) LogStream.STDOUT else LogStream.ERR
+                    ServerRuntimeState.appendLog(rustStream, "[Rust JNI] $rustStatus", "RustJNI")
+                }
             }
 
             EngineLane.JAVA -> {
@@ -180,60 +197,74 @@ class ServerForegroundService : Service() {
                     "[JVM ARM64] $jvmArgs"
                 )
 
-                if (cfg.enableMdns) {
-                    lanDiscovery = LanDiscoveryManager(this).apply {
-                        runCatching { registerLanService(cfg.serverName, cfg.bedrockPort) }
-                            .onSuccess {
-                                ServerRuntimeState.appendLog(
-                                    LogStream.NET,
-                                    "[mDNS] Anunciando _minecraft._udp en puerto ${cfg.bedrockPort}"
-                                )
-                            }
-                            .onFailure { err ->
-                                ServerRuntimeState.appendLog(
-                                    LogStream.WARN,
-                                    "[mDNS] No se pudo iniciar anuncio NsdManager: ${err.message}"
-                                )
-                            }
+                serviceScope.launch(Dispatchers.IO) {
+                    if (cfg.enableMdns) {
+                        lanDiscovery = LanDiscoveryManager(this@ServerForegroundService).apply {
+                            runCatching { registerLanService(cfg.serverName, cfg.bedrockPort) }
+                                .onSuccess {
+                                    ServerRuntimeState.appendLog(
+                                        LogStream.NET,
+                                        "[mDNS] Anunciando _minecraft._udp en puerto ${cfg.bedrockPort}"
+                                    )
+                                }
+                                .onFailure { err ->
+                                    ServerRuntimeState.appendLog(
+                                        LogStream.WARN,
+                                        "[mDNS] No se pudo iniciar anuncio NsdManager: ${err.message}"
+                                    )
+                                }
+                        }
                     }
-                }
 
-                if (cfg.networkCallbackEnabled) {
-                    networkMonitor = NetworkMonitor(this).apply {
-                        startObserving {
-                            val probe = EngineLaunchPlanner.probeNetwork(cfg)
-                            ServerRuntimeState.updateNetworkReport(probe)
-                            val probeJson = RustCoreBridge.probeNetworkAndUpnpSafe(
-                                cfg.bedrockPort,
-                                cfg.javaPort,
-                                cfg.enableUpnp,
-                                cfg.dualStackIpv6
-                            )
-                            if (probeJson != null) {
-                                ServerRuntimeState.appendLog(LogStream.NET, "[NetworkCallback] $probeJson")
+                    if (cfg.networkCallbackEnabled) {
+                        networkMonitor = NetworkMonitor(this@ServerForegroundService).apply {
+                            startObserving {
+                                serviceScope.launch(Dispatchers.IO) {
+                                    val nowMs = System.currentTimeMillis()
+                                    val allowSsdp = (nowMs - lastNetworkCallbackProbeMs) >= 30_000L
+                                    if (allowSsdp) {
+                                        lastNetworkCallbackProbeMs = nowMs
+                                    }
+                                    val probe = EngineLaunchPlanner.probeNetwork(cfg, allowSsdp = allowSsdp)
+                                    ServerRuntimeState.updateNetworkReport(probe)
+                                    val probeJson = RustCoreBridge.probeNetworkAndUpnpSafe(
+                                        cfg.bedrockPort,
+                                        cfg.javaPort,
+                                        cfg.enableUpnp && allowSsdp,
+                                        cfg.dualStackIpv6
+                                    )
+                                    if (probeJson != null) {
+                                        ServerRuntimeState.appendLog(LogStream.NET, "[NetworkCallback] $probeJson")
+                                    }
+                                }
                             }
                         }
                     }
-                }
 
-                val rustStatus = RustCoreBridge.initRuntimeSafe(
-                    laneDir.absolutePath,
-                    cfg.serverName,
-                    cfg.activeLane.name,
-                    cfg.bedrockPort,
-                    cfg.rustMaxRamMb,
-                    cfg.localFastPath,
-                    cfg.tcpNoDelay,
-                    cfg.ipTosLowDelay,
-                    cfg.localJitterMs,
-                    cfg.wanMtuBytes,
-                    cfg.snapdragonPinning,
-                    cfg.ioPriorityBe,
-                    cfg.thermalGuardC
-                )
-                rustRuntimeStarted = rustStatus.startsWith("OK")
-                val rustStream = if (rustRuntimeStarted) LogStream.STDOUT else LogStream.ERR
-                ServerRuntimeState.appendLog(rustStream, "[Rust JNI] $rustStatus", "RustJNI")
+                    Trace.beginSection("nethernet.join")
+                    val rustStatus = try {
+                        RustCoreBridge.initRuntimeSafe(
+                            laneDir.absolutePath,
+                            cfg.serverName,
+                            cfg.activeLane.name,
+                            cfg.bedrockPort,
+                            cfg.rustMaxRamMb,
+                            cfg.localFastPath,
+                            cfg.tcpNoDelay,
+                            cfg.ipTosLowDelay,
+                            cfg.localJitterMs,
+                            cfg.wanMtuBytes,
+                            cfg.snapdragonPinning,
+                            cfg.ioPriorityBe,
+                            cfg.thermalGuardC
+                        )
+                    } finally {
+                        Trace.endSection()
+                    }
+                    rustRuntimeStarted = rustStatus.startsWith("OK")
+                    val rustStream = if (rustRuntimeStarted) LogStream.STDOUT else LogStream.ERR
+                    ServerRuntimeState.appendLog(rustStream, "[Rust JNI] $rustStatus", "RustJNI")
+                }
             }
         }
 

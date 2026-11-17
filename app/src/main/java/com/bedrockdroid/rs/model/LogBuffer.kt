@@ -168,9 +168,23 @@ object LogBuffer {
         }
     }
 
+    @Volatile
+    var verboseDiagnostics: Boolean = false
+
+    fun setVerboseDiagnostics(enabled: Boolean): Boolean {
+        verboseDiagnostics = enabled
+        appendLevel(
+            LogLevel.INFO,
+            "LogcatPipe",
+            if (enabled) "Modo diagnóstico --verbose activado (sin filtro INT32_MAX)." else "Modo normal activo (filtro anti-spam INT32_MAX habilitado)."
+        )
+        return enabled
+    }
+
     private fun parseAndAppendLogcatLine(raw: String) {
         val trimmed = raw.trim()
         if (trimmed.isBlank() || trimmed.startsWith("--------- beginning of")) return
+        if (!verboseDiagnostics && trimmed.contains("Note: end time exceeds INT32_MAX")) return
         val level = when {
             trimmed.startsWith("E/") || trimmed.startsWith("F/") || trimmed.contains(" E/") || trimmed.contains(" F/") || trimmed.contains(" E ") || trimmed.contains(" F ") -> LogLevel.ERROR
             trimmed.startsWith("W/") || trimmed.contains(" W/") || trimmed.contains(" W ") -> LogLevel.WARN

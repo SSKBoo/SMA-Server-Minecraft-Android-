@@ -10,14 +10,21 @@ import android.provider.Settings
 import androidx.core.content.ContextCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -32,6 +39,7 @@ import com.bedrockdroid.rs.model.AndroidLauncherConfig
 import com.bedrockdroid.rs.model.HardwareScanReport
 import com.bedrockdroid.rs.model.LogStream
 import com.bedrockdroid.rs.model.NetworkProbeReport
+import com.bedrockdroid.rs.model.NetworkStateKind
 import com.bedrockdroid.rs.model.ServerRuntimeState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -277,8 +285,36 @@ fun SurvivalNetworkScreen(
                     Text("Probar conexión Local + UPnP / CGNAT")
                 }
                 networkReport?.let { net ->
+                    val (stateBg, stateColor, stateIcon, stateTitle) = when (net.networkState) {
+                        NetworkStateKind.UPNP_OK -> Quad(Color(0xFFECFDF5), Color(0xFF047857), Icons.Default.CheckCircle, "Estado: upnp_ok · Puerto público listo")
+                        NetworkStateKind.CGNAT -> Quad(Color(0xFFFFFBEB), Color(0xFFB45309), Icons.Default.Warning, "Estado: cgnat · Usa túnel (playit.gg / Tailscale)")
+                        NetworkStateKind.LOCAL_ONLY -> Quad(Color(0xFFF1F5F9), Color(0xFF334155), Icons.Default.Info, "Estado: local_only · Sin UPnP IGD en router")
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(stateBg)
+                            .border(1.dp, stateColor.copy(alpha = 0.25f), RoundedCornerShape(10.dp))
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = stateIcon,
+                            contentDescription = net.networkState.id,
+                            tint = stateColor,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = stateTitle,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = stateColor
+                        )
+                    }
                     Text(
-                        "Loopback: ${net.loopbackHint}\nLAN Wi-Fi: ${net.lanIp}\nUPnP IGD: ${net.upnpStatus}",
+                        "Loopback: ${net.loopbackHint}\nLAN Wi-Fi: ${net.lanIp}\nIP Pública (ipify): ${net.publicIp ?: "no disponible"}\nUPnP IGD: ${net.upnpStatus}${if (net.igdWanIp != null) " (WAN ${net.igdWanIp})" else ""}\nBind: v4=${net.bindV4} · v6=${net.bindV6} (v6only=${net.ipv6V6Only})",
                         fontFamily = FontFamily.Monospace,
                         fontSize = 12.sp
                     )
@@ -288,6 +324,8 @@ fun SurvivalNetworkScreen(
         }
     }
 }
+
+private data class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
 @Composable
 private fun ChecklistRow(title: String, passed: Boolean, onAction: () -> Unit) {

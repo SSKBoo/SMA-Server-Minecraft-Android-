@@ -57,6 +57,7 @@ import com.bedrockdroid.rs.model.LogBuffer
 import com.bedrockdroid.rs.model.LogLevel
 import com.bedrockdroid.rs.model.LogStream
 import com.bedrockdroid.rs.model.NetworkProbeReport
+import com.bedrockdroid.rs.model.NetworkStateKind
 import com.bedrockdroid.rs.model.ServerRuntimeState
 
 private enum class ConsoleLogFilter(val label: String) {
@@ -269,20 +270,20 @@ fun StatusCard(
 
                 val netSnapshot = effectiveNetwork
                 if (netSnapshot != null) {
-                    val netLabel = when {
-                        netSnapshot.upnpStatus == "igd_gateway_found" -> "${netSnapshot.lanIp} · UPnP OK"
-                        netSnapshot.lanIp != "127.0.0.1" -> "LAN ${netSnapshot.lanIp}"
-                        else -> "Local ${netSnapshot.lanIp}"
+                    val netLabel = when (netSnapshot.networkState) {
+                        NetworkStateKind.UPNP_OK -> "${netSnapshot.lanIp} · upnp_ok"
+                        NetworkStateKind.CGNAT -> "${netSnapshot.lanIp} · CGNAT"
+                        NetworkStateKind.LOCAL_ONLY -> if (netSnapshot.lanIp != "127.0.0.1") "LAN ${netSnapshot.lanIp}" else "Local ${netSnapshot.lanIp}"
                     }
                     Text(
                         text = netLabel,
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.SemiBold,
-                        color = if (netSnapshot.upnpStatus == "igd_gateway_found" || netSnapshot.lanIp != "127.0.0.1") {
-                            Color(0xFF047857)
-                        } else {
-                            Color(0xFF0F172A)
+                        color = when (netSnapshot.networkState) {
+                            NetworkStateKind.UPNP_OK -> Color(0xFF047857)
+                            NetworkStateKind.CGNAT -> Color(0xFFD97706)
+                            NetworkStateKind.LOCAL_ONLY -> if (netSnapshot.lanIp != "127.0.0.1") Color(0xFF047857) else Color(0xFF0F172A)
                         },
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis

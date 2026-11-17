@@ -109,11 +109,15 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_prob
     enable_upnp: jboolean,
     dual_stack_ipv6: jboolean,
 ) -> jstring {
-    let report = net::upnp_nat::probe_local_and_wan(
+    let active_bind = runtime::current_bind_report()
+        .map(|b| (b.bind_v4, b.bind_v6, b.ipv6_v6only));
+    let report = net::upnp_nat::probe_local_and_wan_with_bind(
         bedrock_port as u16,
         java_port as u16,
         enable_upnp == JNI_TRUE,
         dual_stack_ipv6 == JNI_TRUE,
+        active_bind,
+        true,
     );
     into_jstring_or_null(&env, report)
 }

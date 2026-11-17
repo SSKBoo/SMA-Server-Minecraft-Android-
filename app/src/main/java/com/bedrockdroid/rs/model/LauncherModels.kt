@@ -74,13 +74,25 @@ data class HardwareScanReport(
     val recommendedMtu: Int
 )
 
+enum class NetworkStateKind(val id: String, val label: String) {
+    UPNP_OK("upnp_ok", "UPnP OK"),
+    CGNAT("cgnat", "CGNAT"),
+    LOCAL_ONLY("local_only", "Solo Local")
+}
+
 data class NetworkProbeReport(
     val lanIp: String,
     val loopbackHint: String,
     val upnpStatus: String,
     val dualStackV6: Boolean,
     val isLikelyCgnat: Boolean,
-    val guidance: String
+    val guidance: String,
+    val networkState: NetworkStateKind = if (upnpStatus == "igd_gateway_found") NetworkStateKind.UPNP_OK else NetworkStateKind.LOCAL_ONLY,
+    val publicIp: String? = null,
+    val igdWanIp: String? = null,
+    val bindV4: String = "0.0.0.0",
+    val bindV6: String = "none",
+    val ipv6V6Only: Boolean = false
 )
 
 data class SurvivalChecklistState(

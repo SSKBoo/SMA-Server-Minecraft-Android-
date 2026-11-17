@@ -1,0 +1,16 @@
+# Artefactos Android / Gradle
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# Artefactos Rust (regla permanente: nunca ignorar rust-core/Cargo.lock para builds --locked)
+rust-core/target/
+app/src/main/jniLibs/
+!rust-core/Cargo.lock
