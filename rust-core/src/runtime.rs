@@ -112,19 +112,19 @@ fn encode_varuint32(mut value: u32, out: &mut Vec<u8>) {
     }
 }
 
-/// Decodifica el primer ID de subpaquete dentro de un wrapper Batch de Bedrock (con o sin cabecera 0xFE).
+/// Decodifica el primer ID de subpaquete dentro de un wrapper Batch estándar de Bedrock (cabecera obligatoria 0xFE).
 pub fn decode_bedrock_batch_packet_id(payload: &[u8]) -> Option<u32> {
-    if payload.is_empty() {
+    if payload.first().copied() != Some(0xfe) || payload.len() < 2 {
         return None;
     }
-    let body = if payload.first().copied() == Some(0xfe) {
-        if payload.len() < 2 {
-            return None;
-        }
-        &payload[1..]
-    } else {
-        payload
-    };
+    decode_nethernet_batch_packet_id(&payload[1..])
+}
+
+/// Decodifica el primer ID de subpaquete dentro de un Batch sin cabecera 0xFE (formato NetherNet WebRTC).
+pub fn decode_nethernet_batch_packet_id(body: &[u8]) -> Option<u32> {
+    if body.is_empty() {
+        return None;
+    }
     if let Some((subpkt_len, len_bytes)) = decode_varuint32(body) {
         if subpkt_len > 0 && body.len() >= len_bytes.saturating_add(subpkt_len as usize) {
             if let Some(subpkt) = body.get(len_bytes..) {
@@ -1057,6 +1057,10 @@ mod tests {
         let sample = [0xfe, 0x05, 0xc1, 0x01, 0x00, 0x00, 0x08, 0xb1];
         assert_eq!(decode_bedrock_batch_packet_id(&sample), Some(0xc1));
         assert_eq!(decode_bedrock_batch_packet_id(&[0x01, 0x02]), None);
+        // Batch sin cabecera 0xFE (formato nativo NetherNet WebRTC)
+        assert_eq!(decode_nethernet_batch_packet_id(&sample[1..]), Some(0xc1));
+        // Longitud declarada mayor que los bytes disponibles -> inválido (None)
+        assert_eq!(decode_nethernet_batch_packet_id(&[0x05, 0x01, 0x02]), None);
     }
 
     #[test]
