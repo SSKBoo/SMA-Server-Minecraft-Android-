@@ -261,6 +261,15 @@ struct CatchUnwindFuture<F> {
     inner: std::pin::Pin<Box<F>>,
 }
 
+impl<F> CatchUnwindFuture<F> {
+    fn new(label: &'static str, fut: F) -> Self {
+        Self {
+            label,
+            inner: Box::pin(fut),
+        }
+    }
+}
+
 impl<F: std::future::Future<Output = ()>> std::future::Future for CatchUnwindFuture<F> {
     type Output = ();
 
@@ -297,10 +306,7 @@ fn spawn_protected<F>(label: &'static str, fut: F) -> tokio::task::JoinHandle<()
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(CatchUnwindFuture {
-        label,
-        inner: Box::pin(fut),
-    })
+    tokio::spawn(CatchUnwindFuture::new(label, fut))
 }
 
 pub fn set_player_event_hook(hook: Option<PlayerEventHook>) {
@@ -1888,6 +1894,7 @@ pub fn current_engine_state() -> EngineState {
 }
 
 pub fn start_runtime(max_ram_mb: u32, blocking_threads: usize) -> Result<String, String> {
+    init_android_logging();
     if current_engine_state() == EngineState::Running {
         return Err("Server is already running. Stop it first.".to_string());
     }
@@ -2024,9 +2031,7 @@ pub fn start_async_engine(
     let peers: Arc<Mutex<HashMap<u64, PeerSession>>> = Arc::new(Mutex::new(HashMap::new()));
     let udp_shared = Arc::new(udp_socket);
 
-    rt.spawn(CatchUnwindFuture {
-        label: "nethernet_main_loop",
-        inner: Box::pin(async move {
+    rt.spawn(CatchUnwindFuture::new("nethernet_main_loop", async move {
         log::info!(
             "bind_v4 = {} | bind_v6 = {} | ipv6_v6only = {}",
             bind_report_for_log.bind_v4,
