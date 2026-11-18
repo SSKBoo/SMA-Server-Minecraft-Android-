@@ -77,6 +77,7 @@ pub struct SessionProgress {
     pub player_uuid: [u8; 16],
     pub player_auth_input_count: u64,
     pub latency_ping_count: u64,
+    pub keepalives_sent: u64,
     pub movement_tick: u64,
     pub last_packet_id: Option<u32>,
     pub last_packet_name: String,
@@ -961,10 +962,20 @@ fn zigzag32(n: i32) -> u32 {
     ((n << 1) ^ (n >> 31)) as u32
 }
 
-/// Calcula el hash FNV-1a 32-bit de un compuesto NBT little-endian de estado de bloque Bedrock.
-/// Serializa directamente sin pasar por `HashMap` ni `nbtx::nbt::ser::write_map` (`PeekMapIter`).
+/// Calcula el checksum FNV-1a de 32 bits sobre cualquier payload binario (bloques y diagnóstico de chunks).
+pub fn fnv1a_32_checksum(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Calcula el hash FNV-1a 32-bit de un compuesto NBT little-endian de estado de bloque Bedrock 1.20+/1.26.
+/// Incluye únicamente `name` y `states` (sin campo `version`) sin pasar por `HashMap` ni `write_map`.
 pub fn block_state_hash_nbtx(block_name: &str) -> u32 {
-    let mut nbt_bytes = Vec::with_capacity(48 + block_name.len());
+    let mut nbt_bytes = Vec::with_capacity(36 + block_name.len());
     // Root TAG_Compound (0x0a) con nombre vacío (u16 LE = 0)
     nbt_bytes.push(0x0a);
     nbt_bytes.extend_from_slice(&0u16.to_le_bytes());
@@ -983,21 +994,10 @@ pub fn block_state_hash_nbtx(block_name: &str) -> u32 {
     nbt_bytes.extend_from_slice(b"states");
     nbt_bytes.push(0x00);
 
-    // 3) TAG_Int "version" = 18_163_713
-    nbt_bytes.push(0x03);
-    nbt_bytes.extend_from_slice(&(7u16).to_le_bytes());
-    nbt_bytes.extend_from_slice(b"version");
-    nbt_bytes.extend_from_slice(&18_163_713i32.to_le_bytes());
-
     // Root TAG_End
     nbt_bytes.push(0x00);
 
-    let mut hash: u32 = 0x811c_9dc5;
-    for &b in &nbt_bytes {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
+    fnv1a_32_checksum(&nbt_bytes)
 }
 
 fn write_bedrock_string(out: &mut Vec<u8>, s: &str) {
@@ -1103,13 +1103,22 @@ pub fn write_nbt_network_compound_from_pairs(
     write_nbt_network_compound_body_from_pairs(entries, out);
 }
 
-fn append_uniform_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, block_hash: u32) {
-    // Formato NETWORK Bedrock v9 (bit 0 = 1 => paleta runtime ZigZag VarInt32, NO formato disk LevelDB)
+fn append_uniform_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, primary_hash: u32, secondary_hash: u32) {
+    // Formato NETWORK Bedrock v9 completo con 1 bit/bloque (0x03 = (1 << 1) | 1):
+    // 128 palabras u32 Little-Endian (512 bytes) + paleta explícita de 2 entradas ZigZag VarInt32.
     out.push(0x09); // SubChunk versión 9
     out.push(0x01); // 1 capa de bloques
     out.push(sub_y as u8);
-    out.push(0x01); // 0 bits por bloque (paleta de 1 valor) + flag network=1
-    encode_varuint32(zigzag32(block_hash as i32), out);
+    out.push(0x03); // 1 bit por bloque + flag network=1 (Little-Endian)
+
+    // Todos los 4096 bloques apuntan al índice 0 (primary_hash) en formato network XZY
+    for _ in 0..128usize {
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    encode_varuint32(zigzag32(2), out); // 2 entradas en paleta
+    encode_varuint32(zigzag32(primary_hash as i32), out);
+    encode_varuint32(zigzag32(secondary_hash as i32), out);
 }
 
 fn append_surface_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, stone_hash: u32, grass_hash: u32) {
@@ -1147,33 +1156,34 @@ fn append_overworld_biomes_and_borders(out: &mut Vec<u8>) {
     out.push(0x00); // border_blocks = 0
 }
 
-/// Genera un chunk vacío (todo `minecraft:air`) usando hashes NBT `nbtx` (9 subchunks: -4..=4).
+/// Genera un chunk vacío (todo `minecraft:air`) usando almacenamiento paletizado 1-bit de red (~4.8 KB, 9 subchunks: -4..=4).
 pub fn build_empty_air_chunk_payload_nbtx() -> Vec<u8> {
     let air_hash = block_state_hash_nbtx("minecraft:air");
-    let mut data = Vec::with_capacity(256);
+    let stone_hash = block_state_hash_nbtx("minecraft:stone");
+    let mut data = Vec::with_capacity(4900);
     for sub_y in -4i8..=4i8 {
-        append_uniform_subchunk_v9(&mut data, sub_y, air_hash);
+        append_uniform_subchunk_v9(&mut data, sub_y, air_hash, stone_hash);
     }
     append_overworld_biomes_and_borders(&mut data);
     data
 }
 
-/// Genera un chunk de spawn seguro con `nbtx`: piedra en `y=-64..62`, césped en `y=63` y aire en `y>=64`,
-/// para que el jugador que aparece en `(0, 64, 0)` no caiga al vacío.
+/// Genera un chunk de spawn seguro en formato NETWORK Little-Endian (~4.8 KB, 9 subchunks: -4..=4):
+/// piedra en `y=-64..62`, césped en `y=63` y aire en `y>=64`, evitando caídas al vacío en `(0, 64, 0)`.
 pub fn build_spawn_chunk_payload_nbtx() -> Vec<u8> {
     let air_hash = block_state_hash_nbtx("minecraft:air");
     let stone_hash = block_state_hash_nbtx("minecraft:stone");
     let grass_hash = block_state_hash_nbtx("minecraft:grass_block");
 
-    let mut data = Vec::with_capacity(768);
+    let mut data = Vec::with_capacity(4900);
     // Subchunks -4..=2 (y = -64..47): sólido de piedra
     for sub_y in -4i8..=2i8 {
-        append_uniform_subchunk_v9(&mut data, sub_y, stone_hash);
+        append_uniform_subchunk_v9(&mut data, sub_y, stone_hash, air_hash);
     }
     // Subchunk 3 (y = 48..63): stone en local_y 0..14 y grass_block en local_y 15 (y=63)
     append_surface_subchunk_v9(&mut data, 3, stone_hash, grass_hash);
     // Subchunk 4 (y = 64..79): todo aire para el jugador en y=64
-    append_uniform_subchunk_v9(&mut data, 4, air_hash);
+    append_uniform_subchunk_v9(&mut data, 4, air_hash, stone_hash);
 
     append_overworld_biomes_and_borders(&mut data);
     data
@@ -1693,6 +1703,47 @@ pub fn build_v2225_set_player_game_type_bytes(game_type: i32) -> Bytes {
     Bytes::from(raw)
 }
 
+/// Construye `SetSpawnPositionPacket` (ID 43 / 0x2b) indicando el punto de aparición del mundo y la brújula.
+pub fn build_v2225_set_spawn_position_packet_bytes(x: i32, y: u32, z: i32, dimension: i32) -> Bytes {
+    let mut raw = Vec::with_capacity(24);
+    encode_varuint32(0x2b, &mut raw); // Packet ID 43 (SetSpawnPosition)
+    encode_varuint32(zigzag32(1), &mut raw); // SpawnType = WorldSpawn (1)
+    // position (NetworkBlockPosition: x zigzag32, y varuint32, z zigzag32)
+    encode_varuint32(zigzag32(x), &mut raw);
+    encode_varuint32(y, &mut raw);
+    encode_varuint32(zigzag32(z), &mut raw);
+    // dimension (Overworld = 0)
+    encode_varuint32(zigzag32(dimension), &mut raw);
+    // spawn_position (BlockPosition)
+    encode_varuint32(zigzag32(x), &mut raw);
+    encode_varuint32(y, &mut raw);
+    encode_varuint32(zigzag32(z), &mut raw);
+    Bytes::from(raw)
+}
+
+/// Construye `SetDifficultyPacket` (ID 60 / 0x3c) sincronizando la dificultad del mundo (2 = Normal).
+pub fn build_v2225_set_difficulty_packet_bytes(difficulty: u32) -> Bytes {
+    let mut raw = Vec::with_capacity(6);
+    encode_varuint32(0x3c, &mut raw); // Packet ID 60 (SetDifficulty)
+    encode_varuint32(difficulty, &mut raw);
+    Bytes::from(raw)
+}
+
+/// Construye `GameRulesChangedPacket` (ID 72 / 0x48) con reglas básicas (`showcoordinates`, `dodaylightcycle`).
+pub fn build_v2225_game_rules_changed_packet_bytes() -> Bytes {
+    let mut raw = Vec::with_capacity(48);
+    encode_varuint32(0x48, &mut raw); // Packet ID 72 (GameRulesChanged)
+    encode_varuint32(2, &mut raw);    // 2 reglas
+
+    for (name, val) in [("showcoordinates", true), ("dodaylightcycle", true)] {
+        write_bedrock_string(&mut raw, name);
+        raw.push(1);                      // editable = true
+        encode_varuint32(1, &mut raw);    // type = 1 (Boolean)
+        raw.push(if val { 1 } else { 0 });
+    }
+    Bytes::from(raw)
+}
+
 #[cfg(feature = "protocol-core")]
 pub fn send_spawn_chunks(
     conn: &mut Connection,
@@ -1718,6 +1769,7 @@ pub fn send_spawn_chunks(
 
     let spawn_chunk_template = build_spawn_chunk_payload_nbtx();
     let payload_size = spawn_chunk_template.len();
+    let payload_checksum = fnv1a_32_checksum(&spawn_chunk_template);
     let mut first_packet_size = 0usize;
     let mut sent_count = 0usize;
     for (cx, cz) in coords {
@@ -1743,10 +1795,11 @@ pub fn send_spawn_chunks(
     }
 
     log::info!(
-        "[Bedrock World] {} chunks network generados (chunk (0,0) primero: payload={} bytes, packet={} bytes, subchunks=9, suelo stone/grass y=63, aire y>=64, biome_id={} Plains) + NetworkChunkPublisherUpdate enviados a {}",
+        "[Bedrock World] {} chunks network generados (chunk (0,0) primero: payload={} bytes, packet={} bytes, checksum=0x{:08x}, subchunks=9, suelo stone/grass y=63, aire y>=64, biome_id={} Plains) + NetworkChunkPublisherUpdate enviados a {}",
         sent_count,
         payload_size,
         first_packet_size,
+        payload_checksum,
         DEFAULT_SPAWN_BIOME_ID,
         peer_addr
     );
@@ -1889,18 +1942,29 @@ pub fn send_world_start_and_spawn(
             }
 
             if !progress.has_sent_world_registries {
+                let spawn_pos_bytes = build_v2225_set_spawn_position_packet_bytes(0, 64, 0, 0);
+                let difficulty_bytes = build_v2225_set_difficulty_packet_bytes(2);
+                let gamerules_bytes = build_v2225_game_rules_changed_packet_bytes();
                 let biome_bytes = build_v2225_biome_definition_list_bytes();
                 let entity_bytes = build_v2225_available_entity_identifiers_bytes();
                 let item_bytes = build_v2225_item_component_registry_bytes();
                 let creative_bytes = build_v2225_creative_content_bytes();
 
-                for pkt_bytes in [biome_bytes, entity_bytes, item_bytes, creative_bytes] {
+                for pkt_bytes in [
+                    spawn_pos_bytes,
+                    difficulty_bytes,
+                    gamerules_bytes,
+                    biome_bytes,
+                    entity_bytes,
+                    item_bytes,
+                    creative_bytes,
+                ] {
                     let batch = session.encode(&[pkt_bytes]);
                     conn.send(batch, now);
                 }
                 progress.has_sent_world_registries = true;
                 log::info!(
-                    "[Bedrock Session] Registros iniciales enviados a {}: BiomeDefinitionList (0x7a), AvailableEntityIdentifiers (0x77), ItemRegistry (0xa2), CreativeContent (0x91)",
+                    "[Bedrock Session] Entorno y registros enviados a {}: SetSpawnPosition (0x2b), SetDifficulty (0x3c), GameRulesChanged (0x48), BiomeDefinitionList (0x7a), AvailableEntityIdentifiers (0x77), ItemRegistry (0xa2), CreativeContent (0x91)",
                     peer_addr
                 );
             }
@@ -2362,7 +2426,7 @@ pub fn format_disconnect_debug_summary(
         "cierre de transporte WebRTC"
     };
     format!(
-        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | chunk_radius={} | spawn_init={}",
+        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | chunk_radius={} | spawn_init={}",
         remote_addr,
         sid,
         reason,
@@ -2370,6 +2434,7 @@ pub fn format_disconnect_debug_summary(
         hint,
         progress.player_auth_input_count,
         progress.latency_ping_count,
+        progress.keepalives_sent,
         progress.has_sent_chunk_radius,
         progress.set_local_player_initialized
     )
@@ -3100,6 +3165,8 @@ pub fn start_async_engine(
         // Bucle principal: acepta señalización HTTP (/v1/join), recibe datagramas UDP WebRTC y despacha Event
         let mut udp_buf = [0u8; 65535];
         let mut rtc_tick = tokio::time::interval(Duration::from_millis(20));
+        let mut keepalive_tick = tokio::time::interval(Duration::from_secs(2));
+        keepalive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         const RAKNET_MAGIC: [u8; 16] = [
             0x00, 0xFF, 0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFE, 0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34,
@@ -3292,6 +3359,45 @@ pub fn start_async_engine(
                         drop(guard);
                         for _ in 0..logged_out_count {
                             notify_player_disconnect();
+                        }
+                    }
+                    for (dest, data) in outbound {
+                        if dest.is_ipv6() {
+                            if let Some(ref v6) = udp_v6_shared {
+                                let _ = v6.send_to(&data, dest).await;
+                            }
+                        } else {
+                            let _ = udp_shared.send_to(&data, dest).await;
+                        }
+                    }
+                }
+                _ = keepalive_tick.tick() => {
+                    let now = Instant::now();
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+                    if let Ok(mut guard) = peers.lock() {
+                        for peer in guard.values_mut() {
+                            if peer.progress.has_sent_start_game {
+                                let ping_pkt = build_network_stack_latency_packet_bytes(ts, true);
+                                let batch = peer.session.encode(&[ping_pkt]);
+                                peer.conn.send(batch, now);
+                                peer.progress.keepalives_sent =
+                                    peer.progress.keepalives_sent.saturating_add(1);
+                                if peer.progress.keepalives_sent == 1 || peer.progress.keepalives_sent % 15 == 0 {
+                                    log::info!(
+                                        "[Bedrock KeepAlive] NetworkStackLatency (0x73, ts={}) enviado periódicamente (#{}) a {}",
+                                        ts,
+                                        peer.progress.keepalives_sent,
+                                        peer.remote_addr
+                                    );
+                                }
+                                while let Some(tx) = peer.conn.poll_transmit() {
+                                    outbound.push((tx.destination, tx.contents));
+                                }
+                            }
                         }
                     }
                     for (dest, data) in outbound {
@@ -3625,8 +3731,9 @@ mod tests {
 
         let empty_chunk = build_empty_air_chunk_payload_nbtx();
         let spawn_chunk = build_spawn_chunk_payload_nbtx();
-        assert!(!empty_chunk.is_empty());
-        assert!(spawn_chunk.len() > empty_chunk.len());
+        assert!(empty_chunk.len() >= 4096);
+        assert!(spawn_chunk.len() >= 4096);
+        assert_ne!(fnv1a_32_checksum(&empty_chunk), fnv1a_32_checksum(&spawn_chunk));
         // SubChunk -4 (0xFC) con versión v9 (0x09) y 1 capa (0x01)
         assert_eq!(&spawn_chunk[..3], &[0x09, 0x01, (-4i8) as u8]);
         assert_eq!(*spawn_chunk.last().expect("border byte"), 0x00);
@@ -3651,6 +3758,17 @@ mod tests {
         write_nbt_network_compound_from_pairs(&[], &mut empty_nbt);
         assert_eq!(empty_nbt, vec![0x0a, 0x00, 0x00]);
         assert!(start_raw.body.windows(3).any(|w| w == [0x0a, 0x00, 0x00]));
+
+        let spawn_pos_bytes = build_v2225_set_spawn_position_packet_bytes(0, 64, 0, 0);
+        assert_eq!(RawPacket::parse(spawn_pos_bytes).expect("parse set_spawn_position").id, 0x2b);
+
+        let diff_bytes = build_v2225_set_difficulty_packet_bytes(2);
+        assert_eq!(RawPacket::parse(diff_bytes).expect("parse set_difficulty").id, 0x3c);
+
+        let gamerules_bytes = build_v2225_game_rules_changed_packet_bytes();
+        let gamerules_raw = RawPacket::parse(gamerules_bytes).expect("parse gamerules");
+        assert_eq!(gamerules_raw.id, 0x48);
+        assert!(gamerules_raw.body.windows(15).any(|w| w == b"showcoordinates"));
 
         let biome_bytes = build_v2225_biome_definition_list_bytes();
         let biome_raw = RawPacket::parse(biome_bytes).expect("parse biome_definition_list");
