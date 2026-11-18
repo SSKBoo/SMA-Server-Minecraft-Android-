@@ -70,8 +70,11 @@ pub struct SessionProgress {
     pub has_sent_start_game: bool,
     pub has_sent_world_registries: bool,
     pub has_sent_initial_chunks: bool,
+    pub has_sent_player_spawn_entities: bool,
     pub has_sent_chunk_radius: bool,
     pub set_local_player_initialized: bool,
+    pub player_name: String,
+    pub player_uuid: [u8; 16],
     pub player_auth_input_count: u64,
     pub latency_ping_count: u64,
     pub movement_tick: u64,
@@ -997,10 +1000,34 @@ pub fn block_state_hash_nbtx(block_name: &str) -> u32 {
     hash
 }
 
-#[cfg(feature = "protocol-core")]
 fn write_bedrock_string(out: &mut Vec<u8>, s: &str) {
     encode_varuint32(s.len() as u32, out);
     out.extend_from_slice(s.as_bytes());
+}
+
+fn zigzag64(n: i64) -> u64 {
+    ((n << 1) ^ (n >> 63)) as u64
+}
+
+pub fn derive_player_uuid_bytes(player_name: &str) -> [u8; 16] {
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h2: u64 = 0x9e37_79b9_7f4a_7c15;
+    for &b in player_name.as_bytes() {
+        h1 ^= b as u64;
+        h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
+        h2 ^= (b as u64).wrapping_add(0x55);
+        h2 = h2.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&h1.to_le_bytes());
+    out[8..].copy_from_slice(&h2.to_le_bytes());
+    out[6] = (out[6] & 0x0f) | 0x40;
+    out[8] = (out[8] & 0x3f) | 0x80;
+    out
+}
+
+fn write_bedrock_uuid(out: &mut Vec<u8>, uuid_bytes: &[u8; 16]) {
+    out.extend_from_slice(uuid_bytes);
 }
 
 fn write_nbt_net_bytes(bytes: &[u8], out: &mut Vec<u8>) {
@@ -1546,6 +1573,126 @@ pub fn clamp_player_auth_y(y: f32) -> f32 {
     }
 }
 
+/// Construye `PlayerListPacket` (0x3f / 63, acción Add = 0) registrando al jugador con UUID, nombre, XUID y skin válida 64x32.
+pub fn build_v2225_player_list_add_packet_bytes(
+    player_uuid: &[u8; 16],
+    entity_unique_id: i64,
+    username: &str,
+    xuid: &str,
+) -> Bytes {
+    let mut raw = Vec::with_capacity(8400);
+    encode_varuint32(0x3f, &mut raw); // Packet ID 63 (PlayerList)
+    raw.push(0x00);                   // ActionType = Add (0)
+    encode_varuint32(1, &mut raw);    // 1 entrada
+
+    write_bedrock_uuid(&mut raw, player_uuid);
+    encode_varuint64(zigzag64(entity_unique_id), &mut raw);
+    write_bedrock_string(&mut raw, username);
+    write_bedrock_string(&mut raw, xuid);
+    write_bedrock_string(&mut raw, ""); // platform_chat_id
+    raw.extend_from_slice(&1i32.to_le_bytes()); // build_platform = 1 (Android)
+
+    // SerializedSkin mínimo válido (64x32 RGBA = 8192 bytes) sin HashMap
+    write_bedrock_string(&mut raw, "Standard_Steve"); // skin_id
+    write_bedrock_string(&mut raw, "");               // play_fab_id
+    write_bedrock_string(
+        &mut raw,
+        "{\"geometry\":{\"default\":\"geometry.humanoid.custom\"}}",
+    );
+    raw.extend_from_slice(&64u32.to_le_bytes()); // skin_image_width
+    raw.extend_from_slice(&32u32.to_le_bytes()); // skin_image_height
+    let skin_rgba_len = 64usize * 32usize * 4usize;
+    encode_varuint32(skin_rgba_len as u32, &mut raw);
+    raw.resize(raw.len() + skin_rgba_len, 0xff);
+
+    raw.extend_from_slice(&0u32.to_le_bytes()); // animations_count = 0
+    raw.extend_from_slice(&0u32.to_le_bytes()); // cape_image_width = 0
+    raw.extend_from_slice(&0u32.to_le_bytes()); // cape_image_height = 0
+    encode_varuint32(0, &mut raw);             // cape_data vacía
+
+    write_bedrock_string(&mut raw, "");               // geometry_data
+    write_bedrock_string(&mut raw, "");               // geometry_data_engine_version
+    write_bedrock_string(&mut raw, "");               // animation_data
+    write_bedrock_string(&mut raw, "");               // cape_id
+    write_bedrock_string(&mut raw, "Standard_Steve"); // full_id
+    write_bedrock_string(&mut raw, "wide");           // arm_size
+    write_bedrock_string(&mut raw, "#0");             // skin_color
+    raw.extend_from_slice(&0u32.to_le_bytes());        // persona_pieces_count = 0
+    raw.extend_from_slice(&0u32.to_le_bytes());        // piece_tint_colors_count = 0
+    raw.push(0);                                      // is_premium_skin
+    raw.push(0);                                      // is_persona_skin
+    raw.push(0);                                      // is_persona_cape_on_classic
+    raw.push(1);                                      // is_primary_user
+    raw.push(0);                                      // override_appearance
+
+    raw.push(0);                                      // is_teacher
+    raw.push(0);                                      // is_host
+    raw.push(0);                                      // is_sub_client
+    raw.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // player_colour (RGBA)
+    raw.push(1);                                      // verified[0] = true
+
+    Bytes::from(raw)
+}
+
+/// Construye `AddPlayerPacket` (0x0c / 12) para materializar la entidad del jugador en `(0, 64, 0)` con mano vacía (aire).
+#[allow(clippy::too_many_arguments)]
+pub fn build_v2225_add_player_packet_bytes(
+    player_uuid: &[u8; 16],
+    username: &str,
+    entity_unique_id: i64,
+    runtime_id: u64,
+    x: f32,
+    y: f32,
+    z: f32,
+    pitch: f32,
+    yaw: f32,
+) -> Bytes {
+    let mut raw = Vec::with_capacity(192);
+    encode_varuint32(0x0c, &mut raw); // Packet ID 12 (AddPlayer)
+    write_bedrock_uuid(&mut raw, player_uuid);
+    write_bedrock_string(&mut raw, username);
+    encode_varuint64(runtime_id, &mut raw);
+    write_bedrock_string(&mut raw, ""); // platform_chat_id
+
+    // Posición (x, y, z) y velocidad inicial (0, 0, 0)
+    for f in [x, y, z, 0.0f32, 0.0f32, 0.0f32, pitch, yaw, yaw] {
+        raw.extend_from_slice(&f.to_le_bytes());
+    }
+
+    // Ítem en la mano: aire (network_id = 0)
+    encode_varuint32(zigzag32(0), &mut raw);
+    // GameType = Survival (0)
+    encode_varuint32(zigzag32(0), &mut raw);
+    // EntityMetadata vacía + PropertySyncData vacía
+    encode_varuint32(0, &mut raw);
+    encode_varuint32(0, &mut raw);
+    encode_varuint32(0, &mut raw);
+
+    // AbilityData (EntityUniqueID i64 LE, perms=Member, cmd=Normal, 1 layer base)
+    raw.extend_from_slice(&entity_unique_id.to_le_bytes());
+    raw.push(1); // PlayerPermissions = Member
+    raw.push(0); // CommandPermissions = Normal
+    raw.push(1); // 1 AbilityLayer
+    raw.extend_from_slice(&1u16.to_le_bytes());          // LayerType = Base
+    raw.extend_from_slice(&0x0007_FFFFu32.to_le_bytes()); // AbilitiesSet
+    raw.extend_from_slice(&0x0000_00F7u32.to_le_bytes()); // AbilityValues
+    raw.extend_from_slice(&0.05f32.to_le_bytes());        // FlySpeed
+    raw.extend_from_slice(&0.10f32.to_le_bytes());        // WalkSpeed
+
+    encode_varuint32(0, &mut raw);             // EntityLinks = 0
+    write_bedrock_string(&mut raw, "");        // DeviceID
+    raw.extend_from_slice(&1i32.to_le_bytes()); // BuildPlatform = 1 (Android)
+    Bytes::from(raw)
+}
+
+/// Construye `SetPlayerGameTypePacket` (0x3e / 62) para confirmar el modo de juego tras `ServerboundLoadingScreen`.
+pub fn build_v2225_set_player_game_type_bytes(game_type: i32) -> Bytes {
+    let mut raw = Vec::with_capacity(6);
+    encode_varuint32(0x3e, &mut raw); // Packet ID 62 (SetPlayerGameType)
+    encode_varuint32(zigzag32(game_type), &mut raw);
+    Bytes::from(raw)
+}
+
 #[cfg(feature = "protocol-core")]
 pub fn send_spawn_chunks(
     conn: &mut Connection,
@@ -1781,6 +1928,60 @@ pub fn send_world_start_and_spawn(
                 peer_addr
             );
         }
+
+        if !progress.has_sent_player_spawn_entities {
+            let effective_name = if progress.player_name.trim().is_empty() {
+                "Jugador Bedrock".to_string()
+            } else {
+                progress.player_name.clone()
+            };
+            let effective_uuid = if progress.player_uuid == [0u8; 16] {
+                derive_player_uuid_bytes(&effective_name)
+            } else {
+                progress.player_uuid
+            };
+            progress.player_name = effective_name.clone();
+            progress.player_uuid = effective_uuid;
+
+            let list_bytes =
+                build_v2225_player_list_add_packet_bytes(&effective_uuid, 1, &effective_name, "");
+            let add_player_bytes = build_v2225_add_player_packet_bytes(
+                &effective_uuid,
+                &effective_name,
+                1,
+                1,
+                0.0,
+                MIN_SPAWN_SAFE_Y,
+                0.0,
+                0.0,
+                0.0,
+            );
+            let move_bytes = build_v2225_move_player_packet_bytes(
+                1,
+                0.0,
+                MIN_SPAWN_SAFE_Y,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0,
+                true,
+                progress.movement_tick,
+            );
+
+            for pkt_bytes in [list_bytes, add_player_bytes, move_bytes] {
+                let batch = session.encode(&[pkt_bytes]);
+                conn.send(batch, now);
+            }
+            progress.has_sent_player_spawn_entities = true;
+            progress.set_local_player_initialized = true;
+            log::info!(
+                "[Bedrock Session] PlayerList (0x3f) + AddPlayer (0x0c) + MovePlayer (0x13, 0,64,0) enviados a {} (jugador={}, spawn_init=true)",
+                peer_addr,
+                effective_name
+            );
+        }
+
         notify_world_spawn_sent(sent_chunks);
     }
 
@@ -1930,6 +2131,8 @@ pub fn handle_bedrock_session_data(
 
                 if !progress.player_logged_in {
                     progress.player_logged_in = true;
+                    progress.player_name = player_name.clone();
+                    progress.player_uuid = derive_player_uuid_bytes(&player_name);
                     notify_player_login(&player_name);
                 }
 
@@ -2087,6 +2290,27 @@ pub fn handle_bedrock_session_data(
                         peer_addr
                     );
                 }
+            }
+
+            // Pantalla de carga del cliente completada (0x138 / 312 ServerboundLoadingScreen) -> SetPlayerGameType (0x3e) + ChunkRadiusUpdated (0x46)
+            id if id == 0x138 || name == "ServerboundLoadingScreen" => {
+                progress.last_packet_name = "ServerboundLoadingScreen".to_string();
+                if !progress.has_sent_player_spawn_entities {
+                    send_world_start_and_spawn(conn, session, progress, peer_addr, now);
+                }
+                let game_type_bytes = build_v2225_set_player_game_type_bytes(0);
+                let gt_batch = session.encode(&[game_type_bytes]);
+                conn.send(gt_batch, now);
+                #[cfg(feature = "protocol-core")]
+                {
+                    let _ = send_chunk_radius_updated(conn, session, peer_addr, now, 4);
+                    progress.has_sent_chunk_radius = true;
+                }
+                log::info!(
+                    "[Bedrock World] ServerboundLoadingScreen (0x138) recibido de {} -> SetPlayerGameType (0x3e) + ChunkRadiusUpdated (0x46) enviados (spawn_init={})",
+                    peer_addr,
+                    progress.set_local_player_initialized
+                );
             }
 
             // Confirmación del cliente tras aparecer en el mundo (0x71 / 113 SetLocalPlayerAsInitialized)
@@ -3456,6 +3680,34 @@ mod tests {
         let spawn_raw = RawPacket::parse(spawn_bytes).expect("parse player_spawn");
         assert_eq!(spawn_raw.id, 0x02);
 
+        let test_uuid = derive_player_uuid_bytes("SteveDroid");
+        let player_list_bytes = build_v2225_player_list_add_packet_bytes(&test_uuid, 1, "SteveDroid", "");
+        let player_list_raw = RawPacket::parse(player_list_bytes).expect("parse player_list");
+        assert_eq!(player_list_raw.id, 0x3f);
+        assert!(player_list_raw.body.windows(10).any(|w| w == b"SteveDroid"));
+        assert!(player_list_raw.body.windows(14).any(|w| w == b"Standard_Steve"));
+
+        let add_player_bytes = build_v2225_add_player_packet_bytes(
+            &test_uuid,
+            "SteveDroid",
+            1,
+            1,
+            0.0,
+            64.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+        let add_player_raw = RawPacket::parse(add_player_bytes).expect("parse add_player");
+        assert_eq!(add_player_raw.id, 0x0c);
+        assert!(add_player_raw.body.windows(10).any(|w| w == b"SteveDroid"));
+        assert!(add_player_raw.body.windows(4).any(|w| w == 64.0f32.to_le_bytes()));
+
+        let game_type_bytes = build_v2225_set_player_game_type_bytes(0);
+        let game_type_raw = RawPacket::parse(game_type_bytes).expect("parse set_player_game_type");
+        assert_eq!(game_type_raw.id, 0x3e);
+        assert_eq!(game_type_raw.body.as_ref(), &[0x00]);
+
         // Verificar parseo de PlayerAuthInput (0x90) -> MovePlayerPacket (0x13) con Y >= 64.0 y NetworkStackLatency (0x73)
         assert_eq!(clamp_player_auth_y(63.25), 64.0);
         assert_eq!(clamp_player_auth_y(64.0), 64.0);
@@ -3495,6 +3747,7 @@ mod tests {
 
         let mut dbg_prog = SessionProgress::default();
         dbg_prog.has_sent_start_game = true;
+        dbg_prog.set_local_player_initialized = true;
         dbg_prog.last_packet_id = Some(0x90);
         dbg_prog.last_packet_name = "PlayerAuthInput".to_string();
         let dbg_line = format_disconnect_debug_summary(
@@ -3504,6 +3757,7 @@ mod tests {
             "peer closed",
         );
         assert!(dbg_line.contains("Último paquete procesado: PlayerAuthInput (0x90)"));
+        assert!(dbg_line.contains("spawn_init=true"));
     }
 
     #[test]
