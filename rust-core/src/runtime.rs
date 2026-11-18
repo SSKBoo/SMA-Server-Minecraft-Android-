@@ -68,6 +68,7 @@ pub struct SessionProgress {
     pub has_sent_resource_packs_stack: bool,
     pub has_received_client_cache_status: bool,
     pub has_sent_start_game: bool,
+    pub has_sent_world_registries: bool,
     pub has_sent_initial_chunks: bool,
     pub has_sent_chunk_radius: bool,
     pub set_local_player_initialized: bool,
@@ -1018,14 +1019,15 @@ pub enum NbtFieldValue {
     String(String),
 }
 
-/// Serializa un compuesto NBT NetworkLittleEndian desde `Vec<(String, NbtFieldValue)>`
-/// evitando por completo `HashMap`, `nbtx::nbt::ser::write_map` y `facet_reflect::PeekMapIter`.
-pub fn write_nbt_network_compound_from_pairs(
+pub const DEFAULT_SPAWN_BIOME_ID: i32 = 1; // Plains
+pub const MIN_SPAWN_SAFE_Y: f32 = 64.0;
+
+/// Serializa únicamente los campos internos + `TAG_End` de un compuesto NBT NetworkLittleEndian
+/// sin `HashMap` ni `nbtx::nbt::ser::write_map`.
+pub fn write_nbt_network_compound_body_from_pairs(
     entries: &[(String, NbtFieldValue)],
     out: &mut Vec<u8>,
 ) {
-    out.push(0x0a); // TAG_Compound raíz
-    out.push(0x00); // Nombre raíz vacío (varuint32 = 0)
     for (key, val) in entries {
         match val {
             NbtFieldValue::Byte(v) => {
@@ -1063,7 +1065,19 @@ pub fn write_nbt_network_compound_from_pairs(
     out.push(0x00); // TAG_End
 }
 
+/// Serializa un compuesto NBT NetworkLittleEndian desde `Vec<(String, NbtFieldValue)>`
+/// evitando por completo `HashMap`, `nbtx::nbt::ser::write_map` y `facet_reflect::PeekMapIter`.
+pub fn write_nbt_network_compound_from_pairs(
+    entries: &[(String, NbtFieldValue)],
+    out: &mut Vec<u8>,
+) {
+    out.push(0x0a); // TAG_Compound raíz
+    out.push(0x00); // Nombre raíz vacío (varuint32 = 0)
+    write_nbt_network_compound_body_from_pairs(entries, out);
+}
+
 fn append_uniform_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, block_hash: u32) {
+    // Formato NETWORK Bedrock v9 (bit 0 = 1 => paleta runtime ZigZag VarInt32, NO formato disk LevelDB)
     out.push(0x09); // SubChunk versión 9
     out.push(0x01); // 1 capa de bloques
     out.push(sub_y as u8);
@@ -1072,6 +1086,7 @@ fn append_uniform_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, block_hash: u32) {
 }
 
 fn append_surface_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, stone_hash: u32, grass_hash: u32) {
+    // Formato NETWORK Bedrock v9 (bit 0 = 1 => palabras u32 Little-Endian + paleta runtime ZigZag VarInt32)
     out.push(0x09); // SubChunk versión 9
     out.push(0x01); // 1 capa de bloques
     out.push(sub_y as u8);
@@ -1097,10 +1112,10 @@ fn append_surface_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, stone_hash: u32, gra
 }
 
 fn append_overworld_biomes_and_borders(out: &mut Vec<u8>) {
-    // Overworld abarca 24 subchunks de bioma (-64..319); paleta uniforme = 1 (Plains)
+    // Overworld abarca 24 subchunks de bioma (-64..319); paleta uniforme network = DEFAULT_SPAWN_BIOME_ID (1 = Plains)
     for _ in 0..24 {
         out.push(0x01);
-        encode_varuint32(zigzag32(1), out);
+        encode_varuint32(zigzag32(DEFAULT_SPAWN_BIOME_ID), out);
     }
     out.push(0x00); // border_blocks = 0
 }
@@ -1460,6 +1475,77 @@ pub fn send_chunk_radius_updated(
     clamped_radius
 }
 
+/// Construye `BiomeDefinitionListPacket` (0x7a / 122) en formato Bedrock V2225 sin usar `HashMap`.
+pub fn build_v2225_biome_definition_list_bytes() -> Bytes {
+    let mut raw = Vec::with_capacity(8);
+    encode_varuint32(0x7a, &mut raw); // Packet ID 122 (BiomeDefinitionList)
+    encode_varuint32(0, &mut raw);    // biome_definitions (Vec vacío)
+    encode_varuint32(0, &mut raw);    // string_table (Vec vacío)
+    Bytes::from(raw)
+}
+
+/// Construye `AvailableEntityIdentifiersPacket` (0x77 / 119) en NBT NetworkLittleEndian
+/// registrando entidades estáticas básicas (`minecraft:player`, `minecraft:boat`).
+pub fn build_v2225_available_entity_identifiers_bytes() -> Bytes {
+    let mut raw = Vec::with_capacity(192);
+    encode_varuint32(0x77, &mut raw); // Packet ID 119 (AvailableEntityIdentifiers)
+
+    raw.push(0x0a); // TAG_Compound raíz
+    raw.push(0x00); // Nombre raíz vacío (varuint32 = 0)
+    raw.push(0x09); // TAG_List
+    write_nbt_net_bytes(b"idlist", &mut raw);
+    raw.push(0x0a); // Elemento de lista: TAG_Compound
+    encode_varuint32(zigzag32(2), &mut raw); // 2 entidades estáticas (VarInt32 ZigZag)
+
+    let entities = [
+        vec![
+            ("bid".to_string(), NbtFieldValue::String(String::new())),
+            ("hasspawnegg".to_string(), NbtFieldValue::Byte(0)),
+            ("id".to_string(), NbtFieldValue::String("minecraft:player".to_string())),
+            ("rid".to_string(), NbtFieldValue::Int(1)),
+            ("summonable".to_string(), NbtFieldValue::Byte(0)),
+        ],
+        vec![
+            ("bid".to_string(), NbtFieldValue::String(String::new())),
+            ("hasspawnegg".to_string(), NbtFieldValue::Byte(1)),
+            ("id".to_string(), NbtFieldValue::String("minecraft:boat".to_string())),
+            ("rid".to_string(), NbtFieldValue::Int(90)),
+            ("summonable".to_string(), NbtFieldValue::Byte(1)),
+        ],
+    ];
+    for entry in &entities {
+        write_nbt_network_compound_body_from_pairs(entry, &mut raw);
+    }
+    raw.push(0x00); // Root TAG_End
+    Bytes::from(raw)
+}
+
+/// Construye `ItemRegistryPacket` / `ItemComponentPacket` (0xa2 / 162) vacío para inicializar inventario.
+pub fn build_v2225_item_component_registry_bytes() -> Bytes {
+    let mut raw = Vec::with_capacity(6);
+    encode_varuint32(0xa2, &mut raw); // Packet ID 162 (ItemRegistry / ItemComponent)
+    encode_varuint32(0, &mut raw);    // items (Vec vacío)
+    Bytes::from(raw)
+}
+
+/// Construye `CreativeContentPacket` (0x91 / 145) vacío para permitir abrir el inventario creativo/supervivencia sin crash.
+pub fn build_v2225_creative_content_bytes() -> Bytes {
+    let mut raw = Vec::with_capacity(6);
+    encode_varuint32(0x91, &mut raw); // Packet ID 145 (CreativeContent)
+    encode_varuint32(0, &mut raw);    // groups (Vec vacío)
+    encode_varuint32(0, &mut raw);    // items (Vec vacío)
+    Bytes::from(raw)
+}
+
+/// Garantiza que la coordenada `Y` enviada al cliente en `MovePlayerPacket` nunca caiga por debajo del suelo (`64.0`).
+pub fn clamp_player_auth_y(y: f32) -> f32 {
+    if !y.is_finite() || y < MIN_SPAWN_SAFE_Y {
+        MIN_SPAWN_SAFE_Y
+    } else {
+        y
+    }
+}
+
 #[cfg(feature = "protocol-core")]
 pub fn send_spawn_chunks(
     conn: &mut Connection,
@@ -1484,11 +1570,16 @@ pub fn send_spawn_chunks(
     coords.sort_by_key(|&(cx, cz)| (cx * cx + cz * cz, cx.abs(), cz.abs()));
 
     let spawn_chunk_template = build_spawn_chunk_payload_nbtx();
+    let payload_size = spawn_chunk_template.len();
+    let mut first_packet_size = 0usize;
     let mut sent_count = 0usize;
     for (cx, cz) in coords {
         if let Ok(chunk_bytes) =
             build_v2225_level_chunk_packet_bytes(cx, cz, spawn_chunk_template.clone())
         {
+            if first_packet_size == 0 {
+                first_packet_size = chunk_bytes.len();
+            }
             let batch = session.encode(&[chunk_bytes]);
             conn.send(batch, now);
             sent_count += 1;
@@ -1505,8 +1596,11 @@ pub fn send_spawn_chunks(
     }
 
     log::info!(
-        "[Bedrock World] {} chunks nbtx generados (chunk (0,0) primero, suelo stone/grass y=63, aire y>=64) + NetworkChunkPublisherUpdate enviados a {}",
+        "[Bedrock World] {} chunks network generados (chunk (0,0) primero: payload={} bytes, packet={} bytes, subchunks=9, suelo stone/grass y=63, aire y>=64, biome_id={} Plains) + NetworkChunkPublisherUpdate enviados a {}",
         sent_count,
+        payload_size,
+        first_packet_size,
+        DEFAULT_SPAWN_BIOME_ID,
         peer_addr
     );
     sent_count
@@ -1645,6 +1739,23 @@ pub fn send_world_start_and_spawn(
                 Err(err) => {
                     log::warn!("[Bedrock Session] Error codificando StartGamePacket: {}", err);
                 }
+            }
+
+            if !progress.has_sent_world_registries {
+                let biome_bytes = build_v2225_biome_definition_list_bytes();
+                let entity_bytes = build_v2225_available_entity_identifiers_bytes();
+                let item_bytes = build_v2225_item_component_registry_bytes();
+                let creative_bytes = build_v2225_creative_content_bytes();
+
+                for pkt_bytes in [biome_bytes, entity_bytes, item_bytes, creative_bytes] {
+                    let batch = session.encode(&[pkt_bytes]);
+                    conn.send(batch, now);
+                }
+                progress.has_sent_world_registries = true;
+                log::info!(
+                    "[Bedrock Session] Registros iniciales enviados a {}: BiomeDefinitionList (0x7a), AvailableEntityIdentifiers (0x77), ItemRegistry (0xa2), CreativeContent (0x91)",
+                    peer_addr
+                );
             }
 
             if let Ok(time_bytes) = encode_bedrock_v2225_packet(&SetTimePacket { time: 6000 }) {
@@ -1943,10 +2054,11 @@ pub fn handle_bedrock_session_data(
                 progress.player_auth_input_count = progress.player_auth_input_count.saturating_add(1);
                 progress.movement_tick = progress.movement_tick.saturating_add(1);
                 if let Some(input) = parse_player_auth_input_packet(&pkt.body) {
+                    let safe_y = clamp_player_auth_y(input.y);
                     let move_bytes = build_v2225_move_player_packet_bytes(
                         1,
                         input.x,
-                        input.y,
+                        safe_y,
                         input.z,
                         input.pitch,
                         input.yaw,
@@ -1959,11 +2071,12 @@ pub fn handle_bedrock_session_data(
                     conn.send(batch, now);
                     if progress.player_auth_input_count == 1 || progress.player_auth_input_count % 40 == 0 {
                         log::info!(
-                            "[Bedrock Move] PlayerAuthInput (0x90) #{} de {} (pos={:.2},{:.2},{:.2}) -> MovePlayerPacket (0x13) enviado",
+                            "[Bedrock Move] PlayerAuthInput (0x90) #{} de {} (raw_y={:.2}, pos={:.2},{:.2},{:.2}) -> MovePlayerPacket (0x13) enviado",
                             progress.player_auth_input_count,
                             peer_addr,
-                            input.x,
                             input.y,
+                            input.x,
+                            safe_y,
                             input.z
                         );
                     }
@@ -3315,6 +3428,24 @@ mod tests {
         assert_eq!(empty_nbt, vec![0x0a, 0x00, 0x00]);
         assert!(start_raw.body.windows(3).any(|w| w == [0x0a, 0x00, 0x00]));
 
+        let biome_bytes = build_v2225_biome_definition_list_bytes();
+        let biome_raw = RawPacket::parse(biome_bytes).expect("parse biome_definition_list");
+        assert_eq!(biome_raw.id, 0x7a);
+        assert_eq!(biome_raw.body.as_ref(), &[0x00, 0x00]);
+
+        let entity_bytes = build_v2225_available_entity_identifiers_bytes();
+        let entity_raw = RawPacket::parse(entity_bytes).expect("parse available_entity_identifiers");
+        assert_eq!(entity_raw.id, 0x77);
+        assert!(entity_raw.body.windows(6).any(|w| w == b"idlist"));
+        assert!(entity_raw.body.windows(16).any(|w| w == b"minecraft:player"));
+        assert!(entity_raw.body.windows(14).any(|w| w == b"minecraft:boat"));
+
+        let item_reg_bytes = build_v2225_item_component_registry_bytes();
+        assert_eq!(RawPacket::parse(item_reg_bytes).expect("parse item_registry").id, 0xa2);
+
+        let creative_bytes = build_v2225_creative_content_bytes();
+        assert_eq!(RawPacket::parse(creative_bytes).expect("parse creative_content").id, 0x91);
+
         let chunk_bytes =
             build_v2225_level_chunk_packet_bytes(0, 0, build_spawn_chunk_payload_nbtx())
                 .expect("level_chunk");
@@ -3325,7 +3456,11 @@ mod tests {
         let spawn_raw = RawPacket::parse(spawn_bytes).expect("parse player_spawn");
         assert_eq!(spawn_raw.id, 0x02);
 
-        // Verificar parseo de PlayerAuthInput (0x90) -> MovePlayerPacket (0x13) y NetworkStackLatency (0x73)
+        // Verificar parseo de PlayerAuthInput (0x90) -> MovePlayerPacket (0x13) con Y >= 64.0 y NetworkStackLatency (0x73)
+        assert_eq!(clamp_player_auth_y(63.25), 64.0);
+        assert_eq!(clamp_player_auth_y(64.0), 64.0);
+        assert_eq!(clamp_player_auth_y(65.62), 65.62);
+
         let mut auth_body = Vec::new();
         for f in [12.5f32, 90.0f32, 1.25f32, 65.62f32, -2.5f32, 0.0f32, 1.0f32, 91.0f32] {
             auth_body.extend_from_slice(&f.to_le_bytes());
@@ -3336,7 +3471,7 @@ mod tests {
         let move_pkt = build_v2225_move_player_packet_bytes(
             1,
             parsed_auth.x,
-            parsed_auth.y,
+            clamp_player_auth_y(parsed_auth.y),
             parsed_auth.z,
             parsed_auth.pitch,
             parsed_auth.yaw,
