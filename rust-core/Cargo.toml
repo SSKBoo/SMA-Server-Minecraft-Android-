@@ -34,8 +34,8 @@ acacia-session = "0.1.0"
 p384 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 
-# NBT little-endian (para hashes de estados de bloque y chunks básicos en Fase 4) y UUID v2225
-nbtx = { git = "https://github.com/bedrock-crustaceans/nbtx" }
+# NBT little-endian parcheado (SSKBoo/nbtx-SD: fix SIGABRT en write_map / StartGamePacket) y UUID v2225
+nbtx = { git = "https://github.com/SSKBoo/nbtx-SD.git", branch = "main" }
 uuid = { version = "1.11.0", features = ["v4", "serde"] }
 
 # Runtime asíncrono multi-hilo para NetherNet, señalización HTTP y Game Loop
@@ -76,3 +76,11 @@ strip = false
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[patch.crates-io]
+# Parches SSKBoo para resolver crash nativo SIGABRT en nbtx::write_map + facet-reflect (StartGamePacket)
+nbtx = { git = "https://github.com/SSKBoo/nbtx-SD.git", branch = "main" }
+facet-reflect = { git = "https://github.com/SSKBoo/facet-SD.git", branch = "main" }
+
+[patch."https://github.com/bedrock-crustaceans/nbtx"]
+nbtx = { git = "https://github.com/SSKBoo/nbtx-SD.git", branch = "main" }
