@@ -1505,18 +1505,6 @@ pub fn handle_bedrock_session_data(
 
             // TAREA 3.2: Login (0x01) -> ServerToClientHandshake (0x03) + PlayStatus::LoginSuccess (0x02) + callback JNI
             id if id == Login::ID => {
-                // [P2] Prueba temporal de aislamiento de paquetes sospechosos de SIGABRT/free()
-                const ISOLATE_PROBLEMATIC_PACKETS: bool = true;
-                if ISOLATE_PROBLEMATIC_PACKETS {
-                    log::info!(
-                        "Paquete recibido, procesamiento saltado (Login 0x{:02x}, {} bytes desde {})",
-                        pkt.id,
-                        pkt.body.len(),
-                        peer_addr
-                    );
-                    return;
-                }
-
                 if !progress.has_sent_network_settings {
                     log::warn!(
                         "[Bedrock Login] Login (0x01) recibido antes de NetworkSettings desde {}",
@@ -1618,18 +1606,6 @@ pub fn handle_bedrock_session_data(
             // FASE 4 P0/P1: Al recibir ClientCacheStatus (0x81 / 129), enviar secuencia de recursos si falta,
             // VoxelShapesPacket, StartGamePacket (0x0b), SetTimePacket (0x0a), Chunks iniciales nbtx y PlayStatus::PlayerSpawn (0x02).
             id if id == ClientCacheStatus::ID || id == 0x81 => {
-                // [P2] Prueba temporal de aislamiento antes de construir StartGamePacket / nbtx
-                const ISOLATE_PROBLEMATIC_PACKETS: bool = true;
-                if ISOLATE_PROBLEMATIC_PACKETS {
-                    log::info!(
-                        "Paquete recibido, procesamiento saltado (ClientCacheStatus 0x{:02x}, {} bytes desde {})",
-                        pkt.id,
-                        pkt.body.len(),
-                        peer_addr
-                    );
-                    return;
-                }
-
                 progress.has_received_client_cache_status = true;
                 let cache_enabled = pkt
                     .decode::<ClientCacheStatus>()
