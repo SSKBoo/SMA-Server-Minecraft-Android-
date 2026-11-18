@@ -986,47 +986,57 @@ fn write_nbt_net_bytes(bytes: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(bytes);
 }
 
-/// Serializa un compuesto NBT NetworkLittleEndian desde `Vec<(String, nbtx::Value)>`
-/// evitando por completo `HashMap` y `facet_reflect::PeekMapIter`.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub enum NbtFieldValue {
+    Byte(i8),
+    Short(i16),
+    Int(i32),
+    Float(f32),
+    Double(f64),
+    String(String),
+}
+
+/// Serializa un compuesto NBT NetworkLittleEndian desde `Vec<(String, NbtFieldValue)>`
+/// evitando por completo `HashMap`, `nbtx::nbt::ser::write_map` y `facet_reflect::PeekMapIter`.
 pub fn write_nbt_network_compound_from_pairs(
-    entries: &[(String, nbtx::Value)],
+    entries: &[(String, NbtFieldValue)],
     out: &mut Vec<u8>,
 ) {
     out.push(0x0a); // TAG_Compound raíz
     out.push(0x00); // Nombre raíz vacío (varuint32 = 0)
     for (key, val) in entries {
         match val {
-            nbtx::Value::Byte(v) => {
+            NbtFieldValue::Byte(v) => {
                 out.push(0x01);
                 write_nbt_net_bytes(key.as_bytes(), out);
                 out.push(*v as u8);
             }
-            nbtx::Value::Short(v) => {
+            NbtFieldValue::Short(v) => {
                 out.push(0x02);
                 write_nbt_net_bytes(key.as_bytes(), out);
                 out.extend_from_slice(&v.to_le_bytes());
             }
-            nbtx::Value::Int(v) => {
+            NbtFieldValue::Int(v) => {
                 out.push(0x03);
                 write_nbt_net_bytes(key.as_bytes(), out);
                 encode_varuint32(zigzag32(*v), out);
             }
-            nbtx::Value::Float(v) => {
+            NbtFieldValue::Float(v) => {
                 out.push(0x05);
                 write_nbt_net_bytes(key.as_bytes(), out);
                 out.extend_from_slice(&v.to_le_bytes());
             }
-            nbtx::Value::Double(v) => {
+            NbtFieldValue::Double(v) => {
                 out.push(0x06);
                 write_nbt_net_bytes(key.as_bytes(), out);
                 out.extend_from_slice(&v.to_le_bytes());
             }
-            nbtx::Value::String(s) => {
+            NbtFieldValue::String(s) => {
                 out.push(0x08);
                 write_nbt_net_bytes(key.as_bytes(), out);
                 write_nbt_net_bytes(s.as_bytes(), out);
             }
-            _ => {}
         }
     }
     out.push(0x00); // TAG_End
@@ -1219,9 +1229,9 @@ pub fn build_v2225_start_game_packet_bytes() -> Result<Bytes, String> {
     };
 
     // Workaround SIGABRT en nbtx::nbt::ser::write_map / facet_reflect::PeekMapIter::drop:
-    // Reemplazamos player_property_data (HashMap) por Vec<(String, nbtx::Value)> y serializamos
+    // Reemplazamos player_property_data (HashMap) por Vec<(String, NbtFieldValue)> y serializamos
     // campo por campo el paquete StartGamePacket::<V2225> (ID 0x0b) sin invocar HashMap/write_map.
-    let player_property_pairs: Vec<(String, nbtx::Value)> = Vec::new();
+    let player_property_pairs: Vec<(String, NbtFieldValue)> = Vec::new();
 
     let mut raw = Vec::with_capacity(384);
     let header = BedrockPacketHeader {
