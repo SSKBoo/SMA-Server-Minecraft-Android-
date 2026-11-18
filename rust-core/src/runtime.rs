@@ -936,15 +936,36 @@ fn zigzag32(n: i32) -> u32 {
     ((n << 1) ^ (n >> 31)) as u32
 }
 
-/// Calcula el hash FNV-1a 32-bit de un compuesto NBT little-endian (`nbtx`) de estado de bloque Bedrock.
+/// Calcula el hash FNV-1a 32-bit de un compuesto NBT little-endian de estado de bloque Bedrock.
+/// Serializa directamente sin pasar por `HashMap` ni `nbtx::nbt::ser::write_map` (`PeekMapIter`).
 pub fn block_state_hash_nbtx(block_name: &str) -> u32 {
-    let mut root = nbtx::Compound::new();
-    root.insert("name".into(), nbtx::Value::String(block_name.into()));
-    root.insert("states".into(), nbtx::Value::Compound(nbtx::Compound::new()));
-    root.insert("version".into(), nbtx::Value::Int(18_163_713));
+    let mut nbt_bytes = Vec::with_capacity(48 + block_name.len());
+    // Root TAG_Compound (0x0a) con nombre vacío (u16 LE = 0)
+    nbt_bytes.push(0x0a);
+    nbt_bytes.extend_from_slice(&0u16.to_le_bytes());
 
-    let nbt_bytes = nbtx::to_le_bytes(&nbtx::Value::Compound(root))
-        .unwrap_or_else(|_| block_name.as_bytes().to_vec());
+    // 1) TAG_String "name" = block_name
+    nbt_bytes.push(0x08);
+    nbt_bytes.extend_from_slice(&(4u16).to_le_bytes());
+    nbt_bytes.extend_from_slice(b"name");
+    let name_bytes = block_name.as_bytes();
+    nbt_bytes.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+    nbt_bytes.extend_from_slice(name_bytes);
+
+    // 2) TAG_Compound "states" = {}
+    nbt_bytes.push(0x0a);
+    nbt_bytes.extend_from_slice(&(6u16).to_le_bytes());
+    nbt_bytes.extend_from_slice(b"states");
+    nbt_bytes.push(0x00);
+
+    // 3) TAG_Int "version" = 18_163_713
+    nbt_bytes.push(0x03);
+    nbt_bytes.extend_from_slice(&(7u16).to_le_bytes());
+    nbt_bytes.extend_from_slice(b"version");
+    nbt_bytes.extend_from_slice(&18_163_713i32.to_le_bytes());
+
+    // Root TAG_End
+    nbt_bytes.push(0x00);
 
     let mut hash: u32 = 0x811c_9dc5;
     for &b in &nbt_bytes {
@@ -952,6 +973,63 @@ pub fn block_state_hash_nbtx(block_name: &str) -> u32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
+}
+
+#[cfg(feature = "protocol-core")]
+fn write_bedrock_string(out: &mut Vec<u8>, s: &str) {
+    encode_varuint32(s.len() as u32, out);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn write_nbt_net_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    encode_varuint32(bytes.len() as u32, out);
+    out.extend_from_slice(bytes);
+}
+
+/// Serializa un compuesto NBT NetworkLittleEndian desde `Vec<(String, nbtx::Value)>`
+/// evitando por completo `HashMap` y `facet_reflect::PeekMapIter`.
+pub fn write_nbt_network_compound_from_pairs(
+    entries: &[(String, nbtx::Value)],
+    out: &mut Vec<u8>,
+) {
+    out.push(0x0a); // TAG_Compound raíz
+    out.push(0x00); // Nombre raíz vacío (varuint32 = 0)
+    for (key, val) in entries {
+        match val {
+            nbtx::Value::Byte(v) => {
+                out.push(0x01);
+                write_nbt_net_bytes(key.as_bytes(), out);
+                out.push(*v as u8);
+            }
+            nbtx::Value::Short(v) => {
+                out.push(0x02);
+                write_nbt_net_bytes(key.as_bytes(), out);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            nbtx::Value::Int(v) => {
+                out.push(0x03);
+                write_nbt_net_bytes(key.as_bytes(), out);
+                encode_varuint32(zigzag32(*v), out);
+            }
+            nbtx::Value::Float(v) => {
+                out.push(0x05);
+                write_nbt_net_bytes(key.as_bytes(), out);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            nbtx::Value::Double(v) => {
+                out.push(0x06);
+                write_nbt_net_bytes(key.as_bytes(), out);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            nbtx::Value::String(s) => {
+                out.push(0x08);
+                write_nbt_net_bytes(key.as_bytes(), out);
+                write_nbt_net_bytes(s.as_bytes(), out);
+            }
+            _ => {}
+        }
+    }
+    out.push(0x00); // TAG_End
 }
 
 fn append_uniform_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, block_hash: u32) {
@@ -1063,108 +1141,152 @@ pub fn build_v2225_start_game_packet_bytes() -> Result<Bytes, String> {
     };
     use bedrock::protocol::v818::types::SyncedPlayerMovementSettings;
     use bedrock::protocol::v944::types::NetworkBlockPosition;
-    use bedrock::protocol::V2225;
+    use bedrock::protocol::{Packet, PacketHeader as BedrockPacketHeader, ProtoCodec as BedrockProtoCodec, V2225};
 
-    let pkt = StartGamePacket::<V2225> {
-        target_actor_id: ActorUniqueID(1),
-        target_runtime_id: ActorRuntimeID(1),
-        actor_game_type: GameType::Survival,
-        position: (0.0, 64.0, 0.0),
-        rotation: (0.0, 0.0),
-        settings: LevelSettings::<V2225> {
-            seed: 1,
-            spawn_settings: SpawnSettings::<V2225> {
-                spawn_type: SpawnBiomeType::Default,
-                user_defined_biome_name: String::new(),
-                dimension: 0,
-            },
-            generator_type: GeneratorType::Flat,
-            game_type: GameType::Survival,
-            is_hardcore_enabled: false,
-            game_difficulty: Difficulty::Normal,
-            default_spawn_block_position: NetworkBlockPosition { x: 0, y: 64, z: 0 },
-            achievements_disabled: true,
-            editor_world_type: EditorWorldType::NonEditor,
-            is_created_in_editor: false,
-            is_exported_from_editor: false,
-            editor_level_migration_version: EditorLevelMigrationVersion::Legacy,
-            day_cycle_stop_time: 6000,
-            education_edition_offer: EducationEditionOffer::None,
-            education_features_enabled: false,
-            education_product_id: String::new(),
-            rain_level: 0.0,
-            lightning_level: 0.0,
-            has_confirmed_platform_locked_content: false,
-            multiplayer_enabled: true,
-            lan_broadcasting_enabled: true,
-            xbox_live_broadcast_setting: GamePublishSetting::FriendsOfFriends,
-            platform_broadcast_setting: GamePublishSetting::FriendsOfFriends,
-            commands_enabled: true,
-            texture_packs_required: false,
-            rule_data: GameRuleLegacyData {
-                rules_list: Vec::new(),
-            },
-            experiments: Experiments {
-                experiments: Vec::new(),
-                ever_toggled: false,
-            },
-            bonus_chest_enabled: false,
-            starting_map_enabled: false,
-            player_permissions: 1,
-            server_chunk_tick_range: 4,
-            locked_behaviour_pack: false,
-            locked_resource_pack: false,
-            from_locked_template: false,
-            use_msa_gamer_tags: false,
-            from_template: false,
-            has_locked_template_settings: false,
-            only_spawn_v1_villagers: false,
-            persona_disabled: false,
-            custom_skins_disabled: false,
-            emote_chat_muted: false,
-            base_game_version: BaseGameVersion(MOTD_ADVERTISED_VERSION.to_string()),
-            limited_world_width: 0,
-            limited_world_depth: 0,
-            nether_type: false,
-            edu_shared_uri_resource: EduSharedUriResource {
-                button_name: String::new(),
-                link_uri: String::new(),
-            },
-            override_force_experimental_gameplay: None,
-            chat_restriction_level: ChatRestrictionLevel::None,
-            disable_player_interactions: false,
-            server_editor_connection_policy: 0,
-            allow_anonymous_block_drops_in_editor_worlds: false,
+    let settings = LevelSettings::<V2225> {
+        seed: 1,
+        spawn_settings: SpawnSettings::<V2225> {
+            spawn_type: SpawnBiomeType::Default,
+            user_defined_biome_name: String::new(),
+            dimension: 0,
         },
-        level_id: "bedrockdroid_world".to_string(),
-        level_name: "Bedrock World".to_string(),
-        template_content_identity: String::new(),
-        is_trial: false,
-        movement_settings: SyncedPlayerMovementSettings {
-            rewind_history_size: 40,
-            server_authoritative_block_breaking: true,
+        generator_type: GeneratorType::Flat,
+        game_type: GameType::Survival,
+        is_hardcore_enabled: false,
+        game_difficulty: Difficulty::Normal,
+        default_spawn_block_position: NetworkBlockPosition { x: 0, y: 64, z: 0 },
+        achievements_disabled: true,
+        editor_world_type: EditorWorldType::NonEditor,
+        is_created_in_editor: false,
+        is_exported_from_editor: false,
+        editor_level_migration_version: EditorLevelMigrationVersion::Legacy,
+        day_cycle_stop_time: 6000,
+        education_edition_offer: EducationEditionOffer::None,
+        education_features_enabled: false,
+        education_product_id: String::new(),
+        rain_level: 0.0,
+        lightning_level: 0.0,
+        has_confirmed_platform_locked_content: false,
+        multiplayer_enabled: true,
+        lan_broadcasting_enabled: true,
+        xbox_live_broadcast_setting: GamePublishSetting::FriendsOfFriends,
+        platform_broadcast_setting: GamePublishSetting::FriendsOfFriends,
+        commands_enabled: true,
+        texture_packs_required: false,
+        rule_data: GameRuleLegacyData {
+            rules_list: Vec::new(),
         },
-        current_level_time: 6000,
-        enchantment_seed: 0,
-        block_properties: Vec::new(),
-        multiplayer_correlation_id: String::new(),
-        enable_item_stack_net_manager: true,
-        server_version: MOTD_ADVERTISED_VERSION.to_string(),
-        player_property_data: HashMap::new(),
-        server_block_type_registry_checksum: 0,
-        world_template_id: uuid::Uuid::nil(),
-        server_enabled_client_side_generation: false,
-        block_network_ids_are_hashes: true,
-        network_permissions: NetworkPermissions {
-            server_auth_sound_enabled: false,
+        experiments: Experiments {
+            experiments: Vec::new(),
+            ever_toggled: false,
         },
-        server_join_information: None,
-        server_id: String::new(),
-        scenario_id: String::new(),
-        world_id: String::new(),
-        owner_id: String::new(),
+        bonus_chest_enabled: false,
+        starting_map_enabled: false,
+        player_permissions: 1,
+        server_chunk_tick_range: 4,
+        locked_behaviour_pack: false,
+        locked_resource_pack: false,
+        from_locked_template: false,
+        use_msa_gamer_tags: false,
+        from_template: false,
+        has_locked_template_settings: false,
+        only_spawn_v1_villagers: false,
+        persona_disabled: false,
+        custom_skins_disabled: false,
+        emote_chat_muted: false,
+        base_game_version: BaseGameVersion(MOTD_ADVERTISED_VERSION.to_string()),
+        limited_world_width: 0,
+        limited_world_depth: 0,
+        nether_type: false,
+        edu_shared_uri_resource: EduSharedUriResource {
+            button_name: String::new(),
+            link_uri: String::new(),
+        },
+        override_force_experimental_gameplay: None,
+        chat_restriction_level: ChatRestrictionLevel::None,
+        disable_player_interactions: false,
+        server_editor_connection_policy: 0,
+        allow_anonymous_block_drops_in_editor_worlds: false,
     };
-    encode_bedrock_v2225_packet(&pkt)
+
+    let movement_settings = SyncedPlayerMovementSettings {
+        rewind_history_size: 40,
+        server_authoritative_block_breaking: true,
+    };
+
+    let network_permissions = NetworkPermissions {
+        server_auth_sound_enabled: false,
+    };
+
+    // Workaround SIGABRT en nbtx::nbt::ser::write_map / facet_reflect::PeekMapIter::drop:
+    // Reemplazamos player_property_data (HashMap) por Vec<(String, nbtx::Value)> y serializamos
+    // campo por campo el paquete StartGamePacket::<V2225> (ID 0x0b) sin invocar HashMap/write_map.
+    let player_property_pairs: Vec<(String, nbtx::Value)> = Vec::new();
+
+    let mut raw = Vec::with_capacity(384);
+    let header = BedrockPacketHeader {
+        packet_id: StartGamePacket::<V2225>::ID,
+        sender_sub_client_id: 0,
+        target_sub_client_id: 0,
+    };
+    header
+        .serialize(&mut raw)
+        .map_err(|e| format!("start_game header encode err: {}", e))?;
+
+    ActorUniqueID(1)
+        .serialize(&mut raw)
+        .map_err(|e| format!("target_actor_id encode err: {}", e))?;
+    ActorRuntimeID(1)
+        .serialize(&mut raw)
+        .map_err(|e| format!("target_runtime_id encode err: {}", e))?;
+    GameType::Survival
+        .serialize(&mut raw)
+        .map_err(|e| format!("actor_game_type encode err: {}", e))?;
+
+    // position: (0.0, 64.0, 0.0) & rotation: (0.0, 0.0) en f32 little-endian
+    for f in [0.0f32, 64.0f32, 0.0f32, 0.0f32, 0.0f32] {
+        raw.extend_from_slice(&f.to_le_bytes());
+    }
+
+    settings
+        .serialize(&mut raw)
+        .map_err(|e| format!("level_settings encode err: {}", e))?;
+
+    write_bedrock_string(&mut raw, "bedrockdroid_world"); // level_id
+    write_bedrock_string(&mut raw, "Bedrock World");      // level_name
+    write_bedrock_string(&mut raw, "");                   // template_content_identity
+    raw.push(0);                                          // is_trial = false
+
+    movement_settings
+        .serialize(&mut raw)
+        .map_err(|e| format!("movement_settings encode err: {}", e))?;
+
+    raw.extend_from_slice(&6000u64.to_le_bytes());        // current_level_time (u64 LE)
+    encode_varuint32(zigzag32(0), &mut raw);              // enchantment_seed = 0 (varint32)
+    encode_varuint32(0, &mut raw);                        // block_properties (Vec vacío)
+    write_bedrock_string(&mut raw, "");                   // multiplayer_correlation_id
+    raw.push(1);                                          // enable_item_stack_net_manager = true
+    write_bedrock_string(&mut raw, MOTD_ADVERTISED_VERSION); // server_version
+
+    // player_property_data sin HashMap ni facet_reflect::PeekMapIter:
+    write_nbt_network_compound_from_pairs(&player_property_pairs, &mut raw);
+
+    raw.extend_from_slice(&0u64.to_le_bytes());           // server_block_type_registry_checksum
+    raw.extend_from_slice(uuid::Uuid::nil().as_bytes());  // world_template_id (Uuid nil)
+    raw.push(0);                                          // server_enabled_client_side_generation = false
+    raw.push(1);                                          // block_network_ids_are_hashes = true
+
+    network_permissions
+        .serialize(&mut raw)
+        .map_err(|e| format!("network_permissions encode err: {}", e))?;
+
+    raw.push(0);                                          // server_join_information = None
+    write_bedrock_string(&mut raw, "");                   // server_id
+    write_bedrock_string(&mut raw, "");                   // scenario_id
+    write_bedrock_string(&mut raw, "");                   // world_id
+    write_bedrock_string(&mut raw, "");                   // owner_id
+
+    Ok(Bytes::from(raw))
 }
 
 #[cfg(feature = "protocol-core")]
@@ -2925,6 +3047,10 @@ mod tests {
         let start_bytes = build_v2225_start_game_packet_bytes().expect("start_game");
         let start_raw = RawPacket::parse(start_bytes).expect("parse start_game");
         assert_eq!(start_raw.id, 0x0b);
+        let mut empty_nbt = Vec::new();
+        write_nbt_network_compound_from_pairs(&[], &mut empty_nbt);
+        assert_eq!(empty_nbt, vec![0x0a, 0x00, 0x00]);
+        assert!(start_raw.body.windows(3).any(|w| w == [0x0a, 0x00, 0x00]));
 
         let chunk_bytes =
             build_v2225_level_chunk_packet_bytes(0, 0, build_spawn_chunk_payload_nbtx())
