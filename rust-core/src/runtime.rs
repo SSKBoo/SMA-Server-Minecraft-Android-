@@ -22,7 +22,7 @@ use p384::ecdsa::SigningKey;
 use rand_core::OsRng;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
@@ -87,6 +87,11 @@ pub struct SessionProgress {
     pub movement_tick: u64,
     pub last_packet_id: Option<u32>,
     pub last_packet_name: String,
+    pub pending_chunks: VecDeque<(i32, i32)>,
+    pub pending_spawn_finish: bool,
+    pub chunks_sent_count: usize,
+    pub outbound_packets_sent: u64,
+    pub outbound_bytes_sent: u64,
 }
 
 struct PeerSession {
@@ -1881,6 +1886,177 @@ pub fn build_v2225_game_rules_changed_packet_bytes() -> Bytes {
     Bytes::from(raw)
 }
 
+static SPAWN_CHUNK_TEMPLATE: OnceLock<Vec<u8>> = OnceLock::new();
+
+fn cached_spawn_chunk_payload() -> &'static Vec<u8> {
+    SPAWN_CHUNK_TEMPLATE.get_or_init(build_spawn_chunk_payload_nbtx)
+}
+
+/// Genera las 25 coordenadas de chunk `(-2..=2, -2..=2)` ordenadas por distancia radial desde `(0, 0)`.
+pub fn build_spawn_chunk_ring_coords() -> VecDeque<(i32, i32)> {
+    let mut coords: Vec<(i32, i32)> = Vec::with_capacity(25);
+    for cx in -2..=2 {
+        for cz in -2..=2 {
+            coords.push((cx, cz));
+        }
+    }
+    coords.sort_by_key(|&(cx, cz)| (cx * cx + cz * cz, cx.abs(), cz.abs()));
+    VecDeque::from(coords)
+}
+
+/// Encola los chunks iniciales de spawn para enviarlos de forma dosificada (sin saturar SCTP/UDP en un solo burst).
+pub fn queue_spawn_chunks(progress: &mut SessionProgress) -> usize {
+    if progress.pending_chunks.is_empty() {
+        progress.pending_chunks = build_spawn_chunk_ring_coords();
+    }
+    progress.pending_spawn_finish = true;
+    progress.pending_chunks.len()
+}
+
+/// Envía `MovePlayerPacket` (0x13) y `PlayStatus::PlayerSpawn` (0x02, status=3) para el jugador local
+/// una vez que los chunks alrededor del spawn se han transmitido tras `RequestChunkRadius`.
+/// Nota de protocolo Bedrock: NO enviar `AddPlayerPacket (0x0c)` para el jugador local ni `PlayerList` antes del spawn.
+pub fn send_spawn_finish_sequence(
+    conn: &mut Connection,
+    session: &mut ServerConnection,
+    progress: &mut SessionProgress,
+    peer_addr: SocketAddr,
+    now: Instant,
+) {
+    if progress.has_sent_player_spawn_status {
+        progress.pending_spawn_finish = false;
+        return;
+    }
+
+    #[cfg(feature = "protocol-core")]
+    {
+        let effective_name = if progress.player_name.trim().is_empty() {
+            "Jugador Bedrock".to_string()
+        } else {
+            progress.player_name.clone()
+        };
+        let effective_uuid = if progress.player_uuid == [0u8; 16] {
+            derive_player_uuid_bytes(&effective_name)
+        } else {
+            progress.player_uuid
+        };
+        progress.player_name = effective_name.clone();
+        progress.player_uuid = effective_uuid;
+
+        let move_bytes = build_v2225_move_player_packet_bytes(
+            1,
+            0.0,
+            MIN_SPAWN_SAFE_Y,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            true,
+            progress.movement_tick,
+        );
+        let move_batch = session.encode(&[move_bytes]);
+        conn.send(move_batch, now);
+        progress.has_sent_player_spawn_entities = true;
+
+        if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
+            let status_batch = session.encode(&[spawn_status]);
+            conn.send(status_batch, now);
+            progress.has_sent_player_spawn_status = true;
+            progress.pending_spawn_finish = false;
+            notify_world_spawn_sent(progress.chunks_sent_count);
+            log::info!(
+                "[Bedrock Session] MovePlayer (0x13, 0,64,0) + PlayStatus (0x02, status=3 / PlayerSpawn) enviados a {} tras {} chunks paced (jugador={}, esperando SetLocalPlayerAsInitialized 0x71)",
+                peer_addr,
+                progress.chunks_sent_count,
+                effective_name
+            );
+        }
+    }
+
+    #[cfg(not(feature = "protocol-core"))]
+    {
+        let _ = (conn, session, progress, peer_addr, now);
+    }
+}
+
+/// Drena hasta `max_chunks` de `progress.pending_chunks` respetando el control de congestión SCTP de `str0m`.
+pub fn pump_pending_chunks_batch(
+    conn: &mut Connection,
+    session: &mut ServerConnection,
+    progress: &mut SessionProgress,
+    peer_addr: SocketAddr,
+    now: Instant,
+    max_chunks: usize,
+) -> usize {
+    #[cfg(feature = "protocol-core")]
+    {
+        let template = cached_spawn_chunk_payload();
+        let payload_size = template.len();
+        let payload_fnv1a = fnv1a_32_checksum(template);
+        let payload_crc32 = crc32_checksum(template);
+        let mut batch_sent = 0usize;
+        let mut first_packet_size = 0usize;
+
+        while batch_sent < max_chunks {
+            let Some((cx, cz)) = progress.pending_chunks.pop_front() else {
+                break;
+            };
+            if let Ok(chunk_bytes) =
+                build_v2225_level_chunk_packet_bytes(cx, cz, template.clone())
+            {
+                if first_packet_size == 0 {
+                    first_packet_size = chunk_bytes.len();
+                }
+                let batch = session.encode(&[chunk_bytes]);
+                conn.send(batch, now);
+                batch_sent += 1;
+                progress.chunks_sent_count = progress.chunks_sent_count.saturating_add(1);
+                if progress.chunks_sent_count == 1 {
+                    log::info!(
+                        "[Bedrock World] Chunk spawn ({},{}) enviado primero a {}: payload={} bytes, packet={} bytes, subchunks=9, suelo stone/grass y=63, aire y>=64, biome_id={} Plains, crc32=0x{:08x}, fnv1a=0x{:08x}, is_client_biome_update=true (restantes={})",
+                        cx,
+                        cz,
+                        peer_addr,
+                        payload_size,
+                        first_packet_size,
+                        DEFAULT_SPAWN_BIOME_ID,
+                        payload_crc32,
+                        payload_fnv1a,
+                        progress.pending_chunks.len()
+                    );
+                }
+            }
+        }
+
+        if progress.pending_chunks.is_empty() && batch_sent > 0 {
+            log::info!(
+                "[Bedrock World] Streaming pacing completado: {} chunks totales enviados a {} (crc32=0x{:08x}, fnv1a=0x{:08x}, is_client_biome_update=true)",
+                progress.chunks_sent_count,
+                peer_addr,
+                payload_crc32,
+                payload_fnv1a
+            );
+        }
+
+        // Tras enviar al menos el anillo central 3x3 (9 chunks) o vaciar la cola, completar spawn con PlayStatus::PlayerSpawn.
+        if progress.pending_spawn_finish
+            && !progress.has_sent_player_spawn_status
+            && (progress.chunks_sent_count >= 9 || progress.pending_chunks.is_empty())
+        {
+            send_spawn_finish_sequence(conn, session, progress, peer_addr, now);
+        }
+
+        batch_sent
+    }
+
+    #[cfg(not(feature = "protocol-core"))]
+    {
+        let _ = (conn, session, progress, peer_addr, now, max_chunks);
+        0
+    }
+}
+
 #[cfg(feature = "protocol-core")]
 pub fn send_spawn_chunks(
     conn: &mut Connection,
@@ -1895,34 +2071,6 @@ pub fn send_spawn_chunks(
 
     let clamped_radius = send_chunk_radius_updated(conn, session, peer_addr, now, radius);
 
-    // Ordenamos las coordenadas para garantizar que el chunk de spawn (0,0) llegue primero
-    let mut coords: Vec<(i32, i32)> = Vec::with_capacity(25);
-    for cx in -2..=2 {
-        for cz in -2..=2 {
-            coords.push((cx, cz));
-        }
-    }
-    coords.sort_by_key(|&(cx, cz)| (cx * cx + cz * cz, cx.abs(), cz.abs()));
-
-    let spawn_chunk_template = build_spawn_chunk_payload_nbtx();
-    let payload_size = spawn_chunk_template.len();
-    let payload_fnv1a = fnv1a_32_checksum(&spawn_chunk_template);
-    let payload_crc32 = crc32_checksum(&spawn_chunk_template);
-    let mut first_packet_size = 0usize;
-    let mut sent_count = 0usize;
-    for (cx, cz) in coords {
-        if let Ok(chunk_bytes) =
-            build_v2225_level_chunk_packet_bytes(cx, cz, spawn_chunk_template.clone())
-        {
-            if first_packet_size == 0 {
-                first_packet_size = chunk_bytes.len();
-            }
-            let batch = session.encode(&[chunk_bytes]);
-            conn.send(batch, now);
-            sent_count += 1;
-        }
-    }
-
     if let Ok(pub_pkt) = encode_bedrock_v2225_packet(&NetworkChunkPublisherUpdatePacket::<V2225> {
         new_view_position: BlockPos { x: 0, y: 64, z: 0 },
         new_view_radius: (clamped_radius as u32) * 16,
@@ -1932,17 +2080,17 @@ pub fn send_spawn_chunks(
         conn.send(batch, now);
     }
 
-    log::info!(
-        "[Bedrock World] {} chunks network generados (chunk (0,0) primero: payload={} bytes, packet={} bytes, checksum=0x{:08x}, subchunks=9, suelo stone/grass y=63, aire y>=64, biome_id={} Plains, crc32=0x{:08x}, fnv1a=0x{:08x}, is_client_biome_update=true) + NetworkChunkPublisherUpdate enviados a {}",
-        sent_count,
-        payload_size,
-        first_packet_size,
-        payload_fnv1a,
-        DEFAULT_SPAWN_BIOME_ID,
-        payload_crc32,
-        payload_fnv1a,
-        peer_addr
-    );
+    let template = cached_spawn_chunk_payload();
+    let mut sent_count = 0usize;
+    for (cx, cz) in build_spawn_chunk_ring_coords() {
+        if let Ok(chunk_bytes) =
+            build_v2225_level_chunk_packet_bytes(cx, cz, template.clone())
+        {
+            let batch = session.encode(&[chunk_bytes]);
+            conn.send(batch, now);
+            sent_count += 1;
+        }
+    }
     sent_count
 }
 
@@ -2080,11 +2228,12 @@ pub fn send_world_start_and_spawn(
     peer_addr: SocketAddr,
     now: Instant,
 ) {
-    if progress.has_sent_start_game && progress.has_sent_player_spawn_status {
+    if progress.has_sent_start_game && progress.has_sent_world_registries {
         return;
     }
 
-    // Asegurar secuencia oficial de bedrock-rs: ResourcePacksInfo -> ResourcePackStack -> VoxelShapes -> StartGamePacket
+    // Fase 1 de mundo Bedrock: ResourcePacksInfo -> ResourcePackStack -> VoxelShapes -> StartGamePacket -> Registros/Entorno -> SetTime.
+    // Los LevelChunk y PlayStatus::PlayerSpawn NO se envían en ráfaga aquí; esperan RequestChunkRadius (0x45) y se dosifican en rtc_tick.
     send_resource_packs_sequence(conn, session, progress, peer_addr, now);
 
     #[cfg(feature = "protocol-core")]
@@ -2145,86 +2294,12 @@ pub fn send_world_start_and_spawn(
             if let Ok(time_bytes) = encode_bedrock_v2225_packet(&SetTimePacket { time: 6000 }) {
                 let time_batch = session.encode(&[time_bytes]);
                 conn.send(time_batch, now);
-                log::info!("[Bedrock Session] SetTimePacket (0x0a, time=6000) enviado a {}", peer_addr);
-            }
-        }
-
-        let sent_chunks = if !progress.has_sent_initial_chunks {
-            let n = send_spawn_chunks(conn, session, peer_addr, now, 4);
-            progress.has_sent_initial_chunks = true;
-            progress.has_sent_chunk_radius = true;
-            n
-        } else {
-            0
-        };
-
-        if !progress.has_sent_player_spawn_entities {
-            let effective_name = if progress.player_name.trim().is_empty() {
-                "Jugador Bedrock".to_string()
-            } else {
-                progress.player_name.clone()
-            };
-            let effective_uuid = if progress.player_uuid == [0u8; 16] {
-                derive_player_uuid_bytes(&effective_name)
-            } else {
-                progress.player_uuid
-            };
-            progress.player_name = effective_name.clone();
-            progress.player_uuid = effective_uuid;
-
-            let list_bytes =
-                build_v2225_player_list_add_packet_bytes(&effective_uuid, 1, &effective_name, "");
-            let add_player_bytes = build_v2225_add_player_packet_bytes(
-                &effective_uuid,
-                &effective_name,
-                1,
-                1,
-                0.0,
-                MIN_SPAWN_SAFE_Y,
-                0.0,
-                0.0,
-                0.0,
-            );
-            let move_bytes = build_v2225_move_player_packet_bytes(
-                1,
-                0.0,
-                MIN_SPAWN_SAFE_Y,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0,
-                true,
-                progress.movement_tick,
-            );
-
-            for pkt_bytes in [list_bytes, add_player_bytes, move_bytes] {
-                let batch = session.encode(&[pkt_bytes]);
-                conn.send(batch, now);
-            }
-            progress.has_sent_player_spawn_entities = true;
-            log::info!(
-                "[Bedrock Session] PlayerList (0x3f) + AddPlayer (0x0c) + MovePlayer (0x13, 0,64,0) enviados a {} (jugador={})",
-                peer_addr,
-                effective_name
-            );
-        }
-
-        // PlayStatus::PlayerSpawn (0x02, status=3) DEBE enviarse después de StartGame + Chunks + Spawn
-        // para que el cliente cierre la pantalla de carga y responda con SetLocalPlayerAsInitialized (0x71).
-        if !progress.has_sent_player_spawn_status {
-            if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
-                let status_batch = session.encode(&[spawn_status]);
-                conn.send(status_batch, now);
-                progress.has_sent_player_spawn_status = true;
                 log::info!(
-                    "[Bedrock Session] PlayStatus (0x02, status=3 / PlayerSpawn) enviado a {} tras StartGame + Chunks (esperando SetLocalPlayerAsInitialized 0x71)",
+                    "[Bedrock Session] SetTimePacket (0x0a, time=6000) enviado a {} -> esperando RequestChunkRadius (0x45)",
                     peer_addr
                 );
             }
         }
-
-        notify_world_spawn_sent(sent_chunks);
     }
 
     #[cfg(not(feature = "protocol-core"))]
@@ -2473,13 +2548,16 @@ pub fn handle_bedrock_session_data(
                 }
             }
 
-            // Solicitud de radio de chunks (0x45 / 69 RequestChunkRadius) -> ChunkRadiusUpdated (0x46) + NetworkChunkPublisherUpdate + chunks/PlayerSpawn
+            // Solicitud de radio de chunks (0x45 / 69 RequestChunkRadius) -> ChunkRadiusUpdated (0x46) + NetworkChunkPublisherUpdate + chunks dosificados -> PlayStatus::PlayerSpawn
             id if id == RequestChunkRadius::ID || id == 0x45 => {
                 progress.last_packet_name = "RequestChunkRadius".to_string();
                 let requested = pkt
                     .decode::<RequestChunkRadius>()
                     .map(|r| r.chunk_radius)
                     .unwrap_or(4);
+                if !progress.has_sent_start_game {
+                    send_world_start_and_spawn(conn, session, progress, peer_addr, now);
+                }
                 #[cfg(feature = "protocol-core")]
                 {
                     use bedrock::protocol::v662::packets::NetworkChunkPublisherUpdatePacket;
@@ -2488,11 +2566,8 @@ pub fn handle_bedrock_session_data(
 
                     let approved = send_chunk_radius_updated(conn, session, peer_addr, now, requested);
                     progress.has_sent_chunk_radius = true;
-                    if !progress.has_sent_initial_chunks {
-                        let sent = send_spawn_chunks(conn, session, peer_addr, now, approved);
-                        progress.has_sent_initial_chunks = true;
-                        notify_world_spawn_sent(sent);
-                    } else if let Ok(pub_pkt) = encode_bedrock_v2225_packet(&NetworkChunkPublisherUpdatePacket::<V2225> {
+
+                    if let Ok(pub_pkt) = encode_bedrock_v2225_packet(&NetworkChunkPublisherUpdatePacket::<V2225> {
                         new_view_position: BlockPos { x: 0, y: 64, z: 0 },
                         new_view_radius: (approved as u32) * 16,
                         server_built_chunks: Vec::new(),
@@ -2500,21 +2575,21 @@ pub fn handle_bedrock_session_data(
                         let batch = session.encode(&[pub_pkt]);
                         conn.send(batch, now);
                     }
-                    if progress.has_sent_start_game && !progress.has_sent_player_spawn_status {
-                        if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
-                            let status_batch = session.encode(&[spawn_status]);
-                            conn.send(status_batch, now);
-                            progress.has_sent_player_spawn_status = true;
-                            log::info!(
-                                "[Bedrock Session] PlayStatus (0x02, status=3 / PlayerSpawn) enviado a {} tras RequestChunkRadius",
-                                peer_addr
-                            );
-                        }
+
+                    let mut queued_total = 0usize;
+                    let mut immediate_sent = 0usize;
+                    if !progress.has_sent_initial_chunks {
+                        progress.has_sent_initial_chunks = true;
+                        queued_total = queue_spawn_chunks(progress);
+                        immediate_sent = pump_pending_chunks_batch(conn, session, progress, peer_addr, now, 1);
                     }
+
                     log::info!(
-                        "[Bedrock World] RequestChunkRadius (0x45, req={}) -> ChunkRadiusUpdated (0x46, radius={}) enviado a {}",
+                        "[Bedrock World] RequestChunkRadius (0x45, req={}) -> ChunkRadiusUpdated (0x46, radius={}) + NetworkChunkPublisherUpdate + cola={} chunks (inmediato={}, pacing=2/20ms) enviados a {}",
                         requested,
                         approved,
+                        queued_total,
+                        immediate_sent,
                         peer_addr
                     );
                 }
@@ -2679,7 +2754,7 @@ pub fn format_disconnect_debug_summary(
         "cierre de transporte WebRTC"
     };
     format!(
-        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | rp_done={} | chunk_radius={} | spawn_status={} | spawn_init={} | client_init={} | loading_screen_id={:?} | local_ice={}",
+        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | chunks_sent={} | pending_chunks={} | out_pkts={} | out_bytes={} | rp_done={} | chunk_radius={} | spawn_status={} | spawn_init={} | client_init={} | loading_screen_id={:?} | local_ice={}",
         remote_addr,
         sid,
         reason,
@@ -2688,6 +2763,10 @@ pub fn format_disconnect_debug_summary(
         progress.player_auth_input_count,
         progress.latency_ping_count,
         progress.keepalives_sent,
+        progress.chunks_sent_count,
+        progress.pending_chunks.len(),
+        progress.outbound_packets_sent,
+        progress.outbound_bytes_sent,
         progress.has_completed_resource_packs,
         progress.has_sent_chunk_radius,
         progress.has_sent_player_spawn_status,
@@ -3571,6 +3650,12 @@ pub fn start_async_engine(
                                     }
                                 }
                                 while let Some(tx) = peer.conn.poll_transmit() {
+                                    peer.progress.outbound_packets_sent =
+                                        peer.progress.outbound_packets_sent.saturating_add(1);
+                                    peer.progress.outbound_bytes_sent = peer
+                                        .progress
+                                        .outbound_bytes_sent
+                                        .saturating_add(tx.contents.len() as u64);
                                     outbound.push((tx.destination, tx.contents));
                                 }
                             }
@@ -3642,7 +3727,26 @@ pub fn start_async_engine(
                                     }
                                 }
                             }
+                            if !peer.progress.pending_chunks.is_empty() || peer.progress.pending_spawn_finish {
+                                let addr = peer.remote_addr;
+                                let _ = run_catch_unwind("webrtc_rtc_pump_chunks", || {
+                                    pump_pending_chunks_batch(
+                                        &mut peer.conn,
+                                        &mut peer.session,
+                                        &mut peer.progress,
+                                        addr,
+                                        now,
+                                        2,
+                                    );
+                                });
+                            }
                             while let Some(tx) = peer.conn.poll_transmit() {
+                                peer.progress.outbound_packets_sent =
+                                    peer.progress.outbound_packets_sent.saturating_add(1);
+                                peer.progress.outbound_bytes_sent = peer
+                                    .progress
+                                    .outbound_bytes_sent
+                                    .saturating_add(tx.contents.len() as u64);
                                 outbound.push((tx.destination, tx.contents));
                             }
                         }
@@ -3678,7 +3782,9 @@ pub fn start_async_engine(
                     let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
                     if let Ok(mut guard) = peers.lock() {
                         for peer in guard.values_mut() {
-                            if peer.progress.has_sent_start_game {
+                            if peer.progress.has_sent_player_spawn_status
+                                && peer.progress.pending_chunks.is_empty()
+                            {
                                 let ping_pkt = build_network_stack_latency_packet_bytes(ts, true);
                                 let batch = peer.session.encode(&[ping_pkt]);
                                 peer.conn.send(batch, now);
@@ -3693,6 +3799,12 @@ pub fn start_async_engine(
                                     );
                                 }
                                 while let Some(tx) = peer.conn.poll_transmit() {
+                                    peer.progress.outbound_packets_sent =
+                                        peer.progress.outbound_packets_sent.saturating_add(1);
+                                    peer.progress.outbound_bytes_sent = peer
+                                        .progress
+                                        .outbound_bytes_sent
+                                        .saturating_add(tx.contents.len() as u64);
                                     outbound.push((tx.destination, tx.contents));
                                 }
                             }
@@ -4205,6 +4317,11 @@ mod tests {
         dbg_prog.set_local_player_initialized = true;
         dbg_prog.last_packet_id = Some(0x90);
         dbg_prog.last_packet_name = "PlayerAuthInput".to_string();
+        let coords = build_spawn_chunk_ring_coords();
+        assert_eq!(coords.len(), 25);
+        assert_eq!(coords.front().copied(), Some((0, 0)));
+        assert_eq!(queue_spawn_chunks(&mut dbg_prog), 25);
+        assert!(dbg_prog.pending_spawn_finish);
         let dbg_line = format_disconnect_debug_summary(
             42,
             "192.168.1.79:44951".parse().expect("socket addr"),
@@ -4213,6 +4330,7 @@ mod tests {
         );
         assert!(dbg_line.contains("Último paquete procesado: PlayerAuthInput (0x90)"));
         assert!(dbg_line.contains("spawn_init=true"));
+        assert!(dbg_line.contains("pending_chunks=25"));
     }
 
     #[test]
