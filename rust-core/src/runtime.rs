@@ -988,6 +988,14 @@ fn decode_base64_segment(segment: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+fn decode_zlib_b64_bytes(b64: &str) -> Option<Bytes> {
+    let compressed = decode_base64_segment(b64)?;
+    let mut decoder = ZlibDecoder::new(compressed.as_slice());
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(Bytes::from(out))
+}
+
 fn find_json_display_name(text: &str) -> Option<String> {
     for needle in ["\"displayName\"", "\"DisplayName\""] {
         if let Some(pos) = text.find(needle) {
@@ -1138,6 +1146,7 @@ pub enum NbtFieldValue {
 
 pub const DEFAULT_SPAWN_BIOME_ID: i32 = 1; // Plains
 pub const MIN_SPAWN_SAFE_Y: f32 = 64.0;
+pub const SPAWN_EYE_Y: f32 = 65.62; // Altura de ojos sobre suelo sólido en y=63 (superficie y=64.0 + 1.62)
 
 /// Serializa únicamente los campos internos + `TAG_End` de un compuesto NBT NetworkLittleEndian
 /// sin `HashMap` ni `nbtx::nbt::ser::write_map`.
@@ -1417,8 +1426,8 @@ pub fn build_v2225_start_game_packet_bytes() -> Result<Bytes, String> {
         .serialize(&mut raw)
         .map_err(|e| format!("actor_game_type encode err: {}", e))?;
 
-    // position: (0.0, 64.0, 0.0) & rotation: (0.0, 0.0) en f32 little-endian
-    for f in [0.0f32, 64.0f32, 0.0f32, 0.0f32, 0.0f32] {
+    // position: (0.0, 65.62, 0.0) [altura de ojos sobre suelo y=63/64] & rotation: (0.0, 0.0) en f32 little-endian
+    for f in [0.0f32, SPAWN_EYE_Y, 0.0f32, 0.0f32, 0.0f32] {
         raw.extend_from_slice(&f.to_le_bytes());
     }
 
@@ -1477,7 +1486,7 @@ pub fn build_v2225_level_chunk_packet_bytes(cx: i32, cz: i32, serialized_chunk_d
         cache_enabled: false,
         cache_blobs: Vec::new(),
         serialized_chunk_data,
-        is_client_biome_update: true,
+        is_client_biome_update: false,
     };
     encode_bedrock_v2225_packet(&pkt)
 }
@@ -1581,7 +1590,7 @@ pub fn parse_player_auth_input_packet(body: &[u8]) -> Option<ParsedPlayerAuthInp
     })
 }
 
-/// Construye `MovePlayerPacket` (0x13 / 19) en formato wire Bedrock para confirmar posición al cliente.
+/// Construye `MovePlayerPacket` (0x13 / 19) en formato wire `bedrock-rs` `V2225` (incluye `teleport_data: Option`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_v2225_move_player_packet_bytes(
     runtime_id: u64,
@@ -1595,7 +1604,45 @@ pub fn build_v2225_move_player_packet_bytes(
     on_ground: bool,
     tick: u64,
 ) -> Bytes {
-    let mut raw = Vec::with_capacity(48);
+    #[cfg(feature = "protocol-core")]
+    {
+        use bedrock::protocol::v2168::enums::PlayerPositionMode;
+        use bedrock::protocol::v2168::packets::MovePlayerPacket;
+        use bedrock::protocol::v2168::types::MovePlayerTeleportData;
+        use bedrock::protocol::v662::types::ActorRuntimeID;
+        use bedrock::protocol::V2225;
+
+        let position_mode = match mode {
+            1 => PlayerPositionMode::Respawn,
+            2 => PlayerPositionMode::Teleport,
+            3 => PlayerPositionMode::OnlyHeadRot,
+            _ => PlayerPositionMode::Normal,
+        };
+        let teleport_data = if mode == 2 {
+            Some(MovePlayerTeleportData {
+                teleportation_cause: 0,
+                source_actor_type: 0,
+            })
+        } else {
+            None
+        };
+        let pkt = MovePlayerPacket::<V2225> {
+            player_runtime_id: ActorRuntimeID(runtime_id),
+            position: (x, y, z),
+            rotation: (pitch, yaw),
+            y_head_rotation: head_yaw,
+            position_mode,
+            on_ground,
+            riding_runtime_id: ActorRuntimeID(0),
+            teleport_data,
+            tick,
+        };
+        if let Ok(encoded) = encode_bedrock_v2225_packet(&pkt) {
+            return encoded;
+        }
+    }
+
+    let mut raw = Vec::with_capacity(52);
     encode_varuint32(0x13, &mut raw);
     encode_varuint64(runtime_id, &mut raw);
     raw.extend_from_slice(&x.to_le_bytes());
@@ -1608,8 +1655,11 @@ pub fn build_v2225_move_player_packet_bytes(
     raw.push(if on_ground { 1 } else { 0 });
     encode_varuint64(0, &mut raw); // riding_runtime_id = 0
     if mode == 2 {
-        encode_varuint32(0, &mut raw); // teleport_cause
-        encode_varuint32(0, &mut raw); // teleport_item
+        raw.push(0x01); // Option::Some
+        raw.extend_from_slice(&0i32.to_le_bytes()); // teleportation_cause
+        raw.extend_from_slice(&0i32.to_le_bytes()); // source_actor_type
+    } else {
+        raw.push(0x00); // Option::None
     }
     encode_varuint64(tick, &mut raw);
     Bytes::from(raw)
@@ -1644,7 +1694,7 @@ pub fn send_chunk_radius_updated(
 ) -> i32 {
     use bedrock::protocol::v662::packets::ChunkRadiusUpdatedPacket;
 
-    let clamped_radius = radius.clamp(1, 4);
+    let clamped_radius = radius.clamp(1, 2);
     if let Ok(rad_pkt) = encode_bedrock_v2225_packet(&ChunkRadiusUpdatedPacket {
         chunk_radius: clamped_radius,
     }) {
@@ -1654,8 +1704,68 @@ pub fn send_chunk_radius_updated(
     clamped_radius
 }
 
-/// Construye `BiomeDefinitionListPacket` (0x7a / 122) en formato Bedrock V2225 sin usar `HashMap`.
+/// Construye `BiomeDefinitionListPacket` (0x7a / 122) en formato `bedrock-rs` `V2225` con biomas vanilla principales sin usar `HashMap`.
 pub fn build_v2225_biome_definition_list_bytes() -> Bytes {
+    #[cfg(feature = "protocol-core")]
+    {
+        use bedrock::protocol::v800::packets::{BiomeDefinitionListPacket, BiomeEntry};
+        use bedrock::protocol::v844::types::BiomeDefinition;
+        use bedrock::protocol::V2225;
+
+        const VANILLA_BIOMES: &[(&str, f32, f32, bool)] = &[
+            ("ocean", 0.5, 0.5, true),
+            ("plains", 0.8, 0.4, true),
+            ("desert", 2.0, 0.0, false),
+            ("extreme_hills", 0.2, 0.3, true),
+            ("forest", 0.7, 0.8, true),
+            ("taiga", 0.25, 0.8, true),
+            ("swampland", 0.8, 0.9, true),
+            ("river", 0.5, 0.5, true),
+            ("hell", 2.0, 0.0, false),
+            ("the_end", 0.5, 0.5, false),
+            ("frozen_ocean", 0.0, 0.5, true),
+            ("frozen_river", 0.0, 0.5, true),
+            ("ice_plains", 0.0, 0.5, true),
+            ("mushroom_island", 0.9, 1.0, true),
+            ("beach", 0.8, 0.4, true),
+            ("jungle", 0.95, 0.9, true),
+            ("deep_ocean", 0.5, 0.5, true),
+            ("birch_forest", 0.6, 0.6, true),
+            ("roofed_forest", 0.7, 0.8, true),
+            ("savanna", 1.2, 0.0, false),
+            ("mesa", 2.0, 0.0, false),
+            ("sunflower_plains", 0.8, 0.4, true),
+            ("flower_forest", 0.7, 0.8, true),
+            ("meadow", 0.5, 0.8, true),
+        ];
+
+        let mut strings = Vec::with_capacity(VANILLA_BIOMES.len());
+        let mut biomes = Vec::with_capacity(VANILLA_BIOMES.len());
+        for (idx, &(name, temperature, downfall, rain)) in VANILLA_BIOMES.iter().enumerate() {
+            strings.push(name.to_string());
+            biomes.push(BiomeEntry {
+                name_index: idx as u16,
+                definition: BiomeDefinition::<V2225> {
+                    id: u16::MAX, // Built-in vanilla ID mapping (plains = 1)
+                    temperature,
+                    downfall,
+                    foliage_snow: 0.0,
+                    depth: 0.125,
+                    scale: 0.05,
+                    map_water_color: 0x0044_AFF5,
+                    rain,
+                    tags: None,
+                    chunk_gen_data: None,
+                },
+            });
+        }
+
+        let pkt = BiomeDefinitionListPacket::<V2225> { biomes, strings };
+        if let Ok(encoded) = encode_bedrock_v2225_packet(&pkt) {
+            return encoded;
+        }
+    }
+
     let mut raw = Vec::with_capacity(8);
     encode_varuint32(0x7a, &mut raw); // Packet ID 122 (BiomeDefinitionList)
     encode_varuint32(0, &mut raw);    // biome_definitions (Vec vacío)
@@ -1663,9 +1773,10 @@ pub fn build_v2225_biome_definition_list_bytes() -> Bytes {
     Bytes::from(raw)
 }
 
-/// Construye `AvailableEntityIdentifiersPacket` (0x77 / 119) en NBT NetworkLittleEndian
-/// registrando entidades estáticas básicas (`minecraft:player`, `minecraft:boat`).
-pub fn build_v2225_available_entity_identifiers_bytes() -> Bytes {
+const VANILLA_ACTOR_IDENTIFIERS_ZLIB_B64: &str = "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";
+static VANILLA_ACTOR_IDENTIFIERS_CACHE: OnceLock<Bytes> = OnceLock::new();
+
+fn build_v2225_available_entity_identifiers_fallback_bytes() -> Bytes {
     let mut raw = Vec::with_capacity(192);
     encode_varuint32(0x77, &mut raw); // Packet ID 119 (AvailableEntityIdentifiers)
 
@@ -1699,16 +1810,52 @@ pub fn build_v2225_available_entity_identifiers_bytes() -> Bytes {
     Bytes::from(raw)
 }
 
-/// Construye `ItemRegistryPacket` / `ItemComponentPacket` (0xa2 / 162) vacío para inicializar inventario.
-pub fn build_v2225_item_component_registry_bytes() -> Bytes {
+/// Construye `AvailableEntityIdentifiersPacket` (0x77 / 119) usando el registro completo vanilla BDS (cacheado con `ZlibDecoder`).
+pub fn build_v2225_available_entity_identifiers_bytes() -> Bytes {
+    VANILLA_ACTOR_IDENTIFIERS_CACHE
+        .get_or_init(|| {
+            decode_zlib_b64_bytes(VANILLA_ACTOR_IDENTIFIERS_ZLIB_B64)
+                .unwrap_or_else(build_v2225_available_entity_identifiers_fallback_bytes)
+        })
+        .clone()
+}
+
+const VANILLA_ITEM_REGISTRY_ZLIB_B64: &str = "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";
+static VANILLA_ITEM_REGISTRY_CACHE: OnceLock<Bytes> = OnceLock::new();
+
+fn build_v2225_item_component_registry_fallback_bytes() -> Bytes {
     let mut raw = Vec::with_capacity(6);
     encode_varuint32(0xa2, &mut raw); // Packet ID 162 (ItemRegistry / ItemComponent)
     encode_varuint32(0, &mut raw);    // items (Vec vacío)
     Bytes::from(raw)
 }
 
-/// Construye `CreativeContentPacket` (0x91 / 145) vacío para permitir abrir el inventario creativo/supervivencia sin crash.
+/// Construye `ItemRegistryPacket` / `ItemComponentPacket` (0xa2 / 162) con los 2076 ítems vanilla completos (evita desconexión de clientes móviles).
+pub fn build_v2225_item_component_registry_bytes() -> Bytes {
+    VANILLA_ITEM_REGISTRY_CACHE
+        .get_or_init(|| {
+            decode_zlib_b64_bytes(VANILLA_ITEM_REGISTRY_ZLIB_B64)
+                .unwrap_or_else(build_v2225_item_component_registry_fallback_bytes)
+        })
+        .clone()
+}
+
+/// Construye `CreativeContentPacket` (0x91 / 145) en formato `bedrock-rs` `V2225`.
 pub fn build_v2225_creative_content_bytes() -> Bytes {
+    #[cfg(feature = "protocol-core")]
+    {
+        use bedrock::protocol::v2168::packets::CreativeContentPacket;
+        use bedrock::protocol::V2225;
+
+        let pkt = CreativeContentPacket::<V2225> {
+            groups: Vec::new(),
+            contents: Vec::new(),
+        };
+        if let Ok(encoded) = encode_bedrock_v2225_packet(&pkt) {
+            return encoded;
+        }
+    }
+
     let mut raw = Vec::with_capacity(6);
     encode_varuint32(0x91, &mut raw); // Packet ID 145 (CreativeContent)
     encode_varuint32(0, &mut raw);    // groups (Vec vacío)
@@ -1845,34 +1992,88 @@ pub fn build_v2225_set_player_game_type_bytes(game_type: i32) -> Bytes {
     Bytes::from(raw)
 }
 
-/// Construye `SetSpawnPositionPacket` (ID 43 / 0x2b) indicando el punto de aparición del mundo y la brújula.
+/// Construye `SetSpawnPositionPacket` (ID 43 / 0x2b) en formato `bedrock-rs` `V2225` (ZigZag i32 para `y`).
 pub fn build_v2225_set_spawn_position_packet_bytes(x: i32, y: u32, z: i32, dimension: i32) -> Bytes {
+    #[cfg(feature = "protocol-core")]
+    {
+        use bedrock::protocol::v662::enums::SpawnPositionType;
+        use bedrock::protocol::v662::packets::SetSpawnPositionPacket;
+        use bedrock::protocol::v944::types::NetworkBlockPosition;
+        use bedrock::protocol::V2225;
+
+        let pos = NetworkBlockPosition { x, y: y as i32, z };
+        let pkt = SetSpawnPositionPacket::<V2225> {
+            spawn_position_type: SpawnPositionType::WorldSpawn,
+            block_position: pos.clone(),
+            dimension_type: dimension,
+            spawn_block_pos: pos,
+        };
+        if let Ok(encoded) = encode_bedrock_v2225_packet(&pkt) {
+            return encoded;
+        }
+    }
+
     let mut raw = Vec::with_capacity(24);
     encode_varuint32(0x2b, &mut raw); // Packet ID 43 (SetSpawnPosition)
     encode_varuint32(zigzag32(1), &mut raw); // SpawnType = WorldSpawn (1)
-    // position (NetworkBlockPosition: x zigzag32, y varuint32, z zigzag32)
     encode_varuint32(zigzag32(x), &mut raw);
-    encode_varuint32(y, &mut raw);
+    encode_varuint32(zigzag32(y as i32), &mut raw);
     encode_varuint32(zigzag32(z), &mut raw);
-    // dimension (Overworld = 0)
     encode_varuint32(zigzag32(dimension), &mut raw);
-    // spawn_position (BlockPosition)
     encode_varuint32(zigzag32(x), &mut raw);
-    encode_varuint32(y, &mut raw);
+    encode_varuint32(zigzag32(y as i32), &mut raw);
     encode_varuint32(zigzag32(z), &mut raw);
     Bytes::from(raw)
 }
 
-/// Construye `SetDifficultyPacket` (ID 60 / 0x3c) sincronizando la dificultad del mundo (2 = Normal).
+/// Construye `SetDifficultyPacket` (ID 60 / 0x3c) en formato `bedrock-rs` `V2225` (2 = Normal).
 pub fn build_v2225_set_difficulty_packet_bytes(difficulty: u32) -> Bytes {
+    #[cfg(feature = "protocol-core")]
+    {
+        use bedrock::protocol::v662::packets::SetDifficultyPacket;
+
+        if let Ok(encoded) = encode_bedrock_v2225_packet(&SetDifficultyPacket { difficulty }) {
+            return encoded;
+        }
+    }
+
     let mut raw = Vec::with_capacity(6);
     encode_varuint32(0x3c, &mut raw); // Packet ID 60 (SetDifficulty)
     encode_varuint32(difficulty, &mut raw);
     Bytes::from(raw)
 }
 
-/// Construye `GameRulesChangedPacket` (ID 72 / 0x48) con reglas básicas (`showcoordinates`, `dodaylightcycle`).
+/// Construye `GameRulesChangedPacket` (ID 72 / 0x48) en formato `bedrock-rs` `V2225` (`showcoordinates`, `dodaylightcycle`).
 pub fn build_v2225_game_rules_changed_packet_bytes() -> Bytes {
+    #[cfg(feature = "protocol-core")]
+    {
+        use bedrock::protocol::v662::packets::GameRulesChangedPacket;
+        use bedrock::protocol::v844::types::{
+            GameRuleChanged, GameRulesChangedPacketData, Type as GameRuleType,
+        };
+        use bedrock::protocol::V2225;
+
+        let pkt = GameRulesChangedPacket::<V2225> {
+            rules_data: GameRulesChangedPacketData {
+                rules_list: vec![
+                    GameRuleChanged {
+                        rule_name: "showcoordinates".to_string(),
+                        can_be_modified_by_player: true,
+                        rule_type: GameRuleType::Bool(true),
+                    },
+                    GameRuleChanged {
+                        rule_name: "dodaylightcycle".to_string(),
+                        can_be_modified_by_player: true,
+                        rule_type: GameRuleType::Bool(true),
+                    },
+                ],
+            },
+        };
+        if let Ok(encoded) = encode_bedrock_v2225_packet(&pkt) {
+            return encoded;
+        }
+    }
+
     let mut raw = Vec::with_capacity(48);
     encode_varuint32(0x48, &mut raw); // Packet ID 72 (GameRulesChanged)
     encode_varuint32(2, &mut raw);    // 2 reglas
@@ -1913,9 +2114,8 @@ pub fn queue_spawn_chunks(progress: &mut SessionProgress) -> usize {
     progress.pending_chunks.len()
 }
 
-/// Envía `MovePlayerPacket` (0x13) y `PlayStatus::PlayerSpawn` (0x02, status=3) para el jugador local
-/// una vez que los chunks alrededor del spawn se han transmitido tras `RequestChunkRadius`.
-/// Nota de protocolo Bedrock: NO enviar `AddPlayerPacket (0x0c)` para el jugador local ni `PlayerList` antes del spawn.
+/// Envía `PlayStatus::PlayerSpawn` (0x02, status=3) una vez que los 25 chunks alrededor del spawn se han transmitido.
+/// Nota de protocolo Bedrock (BDS): NO enviar `MovePlayerPacket (0x13)`, `AddPlayerPacket (0x0c)` ni `PlayerList (0x3f)` antes del spawn.
 pub fn send_spawn_finish_sequence(
     conn: &mut Connection,
     session: &mut ServerConnection,
@@ -1943,30 +2143,15 @@ pub fn send_spawn_finish_sequence(
         progress.player_name = effective_name.clone();
         progress.player_uuid = effective_uuid;
 
-        let move_bytes = build_v2225_move_player_packet_bytes(
-            1,
-            0.0,
-            MIN_SPAWN_SAFE_Y,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0,
-            true,
-            progress.movement_tick,
-        );
-        let move_batch = session.encode(&[move_bytes]);
-        conn.send(move_batch, now);
-        progress.has_sent_player_spawn_entities = true;
-
         if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
             let status_batch = session.encode(&[spawn_status]);
             conn.send(status_batch, now);
+            progress.has_sent_player_spawn_entities = true;
             progress.has_sent_player_spawn_status = true;
             progress.pending_spawn_finish = false;
             notify_world_spawn_sent(progress.chunks_sent_count);
             log::info!(
-                "[Bedrock Session] MovePlayer (0x13, 0,64,0) + PlayStatus (0x02, status=3 / PlayerSpawn) enviados a {} tras {} chunks paced (jugador={}, esperando SetLocalPlayerAsInitialized 0x71)",
+                "[Bedrock Session] PlayStatus (0x02, status=3 / PlayerSpawn) enviado a {} tras {} chunks paced (jugador={}, esperando SetLocalPlayerAsInitialized 0x71)",
                 peer_addr,
                 progress.chunks_sent_count,
                 effective_name
@@ -2014,7 +2199,7 @@ pub fn pump_pending_chunks_batch(
                 progress.chunks_sent_count = progress.chunks_sent_count.saturating_add(1);
                 if progress.chunks_sent_count == 1 {
                     log::info!(
-                        "[Bedrock World] Chunk spawn ({},{}) enviado primero a {}: payload={} bytes, packet={} bytes, subchunks=9, suelo stone/grass y=63, aire y>=64, biome_id={} Plains, crc32=0x{:08x}, fnv1a=0x{:08x}, is_client_biome_update=true (restantes={})",
+                        "[Bedrock World] Chunk spawn ({},{}) enviado primero a {}: payload={} bytes, packet={} bytes, subchunks=9, suelo stone/grass y=63, aire y>=64, biome_id={} Plains, crc32=0x{:08x}, fnv1a=0x{:08x}, is_client_biome_update=false (restantes={})",
                         cx,
                         cz,
                         peer_addr,
@@ -2031,7 +2216,7 @@ pub fn pump_pending_chunks_batch(
 
         if progress.pending_chunks.is_empty() && batch_sent > 0 {
             log::info!(
-                "[Bedrock World] Streaming pacing completado: {} chunks totales enviados a {} (crc32=0x{:08x}, fnv1a=0x{:08x}, is_client_biome_update=true)",
+                "[Bedrock World] Streaming pacing completado: {} chunks totales enviados a {} (crc32=0x{:08x}, fnv1a=0x{:08x}, is_client_biome_update=false)",
                 progress.chunks_sent_count,
                 peer_addr,
                 payload_crc32,
@@ -2039,10 +2224,10 @@ pub fn pump_pending_chunks_batch(
             );
         }
 
-        // Tras enviar al menos el anillo central 3x3 (9 chunks) o vaciar la cola, completar spawn con PlayStatus::PlayerSpawn.
+        // Esperar a entregar los 25 chunks (-2..=2, acorde a ChunkRadiusUpdated=2 / view_radius=32) antes de PlayStatus::PlayerSpawn.
         if progress.pending_spawn_finish
             && !progress.has_sent_player_spawn_status
-            && (progress.chunks_sent_count >= 9 || progress.pending_chunks.is_empty())
+            && progress.pending_chunks.is_empty()
         {
             send_spawn_finish_sequence(conn, session, progress, peer_addr, now);
         }
@@ -2252,7 +2437,7 @@ pub fn send_world_start_and_spawn(
                     conn.send(start_batch, now);
                     progress.has_sent_start_game = true;
                     log::info!(
-                        "[Bedrock Session] StartGamePacket enviado a {} (spawn=0,64,0, dim=0 Overworld)",
+                        "[Bedrock Session] StartGamePacket enviado a {} (spawn=0,65.62,0, dim=0 Overworld)",
                         peer_addr
                     );
                     // Nota de protocolo Bedrock: NO enviar ChangeDimensionPacket(dim=0) en el spawn inicial,
@@ -2581,13 +2766,14 @@ pub fn handle_bedrock_session_data(
                     if !progress.has_sent_initial_chunks {
                         progress.has_sent_initial_chunks = true;
                         queued_total = queue_spawn_chunks(progress);
-                        immediate_sent = pump_pending_chunks_batch(conn, session, progress, peer_addr, now, 1);
+                        immediate_sent = pump_pending_chunks_batch(conn, session, progress, peer_addr, now, 4);
                     }
 
                     log::info!(
-                        "[Bedrock World] RequestChunkRadius (0x45, req={}) -> ChunkRadiusUpdated (0x46, radius={}) + NetworkChunkPublisherUpdate + cola={} chunks (inmediato={}, pacing=2/20ms) enviados a {}",
+                        "[Bedrock World] RequestChunkRadius (0x45, req={}) -> ChunkRadiusUpdated (0x46, radius={}) + NetworkChunkPublisherUpdate (view_radius={}) + cola={} chunks (inmediato={}, pacing=4/20ms) enviados a {}",
                         requested,
                         approved,
+                        (approved as u32) * 16,
                         queued_total,
                         immediate_sent,
                         peer_addr
@@ -2676,8 +2862,14 @@ pub fn handle_bedrock_session_data(
                 if let Some((_, Some(screen_id))) = parsed {
                     progress.last_loading_screen_id = Some(screen_id);
                 }
+                let screen_type_name = match parsed.map(|(t, _)| t) {
+                    Some(1) => "StartLoadingScreen",
+                    Some(2) => "EndLoadingScreen",
+                    _ => "Unknown",
+                };
                 log::info!(
-                    "[Bedrock World] ServerboundLoadingScreen (0x138) recibido -> esperando SetLocalPlayerAsInitialized (0x71) (peer={}, screen_type={:?}, loading_screen_id={:?}, expected_id={:?})",
+                    "[Bedrock World] ServerboundLoadingScreen (0x138, {}) recibido -> esperando SetLocalPlayerAsInitialized (0x71) (peer={}, screen_type={:?}, loading_screen_id={:?}, expected_id={:?})",
+                    screen_type_name,
                     peer_addr,
                     parsed.map(|(t, _)| t),
                     parsed.and_then(|(_, id)| id),
@@ -3736,7 +3928,7 @@ pub fn start_async_engine(
                                         &mut peer.progress,
                                         addr,
                                         now,
-                                        2,
+                                        4,
                                     );
                                 });
                             }
@@ -4208,7 +4400,10 @@ mod tests {
         assert!(!injected_again);
 
         let spawn_pos_bytes = build_v2225_set_spawn_position_packet_bytes(0, 64, 0, 0);
-        assert_eq!(RawPacket::parse(spawn_pos_bytes).expect("parse set_spawn_position").id, 0x2b);
+        let spawn_pos_raw = RawPacket::parse(spawn_pos_bytes).expect("parse set_spawn_position");
+        assert_eq!(spawn_pos_raw.id, 0x2b);
+        // NetworkBlockPosition.y debe ir en ZigZag32: 64 -> 128 -> [0x80, 0x01]
+        assert!(spawn_pos_raw.body.windows(2).any(|w| w == [0x80, 0x01]));
 
         let diff_bytes = build_v2225_set_difficulty_packet_bytes(2);
         assert_eq!(RawPacket::parse(diff_bytes).expect("parse set_difficulty").id, 0x3c);
@@ -4221,7 +4416,7 @@ mod tests {
         let biome_bytes = build_v2225_biome_definition_list_bytes();
         let biome_raw = RawPacket::parse(biome_bytes).expect("parse biome_definition_list");
         assert_eq!(biome_raw.id, 0x7a);
-        assert_eq!(biome_raw.body.as_ref(), &[0x00, 0x00]);
+        assert!(biome_raw.body.windows(6).any(|w| w == b"plains"));
 
         let entity_bytes = build_v2225_available_entity_identifiers_bytes();
         let entity_raw = RawPacket::parse(entity_bytes).expect("parse available_entity_identifiers");
@@ -4231,7 +4426,9 @@ mod tests {
         assert!(entity_raw.body.windows(14).any(|w| w == b"minecraft:boat"));
 
         let item_reg_bytes = build_v2225_item_component_registry_bytes();
-        assert_eq!(RawPacket::parse(item_reg_bytes).expect("parse item_registry").id, 0xa2);
+        let item_reg_raw = RawPacket::parse(item_reg_bytes).expect("parse item_registry");
+        assert_eq!(item_reg_raw.id, 0xa2);
+        assert!(item_reg_raw.body.len() > 100_000);
 
         let creative_bytes = build_v2225_creative_content_bytes();
         assert_eq!(RawPacket::parse(creative_bytes).expect("parse creative_content").id, 0x91);
@@ -4241,7 +4438,7 @@ mod tests {
                 .expect("level_chunk");
         let chunk_raw = RawPacket::parse(chunk_bytes).expect("parse level_chunk");
         assert_eq!(chunk_raw.id, 0x3a);
-        assert_eq!(chunk_raw.body.last().copied(), Some(0x01));
+        assert_eq!(chunk_raw.body.last().copied(), Some(0x00));
 
         let spawn_bytes = build_v2225_player_spawn_status_bytes().expect("player_spawn");
         let spawn_raw = RawPacket::parse(spawn_bytes).expect("parse player_spawn");
@@ -4299,7 +4496,9 @@ mod tests {
             true,
             1,
         );
-        assert_eq!(RawPacket::parse(move_pkt).expect("parse move_player").id, 0x13);
+        let move_raw = RawPacket::parse(move_pkt).expect("parse move_player");
+        assert_eq!(move_raw.id, 0x13);
+        assert_eq!(&move_raw.body[move_raw.body.len() - 3..], &[0x00, 0x00, 0x01]);
 
         let mut latency_body = Vec::new();
         latency_body.extend_from_slice(&123_456_789i64.to_le_bytes());
