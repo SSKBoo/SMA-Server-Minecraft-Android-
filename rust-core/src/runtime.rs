@@ -66,6 +66,7 @@ pub struct SessionProgress {
     pub has_sent_login_success: bool,
     pub has_sent_resource_packs_info: bool,
     pub has_sent_resource_packs_stack: bool,
+    pub has_completed_resource_packs: bool,
     pub has_received_client_cache_status: bool,
     pub has_sent_start_game: bool,
     pub has_sent_world_registries: bool,
@@ -2003,7 +2004,7 @@ pub fn build_v2225_voxel_shapes_bytes() -> Result<Bytes, String> {
     encode_bedrock_v2225_packet(&pkt)
 }
 
-pub fn send_resource_packs_sequence(
+pub fn send_resource_packs_info_only(
     conn: &mut Connection,
     session: &mut ServerConnection,
     progress: &mut SessionProgress,
@@ -2025,6 +2026,22 @@ pub fn send_resource_packs_sequence(
                 }
             }
         }
+    }
+    #[cfg(not(feature = "protocol-core"))]
+    {
+        let _ = (conn, session, progress, peer_addr, now);
+    }
+}
+
+pub fn send_resource_packs_stack_only(
+    conn: &mut Connection,
+    session: &mut ServerConnection,
+    progress: &mut SessionProgress,
+    peer_addr: SocketAddr,
+    now: Instant,
+) {
+    #[cfg(feature = "protocol-core")]
+    {
         if !progress.has_sent_resource_packs_stack {
             match build_v2225_resource_pack_stack_bytes() {
                 Ok(rp_stack) => {
@@ -2045,6 +2062,17 @@ pub fn send_resource_packs_sequence(
     }
 }
 
+pub fn send_resource_packs_sequence(
+    conn: &mut Connection,
+    session: &mut ServerConnection,
+    progress: &mut SessionProgress,
+    peer_addr: SocketAddr,
+    now: Instant,
+) {
+    send_resource_packs_info_only(conn, session, progress, peer_addr, now);
+    send_resource_packs_stack_only(conn, session, progress, peer_addr, now);
+}
+
 pub fn send_world_start_and_spawn(
     conn: &mut Connection,
     session: &mut ServerConnection,
@@ -2052,6 +2080,10 @@ pub fn send_world_start_and_spawn(
     peer_addr: SocketAddr,
     now: Instant,
 ) {
+    if progress.has_sent_start_game && progress.has_sent_player_spawn_status {
+        return;
+    }
+
     // Asegurar secuencia oficial de bedrock-rs: ResourcePacksInfo -> ResourcePackStack -> VoxelShapes -> StartGamePacket
     send_resource_packs_sequence(conn, session, progress, peer_addr, now);
 
@@ -2071,29 +2103,11 @@ pub fn send_world_start_and_spawn(
                     conn.send(start_batch, now);
                     progress.has_sent_start_game = true;
                     log::info!(
-                        "[Bedrock Session] StartGamePacket enviado a {} (spawn=0,64,0)",
+                        "[Bedrock Session] StartGamePacket enviado a {} (spawn=0,64,0, dim=0 Overworld)",
                         peer_addr
                     );
-
-                    // P0-1 & P1: ChangeDimensionPacket (0x3d) inmediatamente después de StartGamePacket
-                    // con LoadingScreenId = Some(1) porque el jugador está vivo (respawn=false).
-                    let loading_screen_id = Some(1u32);
-                    let change_dim_bytes = build_v2225_change_dimension_packet_bytes(
-                        0,
-                        0.0,
-                        MIN_SPAWN_SAFE_Y,
-                        0.0,
-                        false,
-                        loading_screen_id,
-                    );
-                    let change_dim_batch = session.encode(&[change_dim_bytes]);
-                    conn.send(change_dim_batch, now);
-                    progress.expected_loading_screen_id = loading_screen_id;
-                    log::info!(
-                        "[Bedrock Session] ChangeDimensionPacket (0x3d, dim=0, pos=0,64,0, respawn=false, loading_screen_id={:?}) enviado a {}",
-                        loading_screen_id,
-                        peer_addr
-                    );
+                    // Nota de protocolo Bedrock: NO enviar ChangeDimensionPacket(dim=0) en el spawn inicial,
+                    // ya que StartGamePacket sitúa al jugador en dim=0 y re-enviar dim=0 deja la pantalla de carga infinita.
                 }
                 Err(err) => {
                     log::warn!("[Bedrock Session] Error codificando StartGamePacket: {}", err);
@@ -2138,6 +2152,7 @@ pub fn send_world_start_and_spawn(
         let sent_chunks = if !progress.has_sent_initial_chunks {
             let n = send_spawn_chunks(conn, session, peer_addr, now, 4);
             progress.has_sent_initial_chunks = true;
+            progress.has_sent_chunk_radius = true;
             n
         } else {
             0
@@ -2188,12 +2203,25 @@ pub fn send_world_start_and_spawn(
                 conn.send(batch, now);
             }
             progress.has_sent_player_spawn_entities = true;
-            // P0-2: El servidor NO envía SetLocalPlayerAsInitialized (0x71) ni marca inicialización hasta recibirlo del cliente.
             log::info!(
-                "[Bedrock Session] PlayerList (0x3f) + AddPlayer (0x0c) + MovePlayer (0x13, 0,64,0) enviados a {} (jugador={}, esperando ServerboundLoadingScreen 0x138 y SetLocalPlayerAsInitialized 0x71)",
+                "[Bedrock Session] PlayerList (0x3f) + AddPlayer (0x0c) + MovePlayer (0x13, 0,64,0) enviados a {} (jugador={})",
                 peer_addr,
                 effective_name
             );
+        }
+
+        // PlayStatus::PlayerSpawn (0x02, status=3) DEBE enviarse después de StartGame + Chunks + Spawn
+        // para que el cliente cierre la pantalla de carga y responda con SetLocalPlayerAsInitialized (0x71).
+        if !progress.has_sent_player_spawn_status {
+            if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
+                let status_batch = session.encode(&[spawn_status]);
+                conn.send(status_batch, now);
+                progress.has_sent_player_spawn_status = true;
+                log::info!(
+                    "[Bedrock Session] PlayStatus (0x02, status=3 / PlayerSpawn) enviado a {} tras StartGame + Chunks (esperando SetLocalPlayerAsInitialized 0x71)",
+                    peer_addr
+                );
+            }
         }
 
         notify_world_spawn_sent(sent_chunks);
@@ -2364,59 +2392,88 @@ pub fn handle_bedrock_session_data(
                 );
             }
 
-            // Respuesta del cliente al ServerToClientHandshake (0x04 ClientToServerHandshake) -> ResourcePacksInfo + ResourcePackStack
+            // Respuesta del cliente al ServerToClientHandshake (0x04 ClientToServerHandshake) -> ResourcePacksInfo (0x06)
             id if id == ClientToServerHandshake::ID => {
                 let _ = pkt.decode::<ClientToServerHandshake>();
                 let _ = ServerToClientHandshake::ID;
-                let play_status = PlayStatus {
-                    status: PlayStatusStatus::LoginSuccess,
-                };
-                let mut status_buf = BytesMut::new();
-                encode_packet(&play_status, &mut status_buf);
-                let status_batch = session.encode(&[status_buf.freeze()]);
-                conn.send(status_batch, now);
-                progress.has_sent_login_success = true;
+                if !progress.has_sent_login_success {
+                    let play_status = PlayStatus {
+                        status: PlayStatusStatus::LoginSuccess,
+                    };
+                    let mut status_buf = BytesMut::new();
+                    encode_packet(&play_status, &mut status_buf);
+                    let status_batch = session.encode(&[status_buf.freeze()]);
+                    conn.send(status_batch, now);
+                    progress.has_sent_login_success = true;
+                }
 
-                send_resource_packs_sequence(conn, session, progress, peer_addr, now);
+                send_resource_packs_info_only(conn, session, progress, peer_addr, now);
                 log::info!(
-                    "[Bedrock Login] ClientToServerHandshake (0x04) + PlayStatus (0x02, status=0 / LoginSuccess) completados con {} -> ResourcePacksInfo + ResourcePackStack enviados",
+                    "[Bedrock Login] ClientToServerHandshake (0x04) completado con {} -> ResourcePacksInfo (0x06) enviado",
                     peer_addr
                 );
             }
 
-            // Respuesta de paquetes de recursos (0x08 ResourcePackClientResponse) -> ResourcePackStack / StartGame
+            // Respuesta de paquetes de recursos (0x08 ResourcePackClientResponse) -> ResourcePackStack (0x07) -> StartGame (0x0b)
             id if id == ResourcePackClientResponse::ID => {
-                if let Ok(rp) = pkt.decode::<ResourcePackClientResponse>() {
-                    match rp.response_status {
-                        ResourcePackClientResponseResponseStatus::HaveAllPacks => {
-                            send_resource_packs_sequence(conn, session, progress, peer_addr, now);
+                match pkt.decode::<ResourcePackClientResponse>() {
+                    Ok(rp) => {
+                        log::info!(
+                            "[Bedrock Packs] ResourcePackClientResponse (0x08) status={:?} ({} bytes) desde {}",
+                            rp.response_status,
+                            pkt.body.len(),
+                            peer_addr
+                        );
+                        match rp.response_status {
+                            ResourcePackClientResponseResponseStatus::HaveAllPacks
+                            | ResourcePackClientResponseResponseStatus::SendPacks => {
+                                send_resource_packs_stack_only(conn, session, progress, peer_addr, now);
+                            }
+                            ResourcePackClientResponseResponseStatus::Completed => {
+                                progress.has_completed_resource_packs = true;
+                                send_world_start_and_spawn(conn, session, progress, peer_addr, now);
+                            }
+                            _ => {}
                         }
-                        ResourcePackClientResponseResponseStatus::Completed => {
-                            log::info!("[Bedrock Packs] ResourcePackClientResponse Completed desde {}", peer_addr);
-                            send_world_start_and_spawn(conn, session, progress, peer_addr, now);
-                        }
-                        _ => {}
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "[Bedrock Packs] Error decodificando ResourcePackClientResponse (0x08, {} bytes) desde {}: {}",
+                            pkt.body.len(),
+                            peer_addr,
+                            err
+                        );
                     }
                 }
             }
 
-            // FASE 4 P0/P1: Al recibir ClientCacheStatus (0x81 / 129), enviar secuencia de recursos si falta,
-            // VoxelShapesPacket, StartGamePacket (0x0b), SetTimePacket (0x0a), Chunks iniciales nbtx y PlayStatus::PlayerSpawn (0x02).
+            // FASE 4 P0/P1: ClientCacheStatus (0x81 / 129) suele llegar antes que ResourcePackClientResponse::Completed.
+            // Registramos el estado sin disparar StartGamePacket prematuramente ni repetirlo si ya inició el mundo.
             id if id == ClientCacheStatus::ID || id == 0x81 => {
                 progress.has_received_client_cache_status = true;
                 let cache_enabled = pkt
                     .decode::<ClientCacheStatus>()
                     .map(|c| c.enabled)
                     .unwrap_or(false);
-                log::info!(
-                    "[Bedrock Session] ClientCacheStatus (0x81, enabled={}) recibido de {} -> disparando StartGamePacket + Spawn + Chunks",
-                    cache_enabled,
-                    peer_addr
-                );
-                send_world_start_and_spawn(conn, session, progress, peer_addr, now);
+                if progress.has_completed_resource_packs && !progress.has_sent_start_game {
+                    log::info!(
+                        "[Bedrock Session] ClientCacheStatus (0x81, enabled={}) recibido de {} tras ResourcePacks -> disparando StartGamePacket + Spawn + Chunks",
+                        cache_enabled,
+                        peer_addr
+                    );
+                    send_world_start_and_spawn(conn, session, progress, peer_addr, now);
+                } else {
+                    log::info!(
+                        "[Bedrock Session] ClientCacheStatus (0x81, enabled={}) recibido de {} (rp_completed={}, start_game_sent={})",
+                        cache_enabled,
+                        peer_addr,
+                        progress.has_completed_resource_packs,
+                        progress.has_sent_start_game
+                    );
+                }
             }
 
-            // Solicitud de radio de chunks (0x45 / 69 RequestChunkRadius) -> ChunkRadiusUpdated (0x46) + chunks spawn
+            // Solicitud de radio de chunks (0x45 / 69 RequestChunkRadius) -> ChunkRadiusUpdated (0x46) + NetworkChunkPublisherUpdate + chunks/PlayerSpawn
             id if id == RequestChunkRadius::ID || id == 0x45 => {
                 progress.last_packet_name = "RequestChunkRadius".to_string();
                 let requested = pkt
@@ -2425,12 +2482,34 @@ pub fn handle_bedrock_session_data(
                     .unwrap_or(4);
                 #[cfg(feature = "protocol-core")]
                 {
+                    use bedrock::protocol::v662::packets::NetworkChunkPublisherUpdatePacket;
+                    use bedrock::protocol::v662::types::BlockPos;
+                    use bedrock::protocol::V2225;
+
                     let approved = send_chunk_radius_updated(conn, session, peer_addr, now, requested);
                     progress.has_sent_chunk_radius = true;
                     if !progress.has_sent_initial_chunks {
                         let sent = send_spawn_chunks(conn, session, peer_addr, now, approved);
                         progress.has_sent_initial_chunks = true;
                         notify_world_spawn_sent(sent);
+                    } else if let Ok(pub_pkt) = encode_bedrock_v2225_packet(&NetworkChunkPublisherUpdatePacket::<V2225> {
+                        new_view_position: BlockPos { x: 0, y: 64, z: 0 },
+                        new_view_radius: (approved as u32) * 16,
+                        server_built_chunks: Vec::new(),
+                    }) {
+                        let batch = session.encode(&[pub_pkt]);
+                        conn.send(batch, now);
+                    }
+                    if progress.has_sent_start_game && !progress.has_sent_player_spawn_status {
+                        if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
+                            let status_batch = session.encode(&[spawn_status]);
+                            conn.send(status_batch, now);
+                            progress.has_sent_player_spawn_status = true;
+                            log::info!(
+                                "[Bedrock Session] PlayStatus (0x02, status=3 / PlayerSpawn) enviado a {} tras RequestChunkRadius",
+                                peer_addr
+                            );
+                        }
                     }
                     log::info!(
                         "[Bedrock World] RequestChunkRadius (0x45, req={}) -> ChunkRadiusUpdated (0x46, radius={}) enviado a {}",
@@ -2532,16 +2611,17 @@ pub fn handle_bedrock_session_data(
             }
 
             // Confirmación del cliente tras aparecer en el mundo (0x71 / 113 SetLocalPlayerAsInitialized).
-            // P0-1: Al recibir 0x71, marcar client_init=true y SOLO ENTONCES enviar PlayStatus::PlayerSpawn (0x02, status=3).
+            // El cliente envía 0x71 después de recibir PlayStatus::PlayerSpawn (0x02, status=3) y cargar chunks.
             id if id == SetLocalPlayerAsInitialized::ID || id == 0x71 => {
                 progress.last_packet_name = "SetLocalPlayerAsInitialized".to_string();
                 let _ = pkt.decode::<SetLocalPlayerAsInitialized>();
                 progress.set_local_player_initialized = true;
                 progress.client_sent_local_player_init = true;
                 log::info!(
-                    "[Bedrock World] SetLocalPlayerAsInitialized (0x71) recibido desde {} (client_init={}, loading_screen_id={:?})",
+                    "[Bedrock World] SetLocalPlayerAsInitialized (0x71) recibido desde {} (client_init={}, spawn_status_sent={}, loading_screen_id={:?})",
                     peer_addr,
                     progress.client_sent_local_player_init,
+                    progress.has_sent_player_spawn_status,
                     progress.last_loading_screen_id
                 );
                 #[cfg(feature = "protocol-core")]
@@ -2551,9 +2631,8 @@ pub fn handle_bedrock_session_data(
                         conn.send(status_batch, now);
                         progress.has_sent_player_spawn_status = true;
                         log::info!(
-                            "[Bedrock Session] PlayStatus (0x02, status=3 / PlayerSpawn) enviado a {} tras SetLocalPlayerAsInitialized (0x71) (client_init={})",
-                            peer_addr,
-                            progress.client_sent_local_player_init
+                            "[Bedrock Session] PlayStatus (0x02, status=3 / PlayerSpawn) enviado a {} tras SetLocalPlayerAsInitialized (0x71) (fallback)",
+                            peer_addr
                         );
                     }
                 }
@@ -2587,7 +2666,7 @@ pub fn format_disconnect_debug_summary(
         }
     };
     let hint = if progress.has_sent_login_success && !progress.has_sent_start_game {
-        "desconexión antes de StartGamePacket / faltó ClientCacheStatus"
+        "desconexión antes de StartGamePacket / faltó ResourcePackClientResponse::Completed"
     } else if reason.to_ascii_lowercase().contains("ice") {
         "ICE disconnected: pérdida de conectividad UDP/STUN o cierre de PeerConnection tras espera de spawn"
     } else if progress.has_sent_start_game && !progress.has_sent_chunk_radius {
@@ -2600,7 +2679,7 @@ pub fn format_disconnect_debug_summary(
         "cierre de transporte WebRTC"
     };
     format!(
-        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | chunk_radius={} | spawn_init={} | client_init={} | loading_screen_id={:?} | local_ice={}",
+        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | rp_done={} | chunk_radius={} | spawn_status={} | spawn_init={} | client_init={} | loading_screen_id={:?} | local_ice={}",
         remote_addr,
         sid,
         reason,
@@ -2609,7 +2688,9 @@ pub fn format_disconnect_debug_summary(
         progress.player_auth_input_count,
         progress.latency_ping_count,
         progress.keepalives_sent,
+        progress.has_completed_resource_packs,
         progress.has_sent_chunk_radius,
+        progress.has_sent_player_spawn_status,
         progress.set_local_player_initialized,
         progress.client_sent_local_player_init,
         progress.last_loading_screen_id,
