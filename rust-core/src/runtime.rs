@@ -802,10 +802,7 @@ pub fn ensure_sdp_ice_candidate(answer_sdp: &str, local_candidate: SocketAddr) -
         return (answer_sdp.to_string(), false);
     }
 
-    let eol = if answer_sdp.contains("
-") { "
-" } else { "
-" };
+    let eol = if answer_sdp.contains("\r\n") { "\r\n" } else { "\n" };
     let cand_line = format!(
         "a=candidate:1 1 UDP 2130706431 {} {} typ host{}",
         target_ip_str,
@@ -822,8 +819,7 @@ pub fn ensure_sdp_ice_candidate(answer_sdp: &str, local_candidate: SocketAddr) -
     }
 
     let mut out = answer_sdp.to_string();
-    if !out.is_empty() && !out.ends_with('
-') {
+    if !out.is_empty() && !out.ends_with('\n') {
         out.push_str(eol);
     }
     out.push_str(&cand_line);
