@@ -792,11 +792,50 @@ pub fn extract_sdp_ice_candidates(sdp: &str) -> Vec<String> {
         .collect()
 }
 
+/// Garantiza que el SDP answer incluya una línea `a=candidate:` UDP host con la IP local resuelta.
+/// Si `str0m` no incluyó candidatos con esa IP, la inyecta antes de `a=end-of-candidates` (o al final).
+pub fn ensure_sdp_ice_candidate(answer_sdp: &str, local_candidate: SocketAddr) -> (String, bool) {
+    let target_ip = normalize_ice_ip(local_candidate.ip());
+    let target_ip_str = target_ip.to_string();
+    let existing = extract_sdp_ice_candidates(answer_sdp);
+    if existing.iter().any(|c| c.split_whitespace().any(|tok| tok == target_ip_str)) {
+        return (answer_sdp.to_string(), false);
+    }
+
+    let eol = if answer_sdp.contains("
+") { "
+" } else { "
+" };
+    let cand_line = format!(
+        "a=candidate:1 1 UDP 2130706431 {} {} typ host{}",
+        target_ip_str,
+        local_candidate.port(),
+        eol
+    );
+
+    if let Some(pos) = answer_sdp.find("a=end-of-candidates") {
+        let mut out = String::with_capacity(answer_sdp.len() + cand_line.len());
+        out.push_str(&answer_sdp[..pos]);
+        out.push_str(&cand_line);
+        out.push_str(&answer_sdp[pos..]);
+        return (out, true);
+    }
+
+    let mut out = answer_sdp.to_string();
+    if !out.is_empty() && !out.ends_with('
+') {
+        out.push_str(eol);
+    }
+    out.push_str(&cand_line);
+    (out, true)
+}
+
 /// Resuelve una IP local concreta (no 0.0.0.0) normalizando direcciones IPv4-mapeadas en IPv6 para que
 /// `str0m::Candidate::host` dentro de `Connection::answer` incluya un candidato ICE UDP válido en el SDP answer.
 fn resolve_local_candidate_addr(preferred_ip: Option<IpAddr>, udp_port: u16) -> SocketAddr {
-    if let Some(ip) = preferred_ip.map(normalize_ice_ip) {
-        if !ip.is_unspecified() {
+    let norm_preferred = preferred_ip.map(normalize_ice_ip);
+    if let Some(ip) = norm_preferred {
+        if !ip.is_unspecified() && !ip.is_loopback() {
             return SocketAddr::new(ip, udp_port);
         }
     }
@@ -804,10 +843,15 @@ fn resolve_local_candidate_addr(preferred_ip: Option<IpAddr>, udp_port: u16) -> 
         if probe.connect("8.8.8.8:80").is_ok() {
             if let Ok(local) = probe.local_addr() {
                 let norm = normalize_ice_ip(local.ip());
-                if !norm.is_unspecified() {
+                if !norm.is_unspecified() && !norm.is_loopback() {
                     return SocketAddr::new(norm, udp_port);
                 }
             }
+        }
+    }
+    if let Some(ip) = norm_preferred {
+        if !ip.is_unspecified() {
+            return SocketAddr::new(ip, udp_port);
         }
     }
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), udp_port)
@@ -2060,19 +2104,6 @@ pub fn send_world_start_and_spawn(
                 }
             }
 
-            // P0-1: PlayStatus::PlayerSpawn (0x02, status=3) después de ChangeDimensionPacket y ANTES de los chunks.
-            if !progress.has_sent_player_spawn_status {
-                if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
-                    let status_batch = session.encode(&[spawn_status]);
-                    conn.send(status_batch, now);
-                    progress.has_sent_player_spawn_status = true;
-                    log::info!(
-                        "[Bedrock Session] PlayStatus (0x02, status=3 / PlayerSpawn) enviado a {} (después de ChangeDimension, antes de chunks)",
-                        peer_addr
-                    );
-                }
-            }
-
             if !progress.has_sent_world_registries {
                 let spawn_pos_bytes = build_v2225_set_spawn_position_packet_bytes(0, 64, 0, 0);
                 let difficulty_bytes = build_v2225_set_difficulty_packet_bytes(2);
@@ -2488,7 +2519,7 @@ pub fn handle_bedrock_session_data(
             }
 
             // Pantalla de carga del cliente completada (0x138 / 312 ServerboundLoadingScreen):
-            // P0-3: Registrar LoadingScreenId, NO reenviar PlayStatus, SetPlayerGameType ni ChunkRadiusUpdated; esperar 0x71.
+            // P1: Registrar LoadingScreenId, NO enviar SetPlayerGameType, ChunkRadiusUpdated ni PlayStatus; esperar 0x71.
             id if id == 0x138 || name == "ServerboundLoadingScreen" => {
                 progress.last_packet_name = "ServerboundLoadingScreen".to_string();
                 let parsed = parse_serverbound_loading_screen_packet(&pkt.body);
@@ -2496,7 +2527,7 @@ pub fn handle_bedrock_session_data(
                     progress.last_loading_screen_id = Some(screen_id);
                 }
                 log::info!(
-                    "[Bedrock World] ServerboundLoadingScreen (0x138) recibido de {} (screen_type={:?}, loading_screen_id={:?}, expected_id={:?}) -> esperando SetLocalPlayerAsInitialized (0x71)",
+                    "[Bedrock World] ServerboundLoadingScreen (0x138) recibido -> esperando SetLocalPlayerAsInitialized (0x71) (peer={}, screen_type={:?}, loading_screen_id={:?}, expected_id={:?})",
                     peer_addr,
                     parsed.map(|(t, _)| t),
                     parsed.and_then(|(_, id)| id),
@@ -2505,17 +2536,31 @@ pub fn handle_bedrock_session_data(
             }
 
             // Confirmación del cliente tras aparecer en el mundo (0x71 / 113 SetLocalPlayerAsInitialized).
-            // P0-2: El servidor solo recibe 0x71; nunca lo envía.
+            // P0-1: Al recibir 0x71, marcar client_init=true y SOLO ENTONCES enviar PlayStatus::PlayerSpawn (0x02, status=3).
             id if id == SetLocalPlayerAsInitialized::ID || id == 0x71 => {
                 progress.last_packet_name = "SetLocalPlayerAsInitialized".to_string();
                 let _ = pkt.decode::<SetLocalPlayerAsInitialized>();
                 progress.set_local_player_initialized = true;
                 progress.client_sent_local_player_init = true;
                 log::info!(
-                    "[Bedrock World] Confirmación recibida: SetLocalPlayerAsInitialized (0x71) desde {} (loading_screen_id={:?}) -> jugador inicializado, PlayerAuthInput aceptado",
+                    "[Bedrock World] SetLocalPlayerAsInitialized (0x71) recibido desde {} (client_init={}, loading_screen_id={:?})",
                     peer_addr,
+                    progress.client_sent_local_player_init,
                     progress.last_loading_screen_id
                 );
+                #[cfg(feature = "protocol-core")]
+                if !progress.has_sent_player_spawn_status {
+                    if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
+                        let status_batch = session.encode(&[spawn_status]);
+                        conn.send(status_batch, now);
+                        progress.has_sent_player_spawn_status = true;
+                        log::info!(
+                            "[Bedrock Session] PlayStatus (0x02, status=3 / PlayerSpawn) enviado a {} tras SetLocalPlayerAsInitialized (0x71) (client_init={})",
+                            peer_addr,
+                            progress.client_sent_local_player_init
+                        );
+                    }
+                }
             }
 
             other => {
@@ -2694,6 +2739,11 @@ async fn handle_http_signaling_stream(
         };
 
         let local_candidate = resolve_local_candidate_addr(local_tcp_ip, udp_port);
+        log::info!(
+            "[NetherNet ICE] IP local utilizada para candidatos ICE: {} (preferred_tcp_ip={:?})",
+            local_candidate,
+            local_tcp_ip
+        );
         let offer_candidates = extract_sdp_ice_candidates(offer_sdp);
         if !is_private_or_loopback_ip(peer_addr.ip()) && is_private_or_loopback_ip(local_candidate.ip()) {
             log::warn!(
@@ -2727,15 +2777,24 @@ async fn handle_http_signaling_stream(
             Connection::answer(offer_sdp, local_candidate, &host_key, now)
         };
         match answer_res {
-            Ok((mut conn, answer_sdp)) => {
+            Ok((mut conn, raw_answer_sdp)) => {
+                let (answer_sdp, injected_fallback) =
+                    ensure_sdp_ice_candidate(&raw_answer_sdp, local_candidate);
                 let answer_candidates = extract_sdp_ice_candidates(&answer_sdp);
                 log::info!(
-                    "Señalización HTTP recibida: SDP offer procesado para {} (candidato ICE local={} | offer_cands={} | answer_cands={} | client_ver={:?})",
+                    "Señalización HTTP recibida: SDP offer procesado para {} (candidato ICE local={} | offer_cands={} | answer_cands={} | injected_fallback={} | client_ver={:?})",
                     peer_addr,
                     local_candidate,
                     offer_candidates.len(),
                     answer_candidates.len(),
+                    injected_fallback,
                     query_params.version
+                );
+                log::info!(
+                    "[NetherNet SDP] Respuesta SDP completa para {} (candidatos={:?}):\n{}",
+                    peer_addr,
+                    answer_candidates,
+                    answer_sdp
                 );
 
                 while let Some(tx) = conn.poll_transmit() {
@@ -3122,19 +3181,31 @@ pub fn start_async_engine(
                                                         } else {
                                                             Connection::answer(&sig.data, local_cand, &lan_key, now).ok()
                                                         };
-                                                        if let Some((mut conn, answer_sdp)) = lan_ans {
-                                                            log::info!("Señalización LAN recibida: ConnectRequest desde {} (session={})", from, sig.connection_id);
+                                                        if let Some((mut conn, raw_answer_sdp)) = lan_ans {
+                                                            let (answer_sdp, injected_fallback) =
+                                                                ensure_sdp_ice_candidate(&raw_answer_sdp, local_cand);
+                                                            let answer_cands = extract_sdp_ice_candidates(&answer_sdp);
+                                                            log::info!(
+                                                                "Señalización LAN recibida: ConnectRequest desde {} (session={}, local_ice={}, answer_cands={}, injected_fallback={})",
+                                                                from,
+                                                                sig.connection_id,
+                                                                local_cand,
+                                                                answer_cands.len(),
+                                                                injected_fallback
+                                                            );
                                                             while let Some(tx) = conn.poll_transmit() {
                                                                 let _ = lan_udp.send_to(&tx.contents, tx.destination).await;
                                                             }
                                                             if let Ok(mut guard) = lan_peers.lock() {
+                                                                let mut init_progress = SessionProgress::default();
+                                                                init_progress.local_ice_candidate = local_cand.to_string();
                                                                 guard.insert(
                                                                     sig.connection_id,
                                                                     PeerSession {
                                                                         conn,
                                                                         session: ServerConnection::nethernet(lan_key.clone()),
                                                                         remote_addr: from,
-                                                                        progress: SessionProgress::default(),
+                                                                        progress: init_progress,
                                                                     },
                                                                 );
                                                             }
@@ -3939,6 +4010,13 @@ mod tests {
         assert_eq!(extract_sdp_ice_candidates(sdp_sample).len(), 1);
         assert!(is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))));
         assert!(!is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        let cand_addr: SocketAddr = "192.168.1.85:19132".parse().expect("cand addr");
+        let sdp_no_cand = "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=end-of-candidates\r\n";
+        let (patched_sdp, injected) = ensure_sdp_ice_candidate(sdp_no_cand, cand_addr);
+        assert!(injected);
+        assert!(patched_sdp.contains("a=candidate:1 1 UDP 2130706431 192.168.1.85 19132 typ host"));
+        let (_unchanged_sdp, injected_again) = ensure_sdp_ice_candidate(&patched_sdp, cand_addr);
+        assert!(!injected_again);
 
         let spawn_pos_bytes = build_v2225_set_spawn_position_packet_bytes(0, 64, 0, 0);
         assert_eq!(RawPacket::parse(spawn_pos_bytes).expect("parse set_spawn_position").id, 0x2b);
