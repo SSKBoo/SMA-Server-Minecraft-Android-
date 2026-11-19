@@ -73,6 +73,7 @@ pub struct SessionProgress {
     pub has_sent_player_spawn_entities: bool,
     pub has_sent_chunk_radius: bool,
     pub set_local_player_initialized: bool,
+    pub client_sent_local_player_init: bool,
     pub player_name: String,
     pub player_uuid: [u8; 16],
     pub player_auth_input_count: u64,
@@ -972,6 +973,19 @@ pub fn fnv1a_32_checksum(bytes: &[u8]) -> u32 {
     hash
 }
 
+/// Calcula el checksum CRC32 estándar (IEEE 802.3, polinomio 0xEDB88320) sobre payloads de chunks.
+pub fn crc32_checksum(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 /// Calcula el hash FNV-1a 32-bit de un compuesto NBT little-endian de estado de bloque Bedrock 1.20+/1.26.
 /// Incluye únicamente `name` y `states` (sin campo `version`) sin pasar por `HashMap` ni `write_map`.
 pub fn block_state_hash_nbtx(block_name: &str) -> u32 {
@@ -1104,15 +1118,15 @@ pub fn write_nbt_network_compound_from_pairs(
 }
 
 fn append_uniform_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, primary_hash: u32, secondary_hash: u32) {
-    // Formato NETWORK Bedrock v9 completo con 1 bit/bloque (0x03 = (1 << 1) | 1):
-    // 128 palabras u32 Little-Endian (512 bytes) + paleta explícita de 2 entradas ZigZag VarInt32.
+    // Formato NETWORK Bedrock v9 completo con 4 bits/bloque (0x09 = (4 << 1) | 1):
+    // 512 palabras u32 Little-Endian (2048 bytes por subchunk, 8 bloques/palabra) + paleta explícita de 2 entradas ZigZag VarInt32.
     out.push(0x09); // SubChunk versión 9
     out.push(0x01); // 1 capa de bloques
     out.push(sub_y as u8);
-    out.push(0x03); // 1 bit por bloque + flag network=1 (Little-Endian)
+    out.push(0x09); // 4 bits por bloque ((4 << 1) | 1) + flag network=1 (Little-Endian)
 
-    // Todos los 4096 bloques apuntan al índice 0 (primary_hash) en formato network XZY
-    for _ in 0..128usize {
+    // Todos los 4096 bloques apuntan al índice 0 (primary_hash) en formato network XZY (512 palabras u32 = 2048 bytes)
+    for _ in 0..512usize {
         out.extend_from_slice(&0u32.to_le_bytes());
     }
 
@@ -1126,17 +1140,17 @@ fn append_surface_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, stone_hash: u32, gra
     out.push(0x09); // SubChunk versión 9
     out.push(0x01); // 1 capa de bloques
     out.push(sub_y as u8);
-    out.push(0x03); // 1 bit por bloque (paleta de 2 valores) + flag network=1
+    out.push(0x09); // 4 bits por bloque ((4 << 1) | 1) + flag network=1 (512 palabras u32 = 2048 bytes)
 
-    // 4096 bloques empaquetados a 1 bit/bloque -> 128 palabras u32 LE.
+    // 4096 bloques empaquetados a 4 bits/bloque (8 bloques por palabra u32 LE) -> 512 palabras u32 LE (2048 bytes).
     // Coordenada en SubChunk: index = (x << 8) | (z << 4) | y -> local_y = index & 0x0F.
-    for word_idx in 0..128usize {
-        let base = word_idx * 32;
+    for word_idx in 0..512usize {
+        let base = word_idx * 8;
         let mut word: u32 = 0;
-        for bit in 0..32usize {
-            let local_y = (base + bit) & 0x0F;
+        for slot in 0..8usize {
+            let local_y = (base + slot) & 0x0F;
             if local_y == 15 {
-                word |= 1u32 << bit;
+                word |= 1u32 << (slot * 4);
             }
         }
         out.extend_from_slice(&word.to_le_bytes());
@@ -1148,7 +1162,8 @@ fn append_surface_subchunk_v9(out: &mut Vec<u8>, sub_y: i8, stone_hash: u32, gra
 }
 
 fn append_overworld_biomes_and_borders(out: &mut Vec<u8>) {
-    // Overworld abarca 24 subchunks de bioma (-64..319); paleta uniforme network = DEFAULT_SPAWN_BIOME_ID (1 = Plains)
+    // Bedrock 1.18+/1.26 eliminó el heightmap 2D heredado del payload de red al introducir biomas 3D.
+    // Overworld abarca 24 secciones de bioma (-64..319); paleta uniforme network = DEFAULT_SPAWN_BIOME_ID (1 = Plains).
     for _ in 0..24 {
         out.push(0x01);
         encode_varuint32(zigzag32(DEFAULT_SPAWN_BIOME_ID), out);
@@ -1156,11 +1171,11 @@ fn append_overworld_biomes_and_borders(out: &mut Vec<u8>) {
     out.push(0x00); // border_blocks = 0
 }
 
-/// Genera un chunk vacío (todo `minecraft:air`) usando almacenamiento paletizado 1-bit de red (~4.8 KB, 9 subchunks: -4..=4).
+/// Genera un chunk vacío (todo `minecraft:air`) usando almacenamiento paletizado 4-bit de red (~18.6 KB, 9 subchunks: -4..=4).
 pub fn build_empty_air_chunk_payload_nbtx() -> Vec<u8> {
     let air_hash = block_state_hash_nbtx("minecraft:air");
     let stone_hash = block_state_hash_nbtx("minecraft:stone");
-    let mut data = Vec::with_capacity(4900);
+    let mut data = Vec::with_capacity(19200);
     for sub_y in -4i8..=4i8 {
         append_uniform_subchunk_v9(&mut data, sub_y, air_hash, stone_hash);
     }
@@ -1168,14 +1183,14 @@ pub fn build_empty_air_chunk_payload_nbtx() -> Vec<u8> {
     data
 }
 
-/// Genera un chunk de spawn seguro en formato NETWORK Little-Endian (~4.8 KB, 9 subchunks: -4..=4):
+/// Genera un chunk de spawn seguro en formato NETWORK Little-Endian (~18.6 KB, 9 subchunks: -4..=4, 4 bits/bloque):
 /// piedra en `y=-64..62`, césped en `y=63` y aire en `y>=64`, evitando caídas al vacío en `(0, 64, 0)`.
 pub fn build_spawn_chunk_payload_nbtx() -> Vec<u8> {
     let air_hash = block_state_hash_nbtx("minecraft:air");
     let stone_hash = block_state_hash_nbtx("minecraft:stone");
     let grass_hash = block_state_hash_nbtx("minecraft:grass_block");
 
-    let mut data = Vec::with_capacity(4900);
+    let mut data = Vec::with_capacity(19200);
     // Subchunks -4..=2 (y = -64..47): sólido de piedra
     for sub_y in -4i8..=2i8 {
         append_uniform_subchunk_v9(&mut data, sub_y, stone_hash, air_hash);
@@ -1386,9 +1401,28 @@ pub fn build_v2225_level_chunk_packet_bytes(cx: i32, cz: i32, serialized_chunk_d
         cache_enabled: false,
         cache_blobs: Vec::new(),
         serialized_chunk_data,
-        is_client_biome_update: false,
+        is_client_biome_update: true,
     };
     encode_bedrock_v2225_packet(&pkt)
+}
+
+/// Construye `ChangeDimensionPacket` (0x3d / 61) con dimensión Overworld (0), posición `(x, y, z)`, `respawn=false` y sin `loading_screen_id`.
+pub fn build_v2225_change_dimension_packet_bytes(
+    dimension: i32,
+    x: f32,
+    y: f32,
+    z: f32,
+    respawn: bool,
+) -> Bytes {
+    let mut raw = Vec::with_capacity(24);
+    encode_varuint32(0x3d, &mut raw); // Packet ID 61 (ChangeDimension)
+    encode_varuint32(zigzag32(dimension), &mut raw);
+    raw.extend_from_slice(&x.to_le_bytes());
+    raw.extend_from_slice(&y.to_le_bytes());
+    raw.extend_from_slice(&z.to_le_bytes());
+    raw.push(if respawn { 1 } else { 0 });
+    raw.push(0x00); // loading_screen_id = Option::None
+    Bytes::from(raw)
 }
 
 #[cfg(feature = "protocol-core")]
@@ -1769,7 +1803,8 @@ pub fn send_spawn_chunks(
 
     let spawn_chunk_template = build_spawn_chunk_payload_nbtx();
     let payload_size = spawn_chunk_template.len();
-    let payload_checksum = fnv1a_32_checksum(&spawn_chunk_template);
+    let payload_fnv1a = fnv1a_32_checksum(&spawn_chunk_template);
+    let payload_crc32 = crc32_checksum(&spawn_chunk_template);
     let mut first_packet_size = 0usize;
     let mut sent_count = 0usize;
     for (cx, cz) in coords {
@@ -1795,12 +1830,14 @@ pub fn send_spawn_chunks(
     }
 
     log::info!(
-        "[Bedrock World] {} chunks network generados (chunk (0,0) primero: payload={} bytes, packet={} bytes, checksum=0x{:08x}, subchunks=9, suelo stone/grass y=63, aire y>=64, biome_id={} Plains) + NetworkChunkPublisherUpdate enviados a {}",
+        "[Bedrock World] {} chunks network generados (chunk (0,0) primero: payload={} bytes, packet={} bytes, checksum=0x{:08x}, subchunks=9, suelo stone/grass y=63, aire y>=64, biome_id={} Plains, crc32=0x{:08x}, fnv1a=0x{:08x}, is_client_biome_update=true) + NetworkChunkPublisherUpdate enviados a {}",
         sent_count,
         payload_size,
         first_packet_size,
-        payload_checksum,
+        payload_fnv1a,
         DEFAULT_SPAWN_BIOME_ID,
+        payload_crc32,
+        payload_fnv1a,
         peer_addr
     );
     sent_count
@@ -1933,6 +1970,16 @@ pub fn send_world_start_and_spawn(
                     progress.has_sent_start_game = true;
                     log::info!(
                         "[Bedrock Session] StartGamePacket enviado a {} (spawn=0,64,0)",
+                        peer_addr
+                    );
+
+                    // P0-1: ChangeDimensionPacket (0x3d) inmediatamente después de StartGamePacket y antes de los chunks
+                    let change_dim_bytes =
+                        build_v2225_change_dimension_packet_bytes(0, 0.0, MIN_SPAWN_SAFE_Y, 0.0, false);
+                    let change_dim_batch = session.encode(&[change_dim_bytes]);
+                    conn.send(change_dim_batch, now);
+                    log::info!(
+                        "[Bedrock Session] ChangeDimensionPacket (0x3d, dim=0, pos=0,64,0, respawn=false) enviado a {}",
                         peer_addr
                     );
                 }
@@ -2318,6 +2365,16 @@ pub fn handle_bedrock_session_data(
             // Movimiento autoritativo del jugador: PlayerAuthInput (0x90 / 144) -> MovePlayerPacket (0x13)
             id if id == 0x90 || name == "PlayerAuthInput" => {
                 progress.last_packet_name = "PlayerAuthInput".to_string();
+                if !progress.has_sent_start_game {
+                    log::warn!(
+                        "[Bedrock Move] PlayerAuthInput (0x90) recibido antes de StartGamePacket desde {}; ignorando hasta inicializar mundo",
+                        peer_addr
+                    );
+                    return;
+                }
+                if !progress.set_local_player_initialized {
+                    progress.set_local_player_initialized = true;
+                }
                 progress.player_auth_input_count = progress.player_auth_input_count.saturating_add(1);
                 progress.movement_tick = progress.movement_tick.saturating_add(1);
                 if let Some(input) = parse_player_auth_input_packet(&pkt.body) {
@@ -2371,18 +2428,24 @@ pub fn handle_bedrock_session_data(
                     progress.has_sent_chunk_radius = true;
                 }
                 log::info!(
-                    "[Bedrock World] ServerboundLoadingScreen (0x138) recibido de {} -> SetPlayerGameType (0x3e) + ChunkRadiusUpdated (0x46) enviados (spawn_init={})",
+                    "[Bedrock World] ServerboundLoadingScreen (0x138) recibido de {} -> SetPlayerGameType (0x3e) + ChunkRadiusUpdated (0x46) enviados (spawn_init={}, client_init={})",
                     peer_addr,
-                    progress.set_local_player_initialized
+                    progress.set_local_player_initialized,
+                    progress.client_sent_local_player_init
                 );
             }
 
             // Confirmación del cliente tras aparecer en el mundo (0x71 / 113 SetLocalPlayerAsInitialized)
-            id if id == SetLocalPlayerAsInitialized::ID => {
+            id if id == SetLocalPlayerAsInitialized::ID || id == 0x71 => {
                 progress.last_packet_name = "SetLocalPlayerAsInitialized".to_string();
+                let _ = pkt.decode::<SetLocalPlayerAsInitialized>();
                 progress.set_local_player_initialized = true;
+                progress.client_sent_local_player_init = true;
+                if !progress.has_sent_player_spawn_entities {
+                    send_world_start_and_spawn(conn, session, progress, peer_addr, now);
+                }
                 log::info!(
-                    "[Bedrock World] Jugador inicializado dentro del mundo (SetLocalPlayerAsInitialized 0x71) desde {}",
+                    "[Bedrock World] Jugador inicializado dentro del mundo (SetLocalPlayerAsInitialized 0x71) desde {} -> PlayerAuthInput aceptado",
                     peer_addr
                 );
             }
@@ -2426,7 +2489,7 @@ pub fn format_disconnect_debug_summary(
         "cierre de transporte WebRTC"
     };
     format!(
-        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | chunk_radius={} | spawn_init={}",
+        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | chunk_radius={} | spawn_init={} | client_init={}",
         remote_addr,
         sid,
         reason,
@@ -2436,7 +2499,8 @@ pub fn format_disconnect_debug_summary(
         progress.latency_ping_count,
         progress.keepalives_sent,
         progress.has_sent_chunk_radius,
-        progress.set_local_player_initialized
+        progress.set_local_player_initialized,
+        progress.client_sent_local_player_init
     )
 }
 
@@ -3731,11 +3795,13 @@ mod tests {
 
         let empty_chunk = build_empty_air_chunk_payload_nbtx();
         let spawn_chunk = build_spawn_chunk_payload_nbtx();
-        assert!(empty_chunk.len() >= 4096);
-        assert!(spawn_chunk.len() >= 4096);
+        assert!(empty_chunk.len() >= 10_240 && empty_chunk.len() <= 20_480);
+        assert!(spawn_chunk.len() >= 10_240 && spawn_chunk.len() <= 20_480);
         assert_ne!(fnv1a_32_checksum(&empty_chunk), fnv1a_32_checksum(&spawn_chunk));
-        // SubChunk -4 (0xFC) con versión v9 (0x09) y 1 capa (0x01)
-        assert_eq!(&spawn_chunk[..3], &[0x09, 0x01, (-4i8) as u8]);
+        assert_ne!(crc32_checksum(&empty_chunk), 0);
+        assert_ne!(crc32_checksum(&empty_chunk), crc32_checksum(&spawn_chunk));
+        // SubChunk -4 (0xFC) con versión v9 (0x09), 1 capa (0x01) y almacenamiento 4 bits/bloque (0x09)
+        assert_eq!(&spawn_chunk[..4], &[0x09, 0x01, (-4i8) as u8, 0x09]);
         assert_eq!(*spawn_chunk.last().expect("border byte"), 0x00);
     }
 
@@ -3758,6 +3824,14 @@ mod tests {
         write_nbt_network_compound_from_pairs(&[], &mut empty_nbt);
         assert_eq!(empty_nbt, vec![0x0a, 0x00, 0x00]);
         assert!(start_raw.body.windows(3).any(|w| w == [0x0a, 0x00, 0x00]));
+
+        let change_dim_bytes = build_v2225_change_dimension_packet_bytes(0, 0.0, 64.0, 0.0, false);
+        let change_dim_raw = RawPacket::parse(change_dim_bytes).expect("parse change_dimension");
+        assert_eq!(change_dim_raw.id, 0x3d);
+        assert_eq!(change_dim_raw.body[0], 0x00);
+        assert_eq!(&change_dim_raw.body[5..9], &64.0f32.to_le_bytes());
+        assert_eq!(change_dim_raw.body[13], 0x00);
+        assert_eq!(change_dim_raw.body[14], 0x00);
 
         let spawn_pos_bytes = build_v2225_set_spawn_position_packet_bytes(0, 64, 0, 0);
         assert_eq!(RawPacket::parse(spawn_pos_bytes).expect("parse set_spawn_position").id, 0x2b);
@@ -3793,6 +3867,7 @@ mod tests {
                 .expect("level_chunk");
         let chunk_raw = RawPacket::parse(chunk_bytes).expect("parse level_chunk");
         assert_eq!(chunk_raw.id, 0x3a);
+        assert_eq!(chunk_raw.body.last().copied(), Some(0x01));
 
         let spawn_bytes = build_v2225_player_spawn_status_bytes().expect("player_spawn");
         let spawn_raw = RawPacket::parse(spawn_bytes).expect("parse player_spawn");
