@@ -71,9 +71,13 @@ pub struct SessionProgress {
     pub has_sent_world_registries: bool,
     pub has_sent_initial_chunks: bool,
     pub has_sent_player_spawn_entities: bool,
+    pub has_sent_player_spawn_status: bool,
     pub has_sent_chunk_radius: bool,
     pub set_local_player_initialized: bool,
     pub client_sent_local_player_init: bool,
+    pub expected_loading_screen_id: Option<u32>,
+    pub last_loading_screen_id: Option<u32>,
+    pub local_ice_candidate: String,
     pub player_name: String,
     pub player_uuid: [u8; 16],
     pub player_auth_input_count: u64,
@@ -763,10 +767,35 @@ pub fn build_bedrock_advertisement(motd_name: &str, ipv4_port: u16) -> String {
     )
 }
 
-/// Resuelve una IP local concreta (no 0.0.0.0) para que `str0m::Candidate::host` dentro de
-/// `Connection::answer` pueda incluir el candidato ICE UDP válido en el SDP answer.
+fn normalize_ice_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    }
+}
+
+pub fn is_private_or_loopback_ip(ip: IpAddr) -> bool {
+    match normalize_ice_ip(ip) {
+        IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local(),
+    }
+}
+
+/// Extrae líneas `a=candidate:...` de un SDP offer/answer para diagnóstico de conectividad ICE/STUN.
+pub fn extract_sdp_ice_candidates(sdp: &str) -> Vec<String> {
+    sdp.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("a=candidate:"))
+        .map(|line| line.trim_start_matches("a=candidate:").to_string())
+        .collect()
+}
+
+/// Resuelve una IP local concreta (no 0.0.0.0) normalizando direcciones IPv4-mapeadas en IPv6 para que
+/// `str0m::Candidate::host` dentro de `Connection::answer` incluya un candidato ICE UDP válido en el SDP answer.
 fn resolve_local_candidate_addr(preferred_ip: Option<IpAddr>, udp_port: u16) -> SocketAddr {
-    if let Some(ip) = preferred_ip {
+    if let Some(ip) = preferred_ip.map(normalize_ice_ip) {
         if !ip.is_unspecified() {
             return SocketAddr::new(ip, udp_port);
         }
@@ -774,8 +803,9 @@ fn resolve_local_candidate_addr(preferred_ip: Option<IpAddr>, udp_port: u16) -> 
     if let Ok(probe) = StdUdpSocket::bind("0.0.0.0:0") {
         if probe.connect("8.8.8.8:80").is_ok() {
             if let Ok(local) = probe.local_addr() {
-                if !local.ip().is_unspecified() {
-                    return SocketAddr::new(local.ip(), udp_port);
+                let norm = normalize_ice_ip(local.ip());
+                if !norm.is_unspecified() {
+                    return SocketAddr::new(norm, udp_port);
                 }
             }
         }
@@ -1406,23 +1436,55 @@ pub fn build_v2225_level_chunk_packet_bytes(cx: i32, cz: i32, serialized_chunk_d
     encode_bedrock_v2225_packet(&pkt)
 }
 
-/// Construye `ChangeDimensionPacket` (0x3d / 61) con dimensión Overworld (0), posición `(x, y, z)`, `respawn=false` y sin `loading_screen_id`.
+/// Construye `ChangeDimensionPacket` (0x3d / 61) con dimensión Overworld (0), posición `(x, y, z)`,
+/// `respawn=false` y `loading_screen_id` opcional (`Some(id)` cuando el jugador está vivo).
 pub fn build_v2225_change_dimension_packet_bytes(
     dimension: i32,
     x: f32,
     y: f32,
     z: f32,
     respawn: bool,
+    loading_screen_id: Option<u32>,
 ) -> Bytes {
-    let mut raw = Vec::with_capacity(24);
+    let mut raw = Vec::with_capacity(28);
     encode_varuint32(0x3d, &mut raw); // Packet ID 61 (ChangeDimension)
     encode_varuint32(zigzag32(dimension), &mut raw);
     raw.extend_from_slice(&x.to_le_bytes());
     raw.extend_from_slice(&y.to_le_bytes());
     raw.extend_from_slice(&z.to_le_bytes());
     raw.push(if respawn { 1 } else { 0 });
-    raw.push(0x00); // loading_screen_id = Option::None
+    match loading_screen_id {
+        Some(screen_id) => {
+            raw.push(0x01);
+            raw.extend_from_slice(&screen_id.to_le_bytes());
+        }
+        None => {
+            raw.push(0x00);
+        }
+    }
     Bytes::from(raw)
+}
+
+/// Parsea `ServerboundLoadingScreen` (0x138 / 312) extrayendo `(type_id, loading_screen_id)`.
+pub fn parse_serverbound_loading_screen_packet(body: &[u8]) -> Option<(i32, Option<u32>)> {
+    let (raw_type, offset) = decode_varuint32(body)?;
+    let screen_type = ((raw_type >> 1) as i32) ^ -((raw_type & 1) as i32);
+    let rest = body.get(offset..)?;
+    if rest.is_empty() {
+        return Some((screen_type, None));
+    }
+    if rest[0] == 0 {
+        return Some((screen_type, None));
+    }
+    if rest[0] == 1 && rest.len() >= 5 {
+        let id = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
+        return Some((screen_type, Some(id)));
+    }
+    if rest.len() == 4 {
+        let id = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+        return Some((screen_type, Some(id)));
+    }
+    Some((screen_type, None))
 }
 
 #[cfg(feature = "protocol-core")]
@@ -1973,18 +2035,41 @@ pub fn send_world_start_and_spawn(
                         peer_addr
                     );
 
-                    // P0-1: ChangeDimensionPacket (0x3d) inmediatamente después de StartGamePacket y antes de los chunks
-                    let change_dim_bytes =
-                        build_v2225_change_dimension_packet_bytes(0, 0.0, MIN_SPAWN_SAFE_Y, 0.0, false);
+                    // P0-1 & P1: ChangeDimensionPacket (0x3d) inmediatamente después de StartGamePacket
+                    // con LoadingScreenId = Some(1) porque el jugador está vivo (respawn=false).
+                    let loading_screen_id = Some(1u32);
+                    let change_dim_bytes = build_v2225_change_dimension_packet_bytes(
+                        0,
+                        0.0,
+                        MIN_SPAWN_SAFE_Y,
+                        0.0,
+                        false,
+                        loading_screen_id,
+                    );
                     let change_dim_batch = session.encode(&[change_dim_bytes]);
                     conn.send(change_dim_batch, now);
+                    progress.expected_loading_screen_id = loading_screen_id;
                     log::info!(
-                        "[Bedrock Session] ChangeDimensionPacket (0x3d, dim=0, pos=0,64,0, respawn=false) enviado a {}",
+                        "[Bedrock Session] ChangeDimensionPacket (0x3d, dim=0, pos=0,64,0, respawn=false, loading_screen_id={:?}) enviado a {}",
+                        loading_screen_id,
                         peer_addr
                     );
                 }
                 Err(err) => {
                     log::warn!("[Bedrock Session] Error codificando StartGamePacket: {}", err);
+                }
+            }
+
+            // P0-1: PlayStatus::PlayerSpawn (0x02, status=3) después de ChangeDimensionPacket y ANTES de los chunks.
+            if !progress.has_sent_player_spawn_status {
+                if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
+                    let status_batch = session.encode(&[spawn_status]);
+                    conn.send(status_batch, now);
+                    progress.has_sent_player_spawn_status = true;
+                    log::info!(
+                        "[Bedrock Session] PlayStatus (0x02, status=3 / PlayerSpawn) enviado a {} (después de ChangeDimension, antes de chunks)",
+                        peer_addr
+                    );
                 }
             }
 
@@ -2031,15 +2116,6 @@ pub fn send_world_start_and_spawn(
             0
         };
 
-        if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
-            let status_batch = session.encode(&[spawn_status]);
-            conn.send(status_batch, now);
-            log::info!(
-                "[Bedrock Session] PlayStatus::PlayerSpawn (0x02 / status=3) enviado a {}",
-                peer_addr
-            );
-        }
-
         if !progress.has_sent_player_spawn_entities {
             let effective_name = if progress.player_name.trim().is_empty() {
                 "Jugador Bedrock".to_string()
@@ -2085,9 +2161,9 @@ pub fn send_world_start_and_spawn(
                 conn.send(batch, now);
             }
             progress.has_sent_player_spawn_entities = true;
-            progress.set_local_player_initialized = true;
+            // P0-2: El servidor NO envía SetLocalPlayerAsInitialized (0x71) ni marca inicialización hasta recibirlo del cliente.
             log::info!(
-                "[Bedrock Session] PlayerList (0x3f) + AddPlayer (0x0c) + MovePlayer (0x13, 0,64,0) enviados a {} (jugador={}, spawn_init=true)",
+                "[Bedrock Session] PlayerList (0x3f) + AddPlayer (0x0c) + MovePlayer (0x13, 0,64,0) enviados a {} (jugador={}, esperando ServerboundLoadingScreen 0x138 y SetLocalPlayerAsInitialized 0x71)",
                 peer_addr,
                 effective_name
             );
@@ -2256,7 +2332,7 @@ pub fn handle_bedrock_session_data(
                 conn.send(status_batch, now);
                 progress.has_sent_login_success = true;
                 log::info!(
-                    "[Bedrock Login] PlayStatus (0x02 LoginSuccess) enviado a {}",
+                    "[Bedrock Login] PlayStatus (0x02, status=0 / LoginSuccess) enviado a {}",
                     peer_addr
                 );
             }
@@ -2276,7 +2352,7 @@ pub fn handle_bedrock_session_data(
 
                 send_resource_packs_sequence(conn, session, progress, peer_addr, now);
                 log::info!(
-                    "[Bedrock Login] ClientToServerHandshake (0x04) completado con {} -> ResourcePacksInfo + ResourcePackStack enviados",
+                    "[Bedrock Login] ClientToServerHandshake (0x04) + PlayStatus (0x02, status=0 / LoginSuccess) completados con {} -> ResourcePacksInfo + ResourcePackStack enviados",
                     peer_addr
                 );
             }
@@ -2372,9 +2448,6 @@ pub fn handle_bedrock_session_data(
                     );
                     return;
                 }
-                if !progress.set_local_player_initialized {
-                    progress.set_local_player_initialized = true;
-                }
                 progress.player_auth_input_count = progress.player_auth_input_count.saturating_add(1);
                 progress.movement_tick = progress.movement_tick.saturating_add(1);
                 if let Some(input) = parse_player_auth_input_packet(&pkt.body) {
@@ -2395,13 +2468,14 @@ pub fn handle_bedrock_session_data(
                     conn.send(batch, now);
                     if progress.player_auth_input_count == 1 || progress.player_auth_input_count % 40 == 0 {
                         log::info!(
-                            "[Bedrock Move] PlayerAuthInput (0x90) #{} de {} (raw_y={:.2}, pos={:.2},{:.2},{:.2}) -> MovePlayerPacket (0x13) enviado",
+                            "[Bedrock Move] PlayerAuthInput (0x90) #{} de {} (raw_y={:.2}, pos={:.2},{:.2},{:.2}, client_init={}) -> MovePlayerPacket (0x13) enviado",
                             progress.player_auth_input_count,
                             peer_addr,
                             input.y,
                             input.x,
                             safe_y,
-                            input.z
+                            input.z,
+                            progress.client_sent_local_player_init
                         );
                     }
                 } else {
@@ -2413,40 +2487,34 @@ pub fn handle_bedrock_session_data(
                 }
             }
 
-            // Pantalla de carga del cliente completada (0x138 / 312 ServerboundLoadingScreen) -> SetPlayerGameType (0x3e) + ChunkRadiusUpdated (0x46)
+            // Pantalla de carga del cliente completada (0x138 / 312 ServerboundLoadingScreen):
+            // P0-3: Registrar LoadingScreenId, NO reenviar PlayStatus, SetPlayerGameType ni ChunkRadiusUpdated; esperar 0x71.
             id if id == 0x138 || name == "ServerboundLoadingScreen" => {
                 progress.last_packet_name = "ServerboundLoadingScreen".to_string();
-                if !progress.has_sent_player_spawn_entities {
-                    send_world_start_and_spawn(conn, session, progress, peer_addr, now);
-                }
-                let game_type_bytes = build_v2225_set_player_game_type_bytes(0);
-                let gt_batch = session.encode(&[game_type_bytes]);
-                conn.send(gt_batch, now);
-                #[cfg(feature = "protocol-core")]
-                {
-                    let _ = send_chunk_radius_updated(conn, session, peer_addr, now, 4);
-                    progress.has_sent_chunk_radius = true;
+                let parsed = parse_serverbound_loading_screen_packet(&pkt.body);
+                if let Some((_, Some(screen_id))) = parsed {
+                    progress.last_loading_screen_id = Some(screen_id);
                 }
                 log::info!(
-                    "[Bedrock World] ServerboundLoadingScreen (0x138) recibido de {} -> SetPlayerGameType (0x3e) + ChunkRadiusUpdated (0x46) enviados (spawn_init={}, client_init={})",
+                    "[Bedrock World] ServerboundLoadingScreen (0x138) recibido de {} (screen_type={:?}, loading_screen_id={:?}, expected_id={:?}) -> esperando SetLocalPlayerAsInitialized (0x71)",
                     peer_addr,
-                    progress.set_local_player_initialized,
-                    progress.client_sent_local_player_init
+                    parsed.map(|(t, _)| t),
+                    parsed.and_then(|(_, id)| id),
+                    progress.expected_loading_screen_id
                 );
             }
 
-            // Confirmación del cliente tras aparecer en el mundo (0x71 / 113 SetLocalPlayerAsInitialized)
+            // Confirmación del cliente tras aparecer en el mundo (0x71 / 113 SetLocalPlayerAsInitialized).
+            // P0-2: El servidor solo recibe 0x71; nunca lo envía.
             id if id == SetLocalPlayerAsInitialized::ID || id == 0x71 => {
                 progress.last_packet_name = "SetLocalPlayerAsInitialized".to_string();
                 let _ = pkt.decode::<SetLocalPlayerAsInitialized>();
                 progress.set_local_player_initialized = true;
                 progress.client_sent_local_player_init = true;
-                if !progress.has_sent_player_spawn_entities {
-                    send_world_start_and_spawn(conn, session, progress, peer_addr, now);
-                }
                 log::info!(
-                    "[Bedrock World] Jugador inicializado dentro del mundo (SetLocalPlayerAsInitialized 0x71) desde {} -> PlayerAuthInput aceptado",
-                    peer_addr
+                    "[Bedrock World] Confirmación recibida: SetLocalPlayerAsInitialized (0x71) desde {} (loading_screen_id={:?}) -> jugador inicializado, PlayerAuthInput aceptado",
+                    peer_addr,
+                    progress.last_loading_screen_id
                 );
             }
 
@@ -2479,6 +2547,8 @@ pub fn format_disconnect_debug_summary(
     };
     let hint = if progress.has_sent_login_success && !progress.has_sent_start_game {
         "desconexión antes de StartGamePacket / faltó ClientCacheStatus"
+    } else if reason.to_ascii_lowercase().contains("ice") {
+        "ICE disconnected: pérdida de conectividad UDP/STUN o cierre de PeerConnection tras espera de spawn"
     } else if progress.has_sent_start_game && !progress.has_sent_chunk_radius {
         "faltó ChunkRadiusUpdated (0x46) tras RequestChunkRadius (0x45)"
     } else if progress.player_auth_input_count > 0 && progress.latency_ping_count == 0 {
@@ -2489,7 +2559,7 @@ pub fn format_disconnect_debug_summary(
         "cierre de transporte WebRTC"
     };
     format!(
-        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | chunk_radius={} | spawn_init={} | client_init={}",
+        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | chunk_radius={} | spawn_init={} | client_init={} | loading_screen_id={:?} | local_ice={}",
         remote_addr,
         sid,
         reason,
@@ -2500,7 +2570,9 @@ pub fn format_disconnect_debug_summary(
         progress.keepalives_sent,
         progress.has_sent_chunk_radius,
         progress.set_local_player_initialized,
-        progress.client_sent_local_player_init
+        progress.client_sent_local_player_init,
+        progress.last_loading_screen_id,
+        progress.local_ice_candidate
     )
 }
 
@@ -2622,6 +2694,15 @@ async fn handle_http_signaling_stream(
         };
 
         let local_candidate = resolve_local_candidate_addr(local_tcp_ip, udp_port);
+        let offer_candidates = extract_sdp_ice_candidates(offer_sdp);
+        if !is_private_or_loopback_ip(peer_addr.ip()) && is_private_or_loopback_ip(local_candidate.ip()) {
+            log::warn!(
+                "[NetherNet ICE] Cliente externo {} recibirá candidato privado {} (detrás de NAT, verifica STUN/port-forwarding UDP {})",
+                peer_addr,
+                local_candidate,
+                udp_port
+            );
+        }
         let now = Instant::now();
         let answer_res = if is_crash_protection_enabled() {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2647,10 +2728,13 @@ async fn handle_http_signaling_stream(
         };
         match answer_res {
             Ok((mut conn, answer_sdp)) => {
+                let answer_candidates = extract_sdp_ice_candidates(&answer_sdp);
                 log::info!(
-                    "Señalización HTTP recibida: SDP offer procesado para {} (candidato ICE local={} client_ver={:?})",
+                    "Señalización HTTP recibida: SDP offer procesado para {} (candidato ICE local={} | offer_cands={} | answer_cands={} | client_ver={:?})",
                     peer_addr,
                     local_candidate,
+                    offer_candidates.len(),
+                    answer_candidates.len(),
                     query_params.version
                 );
 
@@ -2667,13 +2751,15 @@ async fn handle_http_signaling_stream(
                 });
 
                 if let Ok(mut guard) = peers.lock() {
+                    let mut init_progress = SessionProgress::default();
+                    init_progress.local_ice_candidate = local_candidate.to_string();
                     guard.insert(
                         session_id,
                         PeerSession {
                             conn,
                             session: ServerConnection::nethernet(host_key.clone()),
                             remote_addr: peer_addr,
-                            progress: SessionProgress::default(),
+                            progress: init_progress,
                         },
                     );
                 }
@@ -3825,13 +3911,34 @@ mod tests {
         assert_eq!(empty_nbt, vec![0x0a, 0x00, 0x00]);
         assert!(start_raw.body.windows(3).any(|w| w == [0x0a, 0x00, 0x00]));
 
-        let change_dim_bytes = build_v2225_change_dimension_packet_bytes(0, 0.0, 64.0, 0.0, false);
+        let change_dim_bytes = build_v2225_change_dimension_packet_bytes(0, 0.0, 64.0, 0.0, false, Some(1));
         let change_dim_raw = RawPacket::parse(change_dim_bytes).expect("parse change_dimension");
         assert_eq!(change_dim_raw.id, 0x3d);
         assert_eq!(change_dim_raw.body[0], 0x00);
         assert_eq!(&change_dim_raw.body[5..9], &64.0f32.to_le_bytes());
         assert_eq!(change_dim_raw.body[13], 0x00);
-        assert_eq!(change_dim_raw.body[14], 0x00);
+        assert_eq!(change_dim_raw.body[14], 0x01);
+        assert_eq!(&change_dim_raw.body[15..19], &1u32.to_le_bytes());
+
+        let change_dim_none = build_v2225_change_dimension_packet_bytes(0, 0.0, 64.0, 0.0, true, None);
+        let change_dim_none_raw = RawPacket::parse(change_dim_none).expect("parse change_dimension none");
+        assert_eq!(change_dim_none_raw.body[13], 0x01);
+        assert_eq!(change_dim_none_raw.body[14], 0x00);
+
+        let mut ls_body = Vec::new();
+        encode_varuint32(zigzag32(2), &mut ls_body);
+        ls_body.push(0x01);
+        ls_body.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(parse_serverbound_loading_screen_packet(&ls_body), Some((2, Some(1))));
+        let mut ls_none = Vec::new();
+        encode_varuint32(zigzag32(1), &mut ls_none);
+        ls_none.push(0x00);
+        assert_eq!(parse_serverbound_loading_screen_packet(&ls_none), Some((1, None)));
+
+        let sdp_sample = "v=0\r\na=candidate:1 1 UDP 2130706431 192.168.1.50 19132 typ host\r\n";
+        assert_eq!(extract_sdp_ice_candidates(sdp_sample).len(), 1);
+        assert!(is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))));
+        assert!(!is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
 
         let spawn_pos_bytes = build_v2225_set_spawn_position_packet_bytes(0, 64, 0, 0);
         assert_eq!(RawPacket::parse(spawn_pos_bytes).expect("parse set_spawn_position").id, 0x2b);
