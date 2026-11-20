@@ -77,6 +77,8 @@ pub struct SessionProgress {
     pub set_local_player_initialized: bool,
     pub client_sent_local_player_init: bool,
     pub spawn_init: bool,
+    pub unknown_pkts: u32,
+    pub unknown_pkt_ids: std::collections::HashMap<u32, u32>,
     pub expected_loading_screen_id: Option<u32>,
     pub last_loading_screen_id: Option<u32>,
     pub local_ice_candidate: String,
@@ -3150,11 +3152,15 @@ pub fn handle_bedrock_session_data(
             }
 
             other => {
-                log::info!(
-                    "[Bedrock Session] Paquete 0x{:02x} ({}) procesado en sesión activa con {}",
+                progress.unknown_pkts = progress.unknown_pkts.saturating_add(1);
+                *progress.unknown_pkt_ids.entry(other).or_insert(0) += 1;
+                log::warn!(
+                    "[Bedrock Session] Paquete NO MANEJADO ID=0x{:02x} len={} peer={} ts={:?} name={}",
                     other,
-                    name,
-                    peer_addr
+                    pkt.body.len(),
+                    peer_addr,
+                    now,
+                    name
                 );
             }
         }
@@ -3189,8 +3195,18 @@ pub fn format_disconnect_debug_summary(
     } else {
         "cierre de transporte WebRTC"
     };
+    let unknown_top = {
+        let mut entries: Vec<_> = progress.unknown_pkt_ids.iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        entries
+            .into_iter()
+            .take(5)
+            .map(|(id, count)| format!("0x{:02x}:{}", id, count))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     format!(
-        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | chunks_sent={} | pending_chunks={} | out_pkts={} | out_bytes={} | rp_done={} | chunk_radius={} | spawn_status={} | spawn_init={} | client_init={} | loading_screen_id={:?} | local_ice={}",
+        "Conexión WebRTC cerrada con {} (session={}, motivo={}). Último paquete procesado: {} | diagnóstico={} | auth_inputs={} | keepalives={} | keepalives_sent={} | chunks_sent={} | pending_chunks={} | out_pkts={} | out_bytes={} | rp_done={} | chunk_radius={} | spawn_status={} | spawn_init={} | client_init={} | loading_screen_id={:?} | local_ice={} | unknown_pkts={} | unknown_top=[{}]",
         remote_addr,
         sid,
         reason,
@@ -3209,7 +3225,9 @@ pub fn format_disconnect_debug_summary(
         progress.set_local_player_initialized,
         progress.client_sent_local_player_init,
         progress.last_loading_screen_id,
-        progress.local_ice_candidate
+        progress.local_ice_candidate,
+        progress.unknown_pkts,
+        unknown_top
     )
 }
 

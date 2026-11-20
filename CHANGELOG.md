@@ -2,6 +2,12 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.3.0-fase2 — Fase 2: diagnóstico de paquetes no manejados
+
+- Instrumentación en `runtime.rs`: `unknown_pkts`, mapa `unknown_pkt_ids`, log WARN por paquete no clasificado y `unknown_top` en el resumen de desconexión.
+- `docs/protocol/unhandled-packets.md`: lista ordenada por frecuencia (25.608 no manejados; `Animate 0x2c` 25.332, `InventoryTransaction 0x1e` 252, `MobEquipment 0x1f` 13, `Interact 0x21` 5, `Text 0x09` 3).
+- No aparecieron `PlayerAction (0x24)` ni `CommandRequest (0x4d)`.
+
 ## v0.2.0-fase1 — Fase 1: pruebas post-spawn
 
 - `docs/testing/post-spawn.md`: tabla de acciones, paquetes esperados y evidencia de logcat.
