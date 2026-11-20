@@ -2,6 +2,12 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.2.0-fase1 — Fase 1: pruebas post-spawn
+
+- `docs/testing/post-spawn.md`: tabla de acciones, paquetes esperados y evidencia de logcat.
+- Verificado: 5 min+ de juego continuo (sesión de ~17 min), 0 `ICE disconnected`, 4 `peer closed` intencionales del cliente, keepalives 515/98/58, reconexiones correctas.
+- Hallazgos para fases posteriores: menú de objetos sin `InventoryContent`, salto sin gravedad en `MovePlayer`, bloques sin `BlockUpdate`/persistencia.
+
 ## v0.1.0-spawn-ok — Fase 0: consolidación del repositorio
 
 - Repositorio unificado con el historial remoto de `SSKBoo/SMA-Server-Minecraft-Android-` (commit base `b7372f6`).
