@@ -2,6 +2,14 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.5.0-fase4 — Fase 4: persistencia del mundo
+
+- Mapa de overrides `(x,y,z) -> block_runtime_id` persistido en `files/engines/bedrock/world/overrides.txt`.
+- Replay de `UpdateBlock (0x15)` tras los chunks y antes de `PlayStatus`.
+- Comandos `/setblock` y `/save`, autosave cada 300 s, carga al arrancar.
+- Fix de protocolo: los comandos llegan como `CommandRequest (0x4d)`, no `Text (0x09)`.
+- Verificado: guardar → reiniciar (Cargados 1 overrides) → reconectar (Reenviados 1 bloques modificados). `docs/world/persistence.md` y `docs/testing/fase4-persistence.md`.
+
 ## v0.4.0-fase3 — Fase 3: mínimo viable de interacción
 
 - Canal de broadcast (`OnceLock` + `tokio::sync::broadcast`) para re-codificar paquetes por peer sin re-bloquear el mapa de conexiones.

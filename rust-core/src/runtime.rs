@@ -11,11 +11,15 @@ use acacia_session::proto::{
         NetworkSettingsCompressionAlgorithm, PlayStatus, PlayStatusStatus, RequestChunkRadius,
         RequestNetworkSettings, ResourcePackClientResponse,
         ResourcePackClientResponseResponseStatus, ServerToClientHandshake,
-        SetLocalPlayerAsInitialized, Text, TextContent,
+        CommandRequest, InventoryTransaction, SetLocalPlayerAsInitialized, Text, TextContent,
+        UpdateBlock,
     },
     Packet, RawPacket,
 };
 use acacia_session::server::{read_login, ServerConnection};
+use acacia_session::proto::types::{
+    BlockCoordinates, TransactionTransactionData, TransactionUseItemActionType, UpdateBlockFlags,
+};
 use bytes::{Bytes, BytesMut};
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use p384::ecdsa::SigningKey;
@@ -43,6 +47,103 @@ fn publish_broadcast(raw: Bytes) {
     if let Some(tx) = BROADCAST_TX.get() {
         let _ = tx.send(raw);
     }
+}
+
+/// Fase 4: bloques modificados (x, y, z) -> runtime_id. 0 = aire.
+static WORLD_OVERRIDES: OnceLock<Mutex<HashMap<(i32, i32, i32), u32>>> = OnceLock::new();
+
+fn overrides() -> &'static Mutex<HashMap<(i32, i32, i32), u32>> {
+    WORLD_OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static WORLD_BASE: OnceLock<String> = OnceLock::new();
+
+fn world_overrides_path(base: &str) -> PathBuf {
+    PathBuf::from(base).join("world").join("overrides.txt")
+}
+
+fn load_world_overrides(base: &str) -> usize {
+    let path = world_overrides_path(base);
+    let Ok(text) = std::fs::read_to_string(&path) else { return 0 };
+    let mut count = 0usize;
+    if let Ok(mut map) = overrides().lock() {
+        for line in text.lines() {
+            let parts: Vec<_> = line.split(',').collect();
+            if parts.len() == 4 {
+                if let (Ok(x), Ok(y), Ok(z), Ok(id)) = (
+                    parts[0].parse::<i32>(),
+                    parts[1].parse::<i32>(),
+                    parts[2].parse::<i32>(),
+                    parts[3].parse::<u32>(),
+                ) {
+                    map.insert((x, y, z), id);
+                    count += 1;
+                }
+            }
+        }
+    }
+    log::info!("[Bedrock World] Cargados {} overrides desde {}", count, path.display());
+    count
+}
+
+fn save_world_overrides(base: &str) -> usize {
+    let path = world_overrides_path(base);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut text = String::new();
+    let mut count = 0usize;
+    if let Ok(map) = overrides().lock() {
+        for ((x, y, z), id) in map.iter() {
+            text.push_str(&format!("{},{},{},{}\n", x, y, z, id));
+            count += 1;
+        }
+    }
+    match std::fs::write(&path, text) {
+        Ok(_) => log::info!("[Bedrock World] Guardados {} overrides en {}", count, path.display()),
+        Err(e) => log::warn!("[Bedrock World] Error guardando overrides: {}", e),
+    }
+    count
+}
+
+/// Maneja comandos del servidor tanto desde Text (0x09) como desde CommandRequest (0x4d).
+/// Devuelve true si el mensaje era un comando y no debe retransmitirse.
+fn handle_world_command(message: &str, peer_addr: SocketAddr) -> bool {
+    let world_base = WORLD_BASE.get().map(|s| s.as_str()).unwrap_or("");
+    if let Some(rest) = message.trim().strip_prefix("/setblock") {
+        let parts: Vec<_> = rest.split_whitespace().collect();
+        if parts.len() == 4 {
+            if let (Ok(x), Ok(y), Ok(z), Ok(id)) = (
+                parts[0].parse::<i32>(),
+                parts[1].parse::<i32>(),
+                parts[2].parse::<i32>(),
+                parts[3].parse::<u32>(),
+            ) {
+                if let Ok(mut map) = overrides().lock() {
+                    map.insert((x, y, z), id);
+                }
+                let n = save_world_overrides(world_base);
+                log::info!(
+                    "[Bedrock World] /setblock ({},{},{}) -> {} ejecutado por {} ({} overrides guardados)",
+                    x, y, z, id, peer_addr, n
+                );
+            } else {
+                log::warn!("[Bedrock World] /setblock con argumentos inválidos: {:?}", rest);
+            }
+        } else {
+            log::warn!("[Bedrock World] Uso: /setblock <x> <y> <z> <block_runtime_id>");
+        }
+        return true;
+    }
+    if message.trim().eq_ignore_ascii_case("/save") {
+        let n = save_world_overrides(world_base);
+        log::info!(
+            "[Bedrock World] Comando /save ejecutado por {}: {} overrides guardados",
+            peer_addr, n
+        );
+        return true;
+    }
+    false
 }
 
 pub const TARGET_BEDROCK_VERSION: &str = "26.60";
@@ -2355,6 +2456,29 @@ pub fn send_spawn_finish_sequence(
         let health_batch = session.encode(&[health_bytes]);
         conn.send(health_batch, now);
 
+        // Fase 4: reenviar bloques modificados antes del PlayStatus de spawn.
+        if let Ok(map) = overrides().lock() {
+            if !map.is_empty() {
+                for ((x, y, z), block_id) in map.iter() {
+                    let update = UpdateBlock {
+                        position: BlockCoordinates { x: *x, y: *y, z: *z },
+                        block_runtime_id: *block_id,
+                        flags: UpdateBlockFlags(3),
+                        layer: 0,
+                    };
+                    let mut buf = BytesMut::new();
+                    encode_packet(&update, &mut buf);
+                    let batch = session.encode(&[buf.freeze()]);
+                    conn.send(batch, now);
+                }
+                log::info!(
+                    "[Bedrock World] Reenviados {} bloques modificados a {} antes de PlayStatus",
+                    map.len(),
+                    peer_addr
+                );
+            }
+        }
+
         if let Ok(spawn_status) = build_v2225_player_spawn_status_bytes() {
             let status_batch = session.encode(&[spawn_status]);
             conn.send(status_batch, now);
@@ -3161,6 +3285,25 @@ pub fn handle_bedrock_session_data(
                 );
             }
 
+            // Fase 4: los comandos (prefijo /) llegan como CommandRequest (0x4d), no como Text.
+            id if id == 0x4d || name == "CommandRequest" => {
+                progress.last_packet_name = "CommandRequest".to_string();
+                match pkt.decode::<CommandRequest>() {
+                    Ok(cmd) => {
+                        if !handle_world_command(&cmd.command, peer_addr) {
+                            log::info!(
+                                "[Bedrock Cmd] CommandRequest (0x4d) no manejado desde {}: {:?}",
+                                peer_addr, cmd.command
+                            );
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        "[Bedrock Cmd] CommandRequest (0x4d) no decodificable desde {}: {}",
+                        peer_addr, e
+                    ),
+                }
+            }
+
             // Fase 3.2: Text (0x09) -> broadcast a todos los clientes (incluido el emisor).
             id if id == 0x09 || name == "Text" => {
                 progress.last_packet_name = "Text".to_string();
@@ -3181,6 +3324,9 @@ pub fn handle_bedrock_session_data(
                             TextContent::JukeboxPopup(s) => s.message.clone(),
                             TextContent::Default => String::new(),
                         };
+                        if handle_world_command(&message, peer_addr) {
+                            return;
+                        }
                         let has_control = message
                             .chars()
                             .any(|c| c.is_control() && c != '\n' && c != '\t');
@@ -3214,9 +3360,35 @@ pub fn handle_bedrock_session_data(
                 progress.last_packet_name = label.to_string();
                 let hex: String = pkt.body.iter().take(32).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
                 log::info!(
-                    "[Bedrock Action] {} (0x{:02x}) recibido desde {} (len={}, hex=[{}]) -> solo registro (sin WorldUpdate)",
+                    "[Bedrock Action] {} (0x{:02x}) recibido desde {} (len={}, hex=[{}])",
                     label, id, peer_addr, pkt.body.len(), hex
                 );
+                if id == 0x1e {
+                    match pkt.decode::<InventoryTransaction>() {
+                        Ok(tx) => {
+                            if let TransactionTransactionData::ItemUse(use_item) =
+                                &tx.transaction.transaction_data
+                            {
+                                let pos = &use_item.block_position;
+                                let new_id = match use_item.action_type {
+                                    TransactionUseItemActionType::BreakBlock => 0,
+                                    _ => use_item.block_runtime_id,
+                                };
+                                if let Ok(mut map) = overrides().lock() {
+                                    map.insert((pos.x, pos.y, pos.z), new_id);
+                                }
+                                log::info!(
+                                    "[Bedrock World] Override en ({},{},{}) -> block_runtime_id={} (accion={:?})",
+                                    pos.x, pos.y, pos.z, new_id, use_item.action_type
+                                );
+                            }
+                        }
+                        Err(e) => log::warn!(
+                            "[Bedrock Action] InventoryTransaction no decodificable desde {}: {}",
+                            peer_addr, e
+                        ),
+                    }
+                }
             }
 
             other => {
@@ -3706,6 +3878,9 @@ pub fn start_async_engine(
     let host_key = SigningKey::random(&mut OsRng);
     let peers: Arc<Mutex<HashMap<u64, PeerSession>>> = Arc::new(Mutex::new(HashMap::new()));
     let udp_shared = Arc::new(udp_socket);
+    let world_base = dir_owned.clone();
+    let _ = WORLD_BASE.set(world_base.clone());
+    load_world_overrides(&world_base);
 
     rt.spawn(CatchUnwindFuture::new("nethernet_main_loop", async move {
         log::info!(
@@ -4068,6 +4243,8 @@ pub fn start_async_engine(
         let mut rtc_tick = tokio::time::interval(Duration::from_millis(20));
         let mut keepalive_tick = tokio::time::interval(Duration::from_secs(2));
         keepalive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut autosave_tick = tokio::time::interval(Duration::from_secs(300));
+        autosave_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         const RAKNET_MAGIC: [u8; 16] = [
             0x00, 0xFF, 0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFE, 0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34,
@@ -4345,6 +4522,9 @@ pub fn start_async_engine(
                             let _ = udp_shared.send_to(&data, dest).await;
                         }
                     }
+                }
+                _ = autosave_tick.tick() => {
+                    save_world_overrides(&world_base);
                 }
                 bcast_res = bcast_rx.recv() => {
                     if let Ok(raw) = bcast_res {
