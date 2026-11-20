@@ -26,7 +26,14 @@ pub fn probe_local_and_wan(
     enable_upnp: bool,
     dual_stack_ipv6: bool,
 ) -> String {
-    probe_local_and_wan_with_bind(bedrock_port, java_port, enable_upnp, dual_stack_ipv6, None, true)
+    probe_local_and_wan_with_bind(
+        bedrock_port,
+        java_port,
+        enable_upnp,
+        dual_stack_ipv6,
+        None,
+        true,
+    )
 }
 
 pub fn probe_local_and_wan_with_bind(
@@ -128,7 +135,9 @@ fn parse_ssdp_location(response: &str) -> Option<String> {
 
 fn query_igd_external_ip(location_url: &str) -> Option<String> {
     let without_scheme = location_url.strip_prefix("http://")?;
-    let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     let addr: SocketAddr = host_port.parse().ok()?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));

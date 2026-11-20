@@ -25,8 +25,15 @@ pub fn effective_jitter_ms(peer: SocketAddr, cfg: &LowLatencyConfig) -> u32 {
     }
 }
 
-pub fn configure_low_latency_tcp_socket(addr: SocketAddr, cfg: &LowLatencyConfig) -> std::io::Result<Socket> {
-    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+pub fn configure_low_latency_tcp_socket(
+    addr: SocketAddr,
+    cfg: &LowLatencyConfig,
+) -> std::io::Result<Socket> {
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.set_nodelay(cfg.tcp_no_delay)?;

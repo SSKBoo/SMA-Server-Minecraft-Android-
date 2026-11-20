@@ -67,14 +67,20 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_regi
         let vm = match env.get_java_vm() {
             Ok(vm) => vm,
             Err(err) => {
-                log::warn!("[RustJNI] No se pudo obtener JavaVM para callback de crash: {}", err);
+                log::warn!(
+                    "[RustJNI] No se pudo obtener JavaVM para callback de crash: {}",
+                    err
+                );
                 return;
             }
         };
         let global_listener: GlobalRef = match env.new_global_ref(&listener) {
             Ok(r) => r,
             Err(err) => {
-                log::warn!("[RustJNI] No se pudo fijar GlobalRef para listener de crash: {}", err);
+                log::warn!(
+                    "[RustJNI] No se pudo fijar GlobalRef para listener de crash: {}",
+                    err
+                );
                 return;
             }
         };
@@ -89,7 +95,10 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_regi
                         &[JValue::Object(&jerr_obj)],
                     );
                     if let Err(err) = call_res {
-                        log::warn!("[RustJNI] Fallo invocando CrashHandler.onRustCrash: {}", err);
+                        log::warn!(
+                            "[RustJNI] Fallo invocando CrashHandler.onRustCrash: {}",
+                            err
+                        );
                     }
                     if attach_env.exception_check().unwrap_or(false) {
                         let _ = attach_env.exception_clear();
@@ -123,42 +132,53 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_regi
         let vm = match env.get_java_vm() {
             Ok(vm) => vm,
             Err(err) => {
-                log::warn!("[RustJNI] No se pudo obtener JavaVM para callback de jugadores: {}", err);
+                log::warn!(
+                    "[RustJNI] No se pudo obtener JavaVM para callback de jugadores: {}",
+                    err
+                );
                 return;
             }
         };
         let global_listener: GlobalRef = match env.new_global_ref(&listener) {
             Ok(r) => r,
             Err(err) => {
-                log::warn!("[RustJNI] No se pudo fijar GlobalRef para listener de jugadores: {}", err);
+                log::warn!(
+                    "[RustJNI] No se pudo fijar GlobalRef para listener de jugadores: {}",
+                    err
+                );
                 return;
             }
         };
-        runtime::set_player_event_hook(Some(Arc::new(move |player_name: &str, connected_count: usize, connected: bool| {
-            if let Ok(mut attach_env) = vm.attach_current_thread() {
-                if let Ok(jname) = attach_env.new_string(player_name) {
-                    let jname_obj: JObject = jname.into();
-                    let count_arg = connected_count.min(i32::MAX as usize) as jint;
-                    let connected_arg: jboolean = if connected { JNI_TRUE } else { JNI_FALSE };
-                    let call_res = attach_env.call_method(
-                        global_listener.as_obj(),
-                        "onPlayerLoginStateChanged",
-                        "(Ljava/lang/String;IZ)V",
-                        &[
-                            JValue::Object(&jname_obj),
-                            JValue::Int(count_arg),
-                            JValue::Bool(connected_arg),
-                        ],
-                    );
-                    if let Err(err) = call_res {
-                        log::warn!("[RustJNI] Fallo invocando onPlayerLoginStateChanged: {}", err);
-                    }
-                    if attach_env.exception_check().unwrap_or(false) {
-                        let _ = attach_env.exception_clear();
+        runtime::set_player_event_hook(Some(Arc::new(
+            move |player_name: &str, connected_count: usize, connected: bool| {
+                if let Ok(mut attach_env) = vm.attach_current_thread() {
+                    if let Ok(jname) = attach_env.new_string(player_name) {
+                        let jname_obj: JObject = jname.into();
+                        let count_arg = connected_count.min(i32::MAX as usize) as jint;
+                        let connected_arg: jboolean = if connected { JNI_TRUE } else { JNI_FALSE };
+                        let call_res = attach_env.call_method(
+                            global_listener.as_obj(),
+                            "onPlayerLoginStateChanged",
+                            "(Ljava/lang/String;IZ)V",
+                            &[
+                                JValue::Object(&jname_obj),
+                                JValue::Int(count_arg),
+                                JValue::Bool(connected_arg),
+                            ],
+                        );
+                        if let Err(err) = call_res {
+                            log::warn!(
+                                "[RustJNI] Fallo invocando onPlayerLoginStateChanged: {}",
+                                err
+                            );
+                        }
+                        if attach_env.exception_check().unwrap_or(false) {
+                            let _ = attach_env.exception_clear();
+                        }
                     }
                 }
-            }
-        })));
+            },
+        )));
     }));
 }
 
@@ -297,8 +317,8 @@ pub extern "system" fn Java_com_bedrockdroid_rs_nativebridge_RustCoreBridge_prob
     dual_stack_ipv6: jboolean,
 ) -> jstring {
     let report = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let active_bind = runtime::current_bind_report()
-            .map(|b| (b.bind_v4, b.bind_v6, b.ipv6_v6only));
+        let active_bind =
+            runtime::current_bind_report().map(|b| (b.bind_v4, b.bind_v6, b.ipv6_v6only));
         net::upnp_nat::probe_local_and_wan_with_bind(
             bedrock_port as u16,
             java_port as u16,

@@ -3,7 +3,10 @@ use std::fs;
 pub fn inspect_cpu_topology_json() -> String {
     let mut freqs = Vec::new();
     for cpu in 0..16 {
-        let path = format!("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu);
+        let path = format!(
+            "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq",
+            cpu
+        );
         if let Ok(raw) = fs::read_to_string(&path) {
             if let Ok(khz) = raw.trim().parse::<u64>() {
                 freqs.push((cpu, khz));

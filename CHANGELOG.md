@@ -2,6 +2,14 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.6.0-fase5 — Fase 5: robustez y CI
+
+- `cargo fmt` aplicado; `fmt --check` y `clippy -D warnings` limpios (9 lints corregidos).
+- 3 tests nuevos: parseo de `0x71`, parseo de `0x90`, resumen `unknown_top`.
+- 2 tests de red/engine marcados como ignorados solo en Windows (limitación de `socket2` y puerto 19132 ocupado por el puente del emulador).
+- CI reescrito en 3 jobs: `checks`, `build-rust` (3 ABIs, incluido x86_64) y `build-apk` con artefactos.
+- `README.md` con compilación, pruebas y conexión. `docs/testing/fase5-ci.md`.
+
 ## v0.5.0-fase4 — Fase 4: persistencia del mundo
 
 - Mapa de overrides `(x,y,z) -> block_runtime_id` persistido en `files/engines/bedrock/world/overrides.txt`.
