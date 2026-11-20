@@ -2,6 +2,14 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.4.0-fase3 — Fase 3: mínimo viable de interacción
+
+- Canal de broadcast (`OnceLock` + `tokio::sync::broadcast`) para re-codificar paquetes por peer sin re-bloquear el mapa de conexiones.
+- Movimiento: `PlayerAuthInput (0x90)` → `MovePlayer (0x13)` publicado al canal; 1.094 inputs validados.
+- Chat: parseo `Text`, saneo del mensaje y broadcast a todos (7 mensajes verificados). Corregido el falso positivo de caracteres de control del primer intento.
+- Acciones: `InventoryTransaction (0x1e)` registrado con hex (544 eventos); formato en `docs/protocol/player-actions.md`.
+- `docs/testing/fase3-interaction.md`: resultados y criterio adaptado (prueba con 2 clientes pendiente de un segundo cliente).
+
 ## v0.3.0-fase2 — Fase 2: diagnóstico de paquetes no manejados
 
 - Instrumentación en `runtime.rs`: `unknown_pkts`, mapa `unknown_pkt_ids`, log WARN por paquete no clasificado y `unknown_top` en el resumen de desconexión.

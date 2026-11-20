@@ -11,7 +11,7 @@ use acacia_session::proto::{
         NetworkSettingsCompressionAlgorithm, PlayStatus, PlayStatusStatus, RequestChunkRadius,
         RequestNetworkSettings, ResourcePackClientResponse,
         ResourcePackClientResponseResponseStatus, ServerToClientHandshake,
-        SetLocalPlayerAsInitialized,
+        SetLocalPlayerAsInitialized, Text, TextContent,
     },
     Packet, RawPacket,
 };
@@ -34,6 +34,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
+
+/// Canal de broadcast Fase 3: los handlers publican paquetes crudos y el bucle principal
+/// los re-codifica con la sesión de cada peer (compresión/cifrado son por conexión).
+static BROADCAST_TX: OnceLock<tokio::sync::broadcast::Sender<Bytes>> = OnceLock::new();
+
+fn publish_broadcast(raw: Bytes) {
+    if let Some(tx) = BROADCAST_TX.get() {
+        let _ = tx.send(raw);
+    }
+}
 
 pub const TARGET_BEDROCK_VERSION: &str = "26.60";
 pub const TARGET_BEDROCK_PROTOCOL: u32 = 2225;
@@ -3046,8 +3056,8 @@ pub fn handle_bedrock_session_data(
                         true,
                         progress.movement_tick,
                     );
-                    let batch = session.encode(&[move_bytes]);
-                    conn.send(batch, now);
+                    let _ = session.encode(&[move_bytes.clone()]);
+                    publish_broadcast(move_bytes.clone());
                     if progress.player_auth_input_count == 1 || progress.player_auth_input_count % 40 == 0 {
                         log::info!(
                             "[Bedrock Move] PlayerAuthInput (0x90) #{} de {} (raw_y={:.2}, pos={:.2},{:.2},{:.2}, client_init={}) -> MovePlayerPacket (0x13) enviado",
@@ -3148,6 +3158,64 @@ pub fn handle_bedrock_session_data(
                     peer_addr,
                     pkt.body.len(),
                     text_preview
+                );
+            }
+
+            // Fase 3.2: Text (0x09) -> broadcast a todos los clientes (incluido el emisor).
+            id if id == 0x09 || name == "Text" => {
+                progress.last_packet_name = "Text".to_string();
+                match pkt.decode::<Text>() {
+                    Ok(text) => {
+                        let message = match &text.content {
+                            TextContent::Chat(c) => c.message.clone(),
+                            TextContent::Whisper(c) => c.message.clone(),
+                            TextContent::Announcement(c) => c.message.clone(),
+                            TextContent::Raw(s) => s.message.clone(),
+                            TextContent::Tip(s) => s.message.clone(),
+                            TextContent::System(s) => s.message.clone(),
+                            TextContent::JsonWhisper(s) => s.message.clone(),
+                            TextContent::Json(s) => s.message.clone(),
+                            TextContent::JsonAnnouncement(s) => s.message.clone(),
+                            TextContent::Translation(s) => s.message.clone(),
+                            TextContent::Popup(s) => s.message.clone(),
+                            TextContent::JukeboxPopup(s) => s.message.clone(),
+                            TextContent::Default => String::new(),
+                        };
+                        let has_control = message
+                            .chars()
+                            .any(|c| c.is_control() && c != '\n' && c != '\t');
+                        if message.len() > 1024 || has_control {
+                            log::warn!(
+                                "[Bedrock Chat] Text (0x09) descartado desde {} (len={}, msg_len={}, control={})",
+                                peer_addr, pkt.body.len(), message.len(), has_control
+                            );
+                        } else {
+                            let mut buf = BytesMut::new();
+                            encode_packet(&text, &mut buf);
+                            publish_broadcast(buf.freeze());
+                            log::info!(
+                                "[Bedrock Chat] Text (0x09) de {} (len={}) -> broadcast: {:?}",
+                                peer_addr,
+                                pkt.body.len(),
+                                message.chars().take(120).collect::<String>()
+                            );
+                        }
+                    }
+                    Err(err) => log::warn!(
+                        "[Bedrock Chat] Text (0x09) no decodificable desde {}: {}",
+                        peer_addr, err
+                    ),
+                }
+            }
+
+            // Fase 3.3: acciones sobre bloques: parseo/registro, sin modificar el mundo aún.
+            id @ (0x1e | 0x24) => {
+                let label = if id == 0x1e { "InventoryTransaction" } else { "PlayerAction" };
+                progress.last_packet_name = label.to_string();
+                let hex: String = pkt.body.iter().take(32).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                log::info!(
+                    "[Bedrock Action] {} (0x{:02x}) recibido desde {} (len={}, hex=[{}]) -> solo registro (sin WorldUpdate)",
+                    label, id, peer_addr, pkt.body.len(), hex
                 );
             }
 
@@ -3994,6 +4062,8 @@ pub fn start_async_engine(
         };
 
         // Bucle principal: acepta señalización HTTP (/v1/join), recibe datagramas UDP WebRTC y despacha Event
+        let (bcast_tx, mut bcast_rx) = tokio::sync::broadcast::channel::<Bytes>(512);
+        let _ = BROADCAST_TX.set(bcast_tx);
         let mut udp_buf = [0u8; 65535];
         let mut rtc_tick = tokio::time::interval(Duration::from_millis(20));
         let mut keepalive_tick = tokio::time::interval(Duration::from_secs(2));
@@ -4273,6 +4343,36 @@ pub fn start_async_engine(
                             }
                         } else {
                             let _ = udp_shared.send_to(&data, dest).await;
+                        }
+                    }
+                }
+                bcast_res = bcast_rx.recv() => {
+                    if let Ok(raw) = bcast_res {
+                        let now = Instant::now();
+                        let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+                        if let Ok(mut guard) = peers.lock() {
+                            for peer in guard.values_mut() {
+                                let batch = peer.session.encode(&[raw.clone()]);
+                                peer.conn.send(batch, now);
+                                while let Some(tx) = peer.conn.poll_transmit() {
+                                    peer.progress.outbound_packets_sent =
+                                        peer.progress.outbound_packets_sent.saturating_add(1);
+                                    peer.progress.outbound_bytes_sent = peer
+                                        .progress
+                                        .outbound_bytes_sent
+                                        .saturating_add(tx.contents.len() as u64);
+                                    outbound.push((tx.destination, tx.contents));
+                                }
+                            }
+                        }
+                        for (dest, data) in outbound {
+                            if dest.is_ipv6() {
+                                if let Some(ref v6) = udp_v6_shared {
+                                    let _ = v6.send_to(&data, dest).await;
+                                }
+                            } else {
+                                let _ = udp_shared.send_to(&data, dest).await;
+                            }
                         }
                     }
                 }
