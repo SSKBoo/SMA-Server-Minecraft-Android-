@@ -11,5 +11,11 @@ local.properties
 *.keystore
 
 # Artefactos Rust
+target/
 rust-core/target/
 app/src/main/jniLibs/
+*.so
+
+# Logs
+*.log
+logs/
