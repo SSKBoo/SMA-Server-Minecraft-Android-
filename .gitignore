@@ -10,7 +10,6 @@ local.properties
 *.jks
 *.keystore
 
-# Artefactos Rust (CI regenera Cargo.lock dinámicamente sin --locked)
+# Artefactos Rust
 rust-core/target/
 app/src/main/jniLibs/
-Cargo.lock
