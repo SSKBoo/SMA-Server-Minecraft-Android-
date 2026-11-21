@@ -24,6 +24,7 @@ use acacia_session::server::{read_login, ServerConnection};
 use bytes::{Bytes, BytesMut};
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use p384::ecdsa::SigningKey;
+use p384::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use rand_core::OsRng;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::any::Any;
@@ -62,6 +63,41 @@ fn overrides() -> &'static Mutex<OverrideMap> {
 
 static WORLD_BASE: OnceLock<String> = OnceLock::new();
 static ENGINE_START: OnceLock<Instant> = OnceLock::new();
+
+/// Identidad del servidor persistida en PKCS#8 para que los clientes no vuelvan
+/// a pedir confianza (NetherNet pinnea la clave entre reinicios).
+fn host_key_path(base: &str) -> PathBuf {
+    PathBuf::from(base).join("host_key.pk8")
+}
+
+fn load_or_create_host_key(base: &str) -> SigningKey {
+    let path = host_key_path(base);
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(key) = SigningKey::from_pkcs8_der(&bytes) {
+            log::info!(
+                "[Bedrock Identity] Clave persistida cargada desde {}",
+                path.display()
+            );
+            return key;
+        }
+        log::warn!(
+            "[Bedrock Identity] No se pudo leer la clave en {}, generando una nueva",
+            path.display()
+        );
+    }
+    let key = SigningKey::random(&mut OsRng);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match key.to_pkcs8_der() {
+        Ok(doc) => match std::fs::write(&path, doc.as_bytes()) {
+            Ok(_) => log::info!("[Bedrock Identity] Clave guardada en {}", path.display()),
+            Err(e) => log::warn!("[Bedrock Identity] Error guardando clave: {}", e),
+        },
+        Err(e) => log::warn!("[Bedrock Identity] Error serializando clave: {}", e),
+    }
+    key
+}
 
 fn world_overrides_path(base: &str) -> PathBuf {
     PathBuf::from(base).join("world").join("overrides.txt")
@@ -4168,7 +4204,7 @@ pub fn start_async_engine(
     let motd_string = build_bedrock_advertisement(&server_name_owned, effective_port);
     let adv_len = motd_string.len();
     let net_id = server_id();
-    let host_key = SigningKey::random(&mut OsRng);
+    let host_key = load_or_create_host_key(&dir_owned);
     let peers: Arc<Mutex<HashMap<u64, PeerSession>>> = Arc::new(Mutex::new(HashMap::new()));
     let udp_shared = Arc::new(udp_socket);
     let world_base = dir_owned.clone();
@@ -5466,11 +5502,13 @@ mod tests {
         assert_eq!(pong_raw.id, 0x73);
         assert_eq!(pong_raw.body.last().copied(), Some(0u8));
 
-        let mut dbg_prog = SessionProgress::default();
-        dbg_prog.has_sent_start_game = true;
-        dbg_prog.set_local_player_initialized = true;
-        dbg_prog.last_packet_id = Some(0x90);
-        dbg_prog.last_packet_name = "PlayerAuthInput".to_string();
+        let mut dbg_prog = SessionProgress {
+            has_sent_start_game: true,
+            set_local_player_initialized: true,
+            last_packet_id: Some(0x90),
+            last_packet_name: "PlayerAuthInput".to_string(),
+            ..Default::default()
+        };
         let coords = build_spawn_chunk_ring_coords();
         assert_eq!(coords.len(), 25);
         assert_eq!(coords.front().copied(), Some((0, 0)));
@@ -5605,11 +5643,13 @@ mod tests {
 
     #[test]
     fn disconnect_summary_reports_unknown_packet_top5() {
-        let mut progress = SessionProgress::default();
-        progress.last_packet_name = "PlayerAuthInput".to_string();
-        progress.last_packet_id = Some(0x90);
-        progress.player_auth_input_count = 100;
-        progress.unknown_pkts = 12;
+        let mut progress = SessionProgress {
+            last_packet_name: "PlayerAuthInput".to_string(),
+            last_packet_id: Some(0x90),
+            player_auth_input_count: 100,
+            unknown_pkts: 12,
+            ..Default::default()
+        };
         progress.unknown_pkt_ids.insert(0x2c, 7);
         progress.unknown_pkt_ids.insert(0x1e, 3);
         progress.unknown_pkt_ids.insert(0x21, 2);

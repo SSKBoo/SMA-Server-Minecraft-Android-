@@ -2,6 +2,12 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.8.0-dev-server — Iteración rápida en PC
+
+- `rust-core/src/bin/dev_server.rs`: binario NetherNet para probar el motor desde la PC sin Gradle/cargo-ndk.
+- `load_or_create_host_key()`: identidad PKCS#8 persistida en `<data_dir>/host_key.pk8` para evitar re-solicitudes de confianza.
+- Verificado en release (debug rompe por un `debug_assert!` de `socket2` en Windows): escucha `0.0.0.0:19140`, PONG por LAN, firewall abierto. `docs/testing/dev-server.md`.
+
 ## v0.7.0-fase6 — Fase 6: opcional / futuro
 
 - Comandos `/tp`, `/gamemode`, `/time` sobre `CommandRequest (0x4d)` (verificados).
