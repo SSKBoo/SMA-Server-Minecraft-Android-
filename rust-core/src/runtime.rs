@@ -5,16 +5,18 @@ use acacia_nethernet::{
     Connection, Event as RtcEvent, Signal, SignalKind, PROBE_PATH,
 };
 use acacia_session::proto::types::{
-    BlockCoordinates, TransactionTransactionData, TransactionUseItemActionType, UpdateBlockFlags,
+    Action, BlockCoordinates, ContainerSlotType, FullContainerName, GameMode, ItemV4, ItemV4Extra,
+    TransactionTransactionData, TransactionUseItemActionType, UpdateBlockFlags, WindowIDVarint,
 };
 use acacia_session::proto::{
     encode_packet, packet_name,
     packets::{
-        ClientCacheStatus, ClientToServerHandshake, CommandRequest, InventoryTransaction, Login,
-        NetworkSettings, NetworkSettingsCompressionAlgorithm, PlayStatus, PlayStatusStatus,
-        RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse,
-        ResourcePackClientResponseResponseStatus, ServerToClientHandshake,
-        SetLocalPlayerAsInitialized, Text, TextContent, UpdateBlock,
+        ClientCacheStatus, ClientToServerHandshake, CommandRequest, InventoryContent,
+        InventoryTransaction, Login, NetworkSettings, NetworkSettingsCompressionAlgorithm,
+        PlayStatus, PlayStatusStatus, PlayerAction, RequestChunkRadius, RequestNetworkSettings,
+        ResourcePackClientResponse, ResourcePackClientResponseResponseStatus,
+        ServerToClientHandshake, SetLocalPlayerAsInitialized, SetPlayerGameType, SetTime, Text,
+        TextContent, UpdateBlock,
     },
     Packet, RawPacket,
 };
@@ -59,6 +61,7 @@ fn overrides() -> &'static Mutex<OverrideMap> {
 }
 
 static WORLD_BASE: OnceLock<String> = OnceLock::new();
+static ENGINE_START: OnceLock<Instant> = OnceLock::new();
 
 fn world_overrides_path(base: &str) -> PathBuf {
     PathBuf::from(base).join("world").join("overrides.txt")
@@ -156,6 +159,55 @@ fn handle_world_command(message: &str, peer_addr: SocketAddr) -> bool {
             "[Bedrock World] Comando /save ejecutado por {}: {} overrides guardados",
             peer_addr,
             n
+        );
+        return true;
+    }
+    if let Some(rest) = message.trim().strip_prefix("/tp") {
+        let parts: Vec<_> = rest.split_whitespace().collect();
+        if parts.len() == 3 {
+            if let (Ok(x), Ok(y), Ok(z)) = (
+                parts[0].parse::<f32>(),
+                parts[1].parse::<f32>(),
+                parts[2].parse::<f32>(),
+            ) {
+                let move_bytes =
+                    build_v2225_move_player_packet_bytes(1, x, y, z, 0.0, 0.0, 0.0, 0, true, 0);
+                publish_broadcast(move_bytes);
+                log::info!(
+                    "[Bedrock Cmd] /tp ({},{},{}) ejecutado por {}",
+                    x,
+                    y,
+                    z,
+                    peer_addr
+                );
+            }
+        }
+        return true;
+    }
+    if let Some(rest) = message.trim().strip_prefix("/time") {
+        if let Ok(time) = rest.trim().parse::<i32>() {
+            let mut buf = BytesMut::new();
+            encode_packet(&SetTime { time }, &mut buf);
+            publish_broadcast(buf.freeze());
+            log::info!("[Bedrock Cmd] /time {} ejecutado por {}", time, peer_addr);
+        }
+        return true;
+    }
+    if let Some(rest) = message.trim().strip_prefix("/gamemode") {
+        let mode = match rest.trim().to_ascii_lowercase().as_str() {
+            "survival" | "s" | "0" => GameMode::Survival,
+            "creative" | "c" | "1" => GameMode::Creative,
+            "adventure" | "a" | "2" => GameMode::Adventure,
+            "spectator" | "sp" | "6" => GameMode::Spectator,
+            _ => GameMode::Survival,
+        };
+        let mut buf = BytesMut::new();
+        encode_packet(&SetPlayerGameType { gamemode: mode }, &mut buf);
+        publish_broadcast(buf.freeze());
+        log::info!(
+            "[Bedrock Cmd] /gamemode {:?} ejecutado por {}",
+            mode,
+            peer_addr
         );
         return true;
     }
@@ -2522,6 +2574,34 @@ pub fn send_spawn_finish_sequence(
         let health_batch = session.encode(&[health_bytes]);
         conn.send(health_batch, now);
 
+        // Fase 6: inventario vacío estándar para que el cliente abra el menú y pueda interactuar.
+        let empty_item = ItemV4 {
+            network_id: 0,
+            count: 0,
+            metadata: 0,
+            has_stack_id: false,
+            stack_id: None,
+            block_runtime_id: 0,
+            extra: ItemV4Extra::Default(None),
+        };
+        let inventory = InventoryContent {
+            window_id: WindowIDVarint::Inventory,
+            input: vec![empty_item.clone(); 36],
+            container: FullContainerName {
+                container_id: ContainerSlotType::Inventory,
+                dynamic_container_id: None,
+            },
+            storage_item: empty_item,
+        };
+        let mut inv_buf = BytesMut::new();
+        encode_packet(&inventory, &mut inv_buf);
+        let inv_batch = session.encode(&[inv_buf.freeze()]);
+        conn.send(inv_batch, now);
+        log::info!(
+            "[Bedrock World] InventoryContent (0x31) enviado a {} (36 slots)",
+            peer_addr
+        );
+
         // Fase 4: reenviar bloques modificados antes del PlayStatus de spawn.
         if let Ok(map) = overrides().lock() {
             if !map.is_empty() {
@@ -3507,6 +3587,34 @@ pub fn handle_bedrock_session_data(
                             peer_addr, e
                         ),
                         }
+                    } else {
+                        match pkt.decode::<PlayerAction>() {
+                            Ok(action) => {
+                                let is_break = matches!(
+                                    action.action,
+                                    Action::StartBreak
+                                        | Action::CrackBreak
+                                        | Action::StopBreak
+                                        | Action::CreativePlayerDestroyBlock
+                                        | Action::PredictBreak
+                                );
+                                if is_break {
+                                    let pos = &action.position;
+                                    if let Ok(mut map) = overrides().lock() {
+                                        map.insert((pos.x, pos.y, pos.z), 0);
+                                    }
+                                    log::info!(
+                                        "[Bedrock World] Override por PlayerAction ({:?}) en ({},{},{}) -> aire",
+                                        action.action, pos.x, pos.y, pos.z
+                                    );
+                                }
+                            }
+                            Err(e) => log::warn!(
+                                "[Bedrock Action] PlayerAction no decodificable desde {}: {}",
+                                peer_addr,
+                                e
+                            ),
+                        }
                     }
                 }
 
@@ -3667,6 +3775,50 @@ async fn handle_http_signaling_stream(
     );
 
     let (path_only, query_str) = req.path.split_once('?').unwrap_or((req.path, ""));
+
+    // Fase 6: endpoint Prometheus en el mismo puerto HTTP de señalización.
+    if req.method.eq_ignore_ascii_case("GET") && path_only == "/metrics" {
+        let (connected, spawned, packets, bytes) = if let Ok(guard) = peers.lock() {
+            (
+                guard.len(),
+                guard.values().filter(|p| p.progress.spawn_init).count(),
+                guard
+                    .values()
+                    .map(|p| p.progress.outbound_packets_sent)
+                    .sum::<u64>(),
+                guard
+                    .values()
+                    .map(|p| p.progress.outbound_bytes_sent)
+                    .sum::<u64>(),
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+        let overrides = overrides().lock().map(|m| m.len()).unwrap_or(0);
+        let uptime = ENGINE_START
+            .get()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        let body = format!(
+            "# TYPE bedrockdroid_connected_peers gauge\n\
+             bedrockdroid_connected_peers {}\n\
+             # TYPE bedrockdroid_players_spawned gauge\n\
+             bedrockdroid_players_spawned {}\n\
+             # TYPE bedrockdroid_world_overrides gauge\n\
+             bedrockdroid_world_overrides {}\n\
+             # TYPE bedrockdroid_uptime_seconds gauge\n\
+             bedrockdroid_uptime_seconds {}\n\
+             # TYPE bedrockdroid_outbound_packets counter\n\
+             bedrockdroid_outbound_packets {}\n\
+             # TYPE bedrockdroid_outbound_bytes counter\n\
+             bedrockdroid_outbound_bytes {}\n",
+            connected, spawned, overrides, uptime, packets, bytes
+        );
+        let resp = http::response(200, "text/plain; version=0.0.4", &body);
+        let _ = stream.write_all(&resp).await;
+        return;
+    }
+
     let query_params = parse_join_query(query_str);
     let proto_ok = is_protocol_compatible(query_params.protocol, query_params.version.as_deref());
 
@@ -4021,6 +4173,7 @@ pub fn start_async_engine(
     let udp_shared = Arc::new(udp_socket);
     let world_base = dir_owned.clone();
     let _ = WORLD_BASE.set(world_base.clone());
+    let _ = ENGINE_START.set(Instant::now());
     load_world_overrides(&world_base);
 
     rt.spawn(CatchUnwindFuture::new("nethernet_main_loop", async move {

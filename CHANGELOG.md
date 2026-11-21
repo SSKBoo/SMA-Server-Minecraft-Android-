@@ -2,6 +2,14 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.7.0-fase6 — Fase 6: opcional / futuro
+
+- Comandos `/tp`, `/gamemode`, `/time` sobre `CommandRequest (0x4d)` (verificados).
+- Endpoint Prometheus `/metrics` en el puerto 19132 (verificado).
+- `InventoryContent (0x31)` con 36 slots en el spawn y parseo de `PlayerAction (0x24)` para overrides.
+- Foreground service existente verificado y documentado.
+- `docs/testing/fase6.md`: pendientes (menú de inventario no abre en 1.26.65, rotura real no validada de extremo a extremo).
+
 ## v0.6.0-fase5 — Fase 5: robustez y CI
 
 - `cargo fmt` aplicado; `fmt --check` y `clippy -D warnings` limpios (9 lints corregidos).
