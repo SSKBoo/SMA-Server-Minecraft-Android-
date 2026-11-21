@@ -19,3 +19,6 @@ app/src/main/jniLibs/
 # Logs
 *.log
 logs/
+
+# Datos de runtime del servidor de desarrollo (incluye clave privada)
+rust-core/dev_world/
