@@ -6,14 +6,16 @@ use acacia_nethernet::{
 };
 use acacia_session::proto::types::{
     Action, BlockCoordinates, ContainerSlotType, FullContainerName, GameMode, ItemV4, ItemV4Extra,
-    TransactionTransactionData, TransactionUseItemActionType, UpdateBlockFlags, WindowIDVarint,
+    TransactionTransactionData, TransactionUseItemActionType, UpdateBlockFlags, Vec2f, Vec3f,
+    WindowIDVarint,
 };
 use acacia_session::proto::{
     encode_packet, packet_name,
     packets::{
         AvailableCommands, AvailableCommandsCommandDataItem,
         AvailableCommandsCommandDataItemOverloadsItem, ClientCacheStatus, ClientToServerHandshake,
-        CommandRequest, InventoryContent, InventoryTransaction, Login, NetworkSettings,
+        CommandRequest, CorrectPlayerMovePrediction, CorrectPlayerMovePredictionPredictionType,
+        InventoryContent, InventoryTransaction, Login, NetworkSettings,
         NetworkSettingsCompressionAlgorithm, PlayStatus, PlayStatusStatus, PlayerAction,
         RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse,
         ResourcePackClientResponseResponseStatus, ServerToClientHandshake,
@@ -364,6 +366,11 @@ pub struct SessionProgress {
     pub blocks_broken: u64,
     /// Última posición conocida del jugador (ojos), para `ContainerOpen`.
     pub last_position: (f32, f32, f32),
+    /// Simulación vertical del servidor para movimiento server-authoritative.
+    pub sim_base_y: f32,
+    pub sim_y: f32,
+    pub sim_vy: f32,
+    pub sim_grounded: bool,
 }
 
 struct PeerSession {
@@ -2605,6 +2612,29 @@ pub fn build_v2225_creative_content_bytes() -> Bytes {
     Bytes::from(raw)
 }
 
+/// Un paso de la simulación vertical del servidor (salto + gravedad simplificados).
+pub fn step_vertical_simulation(
+    base_y: f32,
+    sim_y: f32,
+    vy: f32,
+    grounded: bool,
+    jumping: bool,
+) -> (f32, f32, bool) {
+    let (mut y, mut v, mut g) = (sim_y, vy, grounded);
+    if jumping && g {
+        v = 0.42;
+        g = false;
+    }
+    v -= 0.08;
+    y += v;
+    if y <= base_y {
+        y = base_y;
+        v = 0.0;
+        g = true;
+    }
+    (y, v, g)
+}
+
 /// Garantiza que la coordenada `Y` enviada al cliente en `MovePlayerPacket` nunca caiga por debajo del suelo (`64.0`).
 pub fn clamp_player_auth_y(y: f32) -> f32 {
     if !y.is_finite() || y < MIN_SPAWN_SAFE_Y {
@@ -3882,8 +3912,9 @@ pub fn handle_bedrock_session_data(
                         if progress.remote_entity_id == 0 {
                             progress.remote_entity_id = allocate_remote_entity_id();
                         }
-                        // El cliente predice su movimiento y nosotros aceptamos su
-                        // posición sin corregirla (guía oficial de movimiento).
+                        // Simulación vertical real del servidor: el cliente está en
+                        // modo server-authoritative y necesita que le corrijamos la
+                        // predicción con el tick del input para aplicar gravedad/salto.
                         let extras = parse_player_auth_input_extras(&pkt.body).ok();
                         let jumping = extras
                             .as_ref()
@@ -3893,6 +3924,50 @@ pub fn handle_bedrock_session_data(
                                     || e.has_flag(61) // JumpCurrentRaw
                             })
                             .unwrap_or(false);
+                        if progress.sim_base_y == 0.0 {
+                            progress.sim_base_y = input.y;
+                            progress.sim_y = input.y;
+                            progress.sim_grounded = true;
+                        }
+                        let (sim_y, sim_vy, sim_grounded) = step_vertical_simulation(
+                            progress.sim_base_y,
+                            progress.sim_y,
+                            progress.sim_vy,
+                            progress.sim_grounded,
+                            jumping,
+                        );
+                        progress.sim_y = sim_y;
+                        progress.sim_vy = sim_vy;
+                        progress.sim_grounded = sim_grounded;
+                        let tick = extras
+                            .as_ref()
+                            .map(|e| e.client_tick)
+                            .unwrap_or(progress.movement_tick);
+                        if (progress.sim_y - input.y).abs() > 0.03 {
+                            let correction = CorrectPlayerMovePrediction {
+                                prediction_type: CorrectPlayerMovePredictionPredictionType::Player,
+                                position: Vec3f {
+                                    x: input.x,
+                                    y: progress.sim_y,
+                                    z: input.z,
+                                },
+                                delta: Vec3f {
+                                    x: 0.0,
+                                    y: progress.sim_vy,
+                                    z: 0.0,
+                                },
+                                rotation: Vec2f {
+                                    x: input.pitch,
+                                    z: input.yaw,
+                                },
+                                angular_velocity: None,
+                                on_ground: progress.sim_grounded,
+                                tick,
+                            };
+                            let mut corr_buf = BytesMut::new();
+                            encode_packet(&correction, &mut corr_buf);
+                            publish_to(BroadcastTarget::Only(peer_addr), corr_buf.freeze());
+                        }
                         let move_bytes = build_v2225_move_player_packet_bytes(
                             progress.remote_entity_id,
                             input.x,
@@ -5674,6 +5749,30 @@ mod tests {
         assert_eq!(face_offset(3), (0, 0, 1));
         assert_eq!(face_offset(4), (-1, 0, 0));
         assert_eq!(face_offset(5), (1, 0, 0));
+    }
+
+    #[test]
+    fn vertical_simulation_jumps_and_lands() {
+        let base = 65.62f32;
+        let (y1, v1, g1) = step_vertical_simulation(base, base, 0.0, true, true);
+        assert!(
+            y1 > base && v1 > 0.0 && !g1,
+            "el salto debe elevar al jugador"
+        );
+        let mut y = y1;
+        let mut v = v1;
+        let mut grounded = g1;
+        for _ in 0..30 {
+            let (ny, nv, ng) = step_vertical_simulation(base, y, v, grounded, false);
+            y = ny;
+            v = nv;
+            grounded = ng;
+            if grounded {
+                break;
+            }
+        }
+        assert!(grounded, "el jugador debe volver a tierra");
+        assert!((y - base).abs() < 0.001);
     }
 
     #[test]

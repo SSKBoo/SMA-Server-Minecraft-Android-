@@ -2,6 +2,13 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.16.0-p1g — Simulación vertical del servidor con correcciones
+
+- **Movimiento**: se implementa la simulación vertical real (salto `v=0.42`, gravedad `0.08` por tick, suelo en la Y inicial) y se envía `CorrectPlayerMovePrediction (0xa1)` al jugador cuando su Y simulada difiere de la predicha (>0.03), con el `client_tick` del `PlayerAuthInput`. Esto sigue la guía oficial de rewind del cliente.
+- **Helper testeable**: `step_vertical_simulation`; test `vertical_simulation_jumps_and_lands`.
+- **Motivo**: tras 134 eventos `[Bedrock Jump]` la Y del cliente seguía fija en 65.62 y `on_ground=false`; aceptar ciegamente no fue suficiente en este cliente, necesita la corrección con tick.
+- **Tests**: 24 tests, 0 fallos, clippy limpio.
+
 ## v0.15.0-p1f — Suelo sin propiedades y sin eco de MovePlayer
 
 - **Suelo**: la capa superficial del chunk de spawn pasa de `minecraft:grass_block` (tiene propiedad `snowy`, su hash sin estados puede no resolverse como bloque sólido) a `minecraft:dirt` (sin propiedades). Hipótesis: el cliente no encontraba colisión y por eso nunca marcaba `VerticalCollision` ni permitía el salto.
