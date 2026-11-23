@@ -2,6 +2,13 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.15.0-p1f — Suelo sin propiedades y sin eco de MovePlayer
+
+- **Suelo**: la capa superficial del chunk de spawn pasa de `minecraft:grass_block` (tiene propiedad `snowy`, su hash sin estados puede no resolverse como bloque sólido) a `minecraft:dirt` (sin propiedades). Hipótesis: el cliente no encontraba colisión y por eso nunca marcaba `VerticalCollision` ni permitía el salto.
+- **Movimiento**: se retira el eco de `MovePlayer` con `on_ground=true`; la doc oficial indica que `On Ground` en paquetes client-bound es ignorado y se reinicia cada frame.
+- **Verificación previa**: `StartGame` decodificado correctamente (Survival, pos 0/65.62/0, rewind 40, block-breaking server-auth, ids por hash). Los 51 eventos `[Bedrock Jump]` confirmaban que el input sí llegaba.
+- **Tests**: 23 tests, 0 fallos, clippy limpio.
+
 ## v0.14.0-p1e — Referencia de suelo para el salto y quitar la antorcha
 
 - **Salto (experimento)**: el log mostró 51 eventos `[Bedrock Jump]` con `flags=[3,6,16,60,61]` pero `on_ground=false` (flag 50 `VerticalCollision` ausente). El cliente sí envía el input, pero no se considera apoyado. Se le devuelve `MovePlayer (0x13)` con `on_ground=true` solo cuando **no** hay flags de salto y `y <= 66.0`, para darle referencia de suelo sin pisar el salto ni congelarlo en el aire.

@@ -1569,7 +1569,9 @@ pub fn build_empty_air_chunk_payload_nbtx() -> Vec<u8> {
 pub fn build_spawn_chunk_payload_nbtx() -> Vec<u8> {
     let air_hash = block_state_hash_nbtx("minecraft:air");
     let stone_hash = block_state_hash_nbtx("minecraft:stone");
-    let grass_hash = block_state_hash_nbtx("minecraft:grass_block");
+    // `grass_block` tiene la propiedad `snowy`; un hash sin estados puede no
+    // resolver a un bloque sólido en el cliente y dejar al jugador sin suelo.
+    let surface_hash = block_state_hash_nbtx("minecraft:dirt");
 
     let mut data = Vec::with_capacity(19200);
     // Subchunks -4..=2 (y = -64..47): sólido de piedra
@@ -1577,7 +1579,7 @@ pub fn build_spawn_chunk_payload_nbtx() -> Vec<u8> {
         append_uniform_subchunk_v9(&mut data, sub_y, stone_hash, air_hash);
     }
     // Subchunk 3 (y = 48..63): stone en local_y 0..14 y grass_block en local_y 15 (y=63)
-    append_surface_subchunk_v9(&mut data, 3, stone_hash, grass_hash);
+    append_surface_subchunk_v9(&mut data, 3, stone_hash, surface_hash);
     // Subchunk 4 (y = 64..79): todo aire para el jugador en y=64
     append_uniform_subchunk_v9(&mut data, 4, air_hash, stone_hash);
 
@@ -3880,11 +3882,8 @@ pub fn handle_bedrock_session_data(
                         if progress.remote_entity_id == 0 {
                             progress.remote_entity_id = allocate_remote_entity_id();
                         }
-                        // Experimento: el cliente envía el salto pero no marca
-                        // VerticalCollision (flag 50), así que se cree sin suelo.
-                        // Le devolvemos MovePlayer con on_ground=true solo cuando no
-                        // está saltando y está cerca del suelo, para darle referencia
-                        // sin pisar su salto ni congelarlo en el aire.
+                        // El cliente predice su movimiento y nosotros aceptamos su
+                        // posición sin corregirla (guía oficial de movimiento).
                         let extras = parse_player_auth_input_extras(&pkt.body).ok();
                         let jumping = extras
                             .as_ref()
@@ -3907,23 +3906,6 @@ pub fn handle_bedrock_session_data(
                             progress.movement_tick,
                         );
                         publish_to(BroadcastTarget::AllExcept(peer_addr), move_bytes);
-                        if !jumping && input.y <= 66.0 {
-                            let grounded = build_v2225_move_player_packet_bytes(
-                                progress.remote_entity_id,
-                                input.x,
-                                input.y,
-                                input.z,
-                                input.pitch,
-                                input.yaw,
-                                input.head_yaw,
-                                0,
-                                true,
-                                progress.movement_tick,
-                            );
-                            publish_to(BroadcastTarget::Only(peer_addr), grounded);
-                        }
-                        // No enviamos CorrectPlayerMovePrediction: una corrección con
-                        // posición aproximada reinicia la simulación del cliente.
 
                         if progress.player_auth_input_count == 1
                             || progress.player_auth_input_count.is_multiple_of(40)
