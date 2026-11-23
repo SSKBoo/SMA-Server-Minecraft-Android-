@@ -2,6 +2,12 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.14.0-p1e — Referencia de suelo para el salto y quitar la antorcha
+
+- **Salto (experimento)**: el log mostró 51 eventos `[Bedrock Jump]` con `flags=[3,6,16,60,61]` pero `on_ground=false` (flag 50 `VerticalCollision` ausente). El cliente sí envía el input, pero no se considera apoyado. Se le devuelve `MovePlayer (0x13)` con `on_ground=true` solo cuando **no** hay flags de salto y `y <= 66.0`, para darle referencia de suelo sin pisar el salto ni congelarlo en el aire.
+- **Antorcha**: se quita de creative/hotbar (el hash de `minecraft:torch` sin propiedades de orientación no es un bloque válido y el cliente la hacía desaparecer). Se sustituye por `minecraft:glass` (id 20).
+- **Tests**: 23 tests, 0 fallos, clippy limpio.
+
 ## v0.13.0-p1d — Revertir AvailableCommands (rompía la conexión)
 
 - **Revert**: dejar de enviar `AvailableCommands (0x4c)`. El cliente respondía con `PacketViolationWarning (0x9c)` y `InitialConnection-90` antes del spawn. La codificación generada por `acacia-proto` no es aceptada por el cliente 1.26.65; se revisará en una iteración separada.

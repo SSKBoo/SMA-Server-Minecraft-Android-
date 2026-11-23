@@ -2505,7 +2505,7 @@ pub const STARTER_ITEMS: &[(&str, i32, bool)] = &[
     ("minecraft:sand", 12, true),
     ("minecraft:oak_log", 17, true),
     ("minecraft:glass", 20, true),
-    ("minecraft:torch", 50, true),
+    ("minecraft:glass", 20, true),
     ("minecraft:stick", 323, false),
     ("minecraft:apple", 883, false),
 ];
@@ -2526,7 +2526,7 @@ fn build_starter_inventory_slots() -> Vec<ItemV4> {
     slots[1] = starter_item_v4("minecraft:stone", 1, true, 64);
     slots[2] = starter_item_v4("minecraft:cobblestone", 4, true, 64);
     slots[3] = starter_item_v4("minecraft:oak_planks", 5, true, 64);
-    slots[4] = starter_item_v4("minecraft:torch", 50, true, 64);
+    slots[4] = starter_item_v4("minecraft:glass", 20, true, 64);
     slots
 }
 
@@ -3880,9 +3880,20 @@ pub fn handle_bedrock_session_data(
                         if progress.remote_entity_id == 0 {
                             progress.remote_entity_id = allocate_remote_entity_id();
                         }
-                        // El cliente es autoritativo de su propio movimiento: NO se le devuelve su
-                        // MovePlayer (eso causaba el "salto sin bajar" por on_ground=true). Solo los
-                        // demás peers lo reciben, con el runtime id remoto de este jugador.
+                        // Experimento: el cliente envía el salto pero no marca
+                        // VerticalCollision (flag 50), así que se cree sin suelo.
+                        // Le devolvemos MovePlayer con on_ground=true solo cuando no
+                        // está saltando y está cerca del suelo, para darle referencia
+                        // sin pisar su salto ni congelarlo en el aire.
+                        let extras = parse_player_auth_input_extras(&pkt.body).ok();
+                        let jumping = extras
+                            .as_ref()
+                            .map(|e| {
+                                e.has_flag(INPUT_FLAG_START_JUMPING)
+                                    || e.has_flag(6)  // Jumping
+                                    || e.has_flag(61) // JumpCurrentRaw
+                            })
+                            .unwrap_or(false);
                         let move_bytes = build_v2225_move_player_packet_bytes(
                             progress.remote_entity_id,
                             input.x,
@@ -3896,11 +3907,23 @@ pub fn handle_bedrock_session_data(
                             progress.movement_tick,
                         );
                         publish_to(BroadcastTarget::AllExcept(peer_addr), move_bytes);
-                        // Según la guía oficial de movimiento, un servidor que aún no
-                        // simula físicas puede aceptar ciegamente la posición predicha.
-                        // NO enviamos CorrectPlayerMovePrediction: una corrección con
-                        // on_ground/posición aproximados reinicia la simulación del
-                        // cliente (salto bloqueado y ClientMovementPredictionSync 0x142).
+                        if !jumping && input.y <= 66.0 {
+                            let grounded = build_v2225_move_player_packet_bytes(
+                                progress.remote_entity_id,
+                                input.x,
+                                input.y,
+                                input.z,
+                                input.pitch,
+                                input.yaw,
+                                input.head_yaw,
+                                0,
+                                true,
+                                progress.movement_tick,
+                            );
+                            publish_to(BroadcastTarget::Only(peer_addr), grounded);
+                        }
+                        // No enviamos CorrectPlayerMovePrediction: una corrección con
+                        // posición aproximada reinicia la simulación del cliente.
 
                         if progress.player_auth_input_count == 1
                             || progress.player_auth_input_count.is_multiple_of(40)
@@ -3919,11 +3942,8 @@ pub fn handle_bedrock_session_data(
                         handle_auth_input_block_actions(&pkt.body, progress, peer_addr);
 
                         // Instrumentación temporal: ¿el cliente envía input de salto?
-                        if let Ok(extras) = parse_player_auth_input_extras(&pkt.body) {
-                            let jumping = extras.has_flag(INPUT_FLAG_START_JUMPING)
-                                || extras.has_flag(6)  // Jumping
-                                || extras.has_flag(61); // JumpCurrentRaw
-                            if jumping {
+                        if jumping {
+                            if let Some(extras) = &extras {
                                 log::warn!(
                                     "[Bedrock Jump] {} tick={} flags={:?} on_ground={}",
                                     peer_addr,
@@ -5650,7 +5670,7 @@ mod tests {
             slots[0].block_runtime_id > 0,
             "dirt debe tener hash de bloque"
         );
-        assert_eq!(slots[4].network_id, 50, "slot 4 debe ser antorcha");
+        assert_eq!(slots[4].network_id, 20, "slot 4 debe ser cristal");
         assert_eq!(slots[5].count, 0, "el resto de slots quedan vacíos");
     }
 
