@@ -371,6 +371,8 @@ pub struct SessionProgress {
     pub sim_y: f32,
     pub sim_vy: f32,
     pub sim_grounded: bool,
+    /// Flanco del botón de salto: evita saltos repetidos mientras se mantiene pulsado.
+    pub prev_jump_held: bool,
 }
 
 struct PeerSession {
@@ -2517,6 +2519,13 @@ pub const STARTER_ITEMS: &[(&str, i32, bool)] = &[
     ("minecraft:glass", 20, true),
     ("minecraft:stick", 323, false),
     ("minecraft:apple", 883, false),
+    ("minecraft:wooden_pickaxe", 312, false),
+    ("minecraft:stone_pickaxe", 316, false),
+    ("minecraft:iron_pickaxe", 299, false),
+    ("minecraft:wooden_shovel", 311, false),
+    ("minecraft:wooden_axe", 313, false),
+    ("minecraft:wooden_sword", 310, false),
+    ("minecraft:bread", 261, false),
 ];
 
 /// 36 ranuras del inventario: hotbar con bloques iniciales y el resto vacío.
@@ -2536,6 +2545,10 @@ fn build_starter_inventory_slots() -> Vec<ItemV4> {
     slots[2] = starter_item_v4("minecraft:cobblestone", 4, true, 64);
     slots[3] = starter_item_v4("minecraft:oak_planks", 5, true, 64);
     slots[4] = starter_item_v4("minecraft:glass", 20, true, 64);
+    slots[5] = starter_item_v4("minecraft:wooden_pickaxe", 312, false, 1);
+    slots[6] = starter_item_v4("minecraft:stone_pickaxe", 316, false, 1);
+    slots[7] = starter_item_v4("minecraft:wooden_shovel", 311, false, 1);
+    slots[8] = starter_item_v4("minecraft:apple", 883, false, 16);
     slots
 }
 
@@ -2614,26 +2627,42 @@ pub fn build_v2225_creative_content_bytes() -> Bytes {
 
 /// Altura del suelo en el espacio de coordenadas que reporta el cliente, teniendo
 /// en cuenta los bloques modificados (override) en la columna `(x, z)`.
-pub fn solid_floor_y(base_y: f32, x: f32, z: f32) -> f32 {
+pub fn column_floor_and_obstacle(base_y: f32, x: f32, z: f32, player_y: f32) -> (f32, bool) {
     let bx = x.floor() as i32;
     let bz = z.floor() as i32;
     let air = air_block_runtime_id();
     const SURFACE_Y: i32 = 63; // capa de dirt; el suelo base termina en y=64.0
     const MIN_Y: i32 = -64;
 
+    let world_y = 64.0 + (player_y - base_y);
     let map = overrides().lock().ok();
-    // Buscamos el bloque sólido más alto de la columna. El terreno natural es
-    // sólido hasta SURFACE_Y; por debajo solo cuenta lo que no se haya roto.
+    let mut floor_top = 63;
+    let mut highest: Option<i32> = None;
     for y in (MIN_Y..=320).rev() {
         let solid = match map.as_ref().and_then(|m| m.get(&(bx, y, bz))) {
             Some(id) => *id != 0 && *id != air,
             None => y <= SURFACE_Y,
         };
         if solid {
-            return base_y + ((y + 1) as f32 - (SURFACE_Y + 1) as f32);
+            if highest.is_none() {
+                highest = Some(y + 1);
+            }
+            // Solo cuenta como suelo lo que está a la altura del jugador o debajo.
+            if (y + 1) as f32 <= world_y + 0.6 {
+                floor_top = y + 1;
+                break;
+            }
         }
     }
-    base_y - 4.0
+    let obstacle = highest
+        .map(|top| top as f32 > world_y + 0.6)
+        .unwrap_or(false);
+    (base_y + (floor_top as f32 - 64.0), obstacle)
+}
+
+/// Flanco ascendente del salto: evita impulsos repetidos mientras el botón está pulsado.
+pub fn is_jump_edge(held: bool, prev_held: bool) -> bool {
+    held && !prev_held
 }
 
 /// Un paso de la simulación vertical del servidor (salto + gravedad simplificados).
@@ -3943,10 +3972,8 @@ pub fn handle_bedrock_session_data(
                             progress.remote_entity_id = allocate_remote_entity_id();
                         }
                         // Simulación vertical con colisión contra los overrides del mundo.
-                        // modo server-authoritative y necesita que le corrijamos la
-                        // predicción con el tick del input para aplicar gravedad/salto.
                         let extras = parse_player_auth_input_extras(&pkt.body).ok();
-                        let jumping = extras
+                        let jump_held = extras
                             .as_ref()
                             .map(|e| {
                                 e.has_flag(INPUT_FLAG_START_JUMPING)
@@ -3954,19 +3981,30 @@ pub fn handle_bedrock_session_data(
                                     || e.has_flag(61) // JumpCurrentRaw
                             })
                             .unwrap_or(false);
+                        // Solo el flanco ascendente dispara el salto; si se mantiene
+                        // pulsado no debe volver a impulsar al jugador hacia el cielo.
+                        let jump_edge = is_jump_edge(jump_held, progress.prev_jump_held);
+                        progress.prev_jump_held = jump_held;
                         if progress.sim_base_y == 0.0 {
                             progress.sim_base_y = input.y;
                             progress.sim_y = input.y;
                             progress.sim_grounded = true;
                         }
-                        let target_floor = solid_floor_y(progress.sim_base_y, input.x, input.z);
-                        let (corr_x, corr_z, floor_y) = if target_floor > progress.sim_y + 0.6 {
-                            // Bloque demasiado alto: se corrige a la posición anterior.
-                            (
+                        let (target_floor, obstacle) = column_floor_and_obstacle(
+                            progress.sim_base_y,
+                            input.x,
+                            input.z,
+                            progress.sim_y,
+                        );
+                        let (corr_x, corr_z, floor_y) = if obstacle {
+                            // Bloque por encima de los pies: mantener posición anterior.
+                            let (floor_prev, _) = column_floor_and_obstacle(
+                                progress.sim_base_y,
                                 prev_x,
                                 prev_z,
-                                solid_floor_y(progress.sim_base_y, prev_x, prev_z),
-                            )
+                                progress.sim_y,
+                            );
+                            (prev_x, prev_z, floor_prev)
                         } else {
                             (input.x, input.z, target_floor)
                         };
@@ -3982,7 +4020,7 @@ pub fn handle_bedrock_session_data(
                             progress.sim_y,
                             progress.sim_vy,
                             progress.sim_grounded,
-                            jumping,
+                            jump_edge,
                         );
                         progress.sim_y = sim_y;
                         progress.sim_vy = sim_vy;
@@ -4050,7 +4088,7 @@ pub fn handle_bedrock_session_data(
                         handle_auth_input_block_actions(&pkt.body, progress, peer_addr);
 
                         // Instrumentación temporal: ¿el cliente envía input de salto?
-                        if jumping {
+                        if jump_edge {
                             if let Some(extras) = &extras {
                                 log::warn!(
                                     "[Bedrock Jump] {} tick={} flags={:?} on_ground={}",
@@ -5779,7 +5817,9 @@ mod tests {
             "dirt debe tener hash de bloque"
         );
         assert_eq!(slots[4].network_id, 20, "slot 4 debe ser cristal");
-        assert_eq!(slots[5].count, 0, "el resto de slots quedan vacíos");
+        assert_eq!(slots[5].network_id, 312, "slot 5 debe ser pico de madera");
+        assert_eq!(slots[8].network_id, 883, "slot 8 debe ser manzana");
+        assert_eq!(slots[9].count, 0, "el resto de slots quedan vacíos");
     }
 
     #[test]
@@ -5803,9 +5843,18 @@ mod tests {
     }
 
     #[test]
-    fn solid_floor_uses_base_when_no_overrides() {
-        let floor = solid_floor_y(65.62, 1000.0, 1000.0);
+    fn jump_only_triggers_on_rising_edge() {
+        assert!(is_jump_edge(true, false));
+        assert!(!is_jump_edge(true, true));
+        assert!(!is_jump_edge(false, true));
+        assert!(!is_jump_edge(false, false));
+    }
+
+    #[test]
+    fn column_floor_uses_base_when_no_overrides() {
+        let (floor, obstacle) = column_floor_and_obstacle(65.62, 1000.0, 1000.0, 65.62);
         assert!((floor - 65.62).abs() < 0.001);
+        assert!(!obstacle);
     }
 
     #[test]

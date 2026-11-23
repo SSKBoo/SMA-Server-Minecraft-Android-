@@ -2,6 +2,13 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.19.0-p1j — Herramientas, salto por flanco y suelo bajo el jugador
+
+- **Herramientas**: el hotbar incluye pico de madera/piedra/hierro, pala, hacha, espada y manzanas (IDs reales del registry vanilla). 9 ranuras útiles.
+- **Salto**: `is_jump_edge` dispara el impulso solo en el flanco ascendente; antes, mantener pulsado causaba impulsos repetidos y el jugador "salía disparado al cielo".
+- **Teletransporte al subir**: `column_floor_and_obstacle` elige el bloque sólido **a la altura del jugador o debajo**, no el más alto de la columna, y marca `obstacle` si hay un bloque por encima de los pies. Así al caer por un pozo no te sube al bloque de arriba.
+- **Tests**: `jump_only_triggers_on_rising_edge`, `column_floor_uses_base_when_no_overrides`; 26 tests, clippy limpio.
+
 ## v0.18.0-p1i — Cuevas profundas y caída gradual
 
 - **Documentación oficial consultada**: [Build action simulation rate](https://mojang.github.io/bedrock-protocol-docs/guides/build-action-simulation-rate/) confirma **20 ticks/s** de simulación. Las guías de movimiento describen el rewind pero **no publican constantes de gravedad/salto**, así que se calibran empíricamente.
