@@ -6,18 +6,17 @@ use acacia_nethernet::{
 };
 use acacia_session::proto::types::{
     Action, BlockCoordinates, ContainerSlotType, FullContainerName, GameMode, ItemV4, ItemV4Extra,
-    TransactionTransactionData, TransactionUseItemActionType, UpdateBlockFlags, Vec2f, Vec3f,
-    WindowIDVarint,
+    TransactionTransactionData, TransactionUseItemActionType, UpdateBlockFlags, WindowIDVarint,
 };
 use acacia_session::proto::{
     encode_packet, packet_name,
     packets::{
-        ClientCacheStatus, ClientToServerHandshake, CommandRequest, CorrectPlayerMovePrediction,
-        CorrectPlayerMovePredictionPredictionType, InventoryContent, InventoryTransaction, Login,
-        NetworkSettings, NetworkSettingsCompressionAlgorithm, PlayStatus, PlayStatusStatus,
-        PlayerAction, RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse,
-        ResourcePackClientResponseResponseStatus, ServerToClientHandshake,
-        SetLocalPlayerAsInitialized, SetPlayerGameType, SetTime, Text, TextContent, UpdateBlock,
+        ClientCacheStatus, ClientToServerHandshake, CommandRequest, InventoryContent,
+        InventoryTransaction, Login, NetworkSettings, NetworkSettingsCompressionAlgorithm,
+        PlayStatus, PlayStatusStatus, PlayerAction, RequestChunkRadius, RequestNetworkSettings,
+        ResourcePackClientResponse, ResourcePackClientResponseResponseStatus,
+        ServerToClientHandshake, SetLocalPlayerAsInitialized, SetPlayerGameType, SetTime, Text,
+        TextContent, UpdateBlock,
     },
     Packet, RawPacket,
 };
@@ -2120,6 +2119,27 @@ pub fn normalize_override_runtime_id(id: u32) -> u32 {
     }
 }
 
+/// Desplazamiento de `BlockFace` de Bedrock (0 abajo, 1 arriba, 2 norte, 3 sur, 4 oeste, 5 este).
+pub fn face_offset(face: u8) -> (i32, i32, i32) {
+    match face {
+        0 => (0, -1, 0),
+        1 => (0, 1, 0),
+        2 => (0, 0, -1),
+        3 => (0, 0, 1),
+        4 => (-1, 0, 0),
+        5 => (1, 0, 0),
+        _ => (0, 1, 0),
+    }
+}
+
+/// Registra la colocación de un bloque y la difunde a todos los peers.
+pub fn apply_block_place(x: i32, y: i32, z: i32, block_runtime_id: u32) {
+    if let Ok(mut map) = overrides().lock() {
+        map.insert((x, y, z), block_runtime_id);
+    }
+    publish_broadcast(build_v2225_update_block_bytes(x, y, z, block_runtime_id));
+}
+
 /// Registra la rotura de un bloque en los overrides y la difunde a todos los peers.
 pub fn apply_block_break(x: i32, y: i32, z: i32) {
     if let Ok(mut map) = overrides().lock() {
@@ -3841,44 +3861,11 @@ pub fn handle_bedrock_session_data(
                             progress.movement_tick,
                         );
                         publish_to(BroadcastTarget::AllExcept(peer_addr), move_bytes);
-
-                        // P1: el cliente con movimiento server-authoritative espera una
-                        // corrección de predicción. Le devolvemos su propia posición (sin
-                        // desplazamiento) para que aplique la física vertical local.
-                        if progress.player_auth_input_count.is_multiple_of(10) {
-                            let extras = parse_player_auth_input_extras(&pkt.body).ok();
-                            let tick = extras
-                                .as_ref()
-                                .map(|e| e.client_tick)
-                                .unwrap_or(progress.movement_tick);
-                            let on_ground = extras
-                                .as_ref()
-                                .map(|e| e.has_flag(INPUT_FLAG_VERTICAL_COLLISION))
-                                .unwrap_or(true);
-                            let correction = CorrectPlayerMovePrediction {
-                                prediction_type: CorrectPlayerMovePredictionPredictionType::Player,
-                                position: Vec3f {
-                                    x: input.x,
-                                    y: input.y,
-                                    z: input.z,
-                                },
-                                delta: Vec3f {
-                                    x: 0.0,
-                                    y: 0.0,
-                                    z: 0.0,
-                                },
-                                rotation: Vec2f {
-                                    x: input.pitch,
-                                    z: input.yaw,
-                                },
-                                angular_velocity: None,
-                                on_ground,
-                                tick,
-                            };
-                            let mut corr_buf = BytesMut::new();
-                            encode_packet(&correction, &mut corr_buf);
-                            publish_to(BroadcastTarget::Only(peer_addr), corr_buf.freeze());
-                        }
+                        // Según la guía oficial de movimiento, un servidor que aún no
+                        // simula físicas puede aceptar ciegamente la posición predicha.
+                        // NO enviamos CorrectPlayerMovePrediction: una corrección con
+                        // on_ground/posición aproximados reinicia la simulación del
+                        // cliente (salto bloqueado y ClientMovementPredictionSync 0x142).
 
                         if progress.player_auth_input_count == 1
                             || progress.player_auth_input_count.is_multiple_of(40)
@@ -4151,35 +4138,58 @@ pub fn handle_bedrock_session_data(
                                     &tx.transaction.transaction_data
                                 {
                                     let pos = &use_item.block_position;
-                                    // El cliente 1.26.65 usa UseItem (ClickBlock/BreakBlock)
-                                    // aunque StartGame anuncie rotura server-authoritative.
-                                    // Aplicamos la rotura en ambos para que responda al toque.
-                                    if matches!(
-                                        use_item.action_type,
-                                        TransactionUseItemActionType::BreakBlock
-                                            | TransactionUseItemActionType::ClickBlock
-                                    ) {
-                                        apply_block_break(pos.x, pos.y, pos.z);
-                                        progress.blocks_broken =
-                                            progress.blocks_broken.saturating_add(1);
-                                        log::info!(
-                                            "[Bedrock Break] {} rompió ({},{},{}) vía InventoryTransaction (accion={:?}, total={})",
-                                            peer_addr,
-                                            pos.x,
-                                            pos.y,
-                                            pos.z,
-                                            use_item.action_type,
-                                            progress.blocks_broken
-                                        );
-                                    } else {
-                                        log::info!(
-                                            "[Bedrock Action] UseItem {:?} en ({},{},{}) -> runtime_id={}",
-                                            use_item.action_type,
-                                            pos.x,
-                                            pos.y,
-                                            pos.z,
-                                            use_item.block_runtime_id
-                                        );
+                                    // Guía oficial: con server-authoritative block breaking
+                                    // desactivado, la destrucción se pide con BreakBlock;
+                                    // ClickBlock es solo el inicio y también se envía al
+                                    // colocar un bloque. No debemos romper en ClickBlock.
+                                    match use_item.action_type {
+                                        TransactionUseItemActionType::BreakBlock => {
+                                            apply_block_break(pos.x, pos.y, pos.z);
+                                            progress.blocks_broken =
+                                                progress.blocks_broken.saturating_add(1);
+                                            log::info!(
+                                                "[Bedrock Break] {} rompió ({},{},{}) vía InventoryTransaction (total={})",
+                                                peer_addr,
+                                                pos.x,
+                                                pos.y,
+                                                pos.z,
+                                                progress.blocks_broken
+                                            );
+                                        }
+                                        TransactionUseItemActionType::ClickBlock
+                                            if use_item.held_item.network_id != 0
+                                                && use_item.block_runtime_id != 0 =>
+                                        {
+                                            let (dx, dy, dz) = face_offset(use_item.face);
+                                            let (px, py, pz) = (pos.x + dx, pos.y + dy, pos.z + dz);
+                                            apply_block_place(
+                                                px,
+                                                py,
+                                                pz,
+                                                use_item.block_runtime_id,
+                                            );
+                                            log::info!(
+                                                "[Bedrock Place] {} colocó ({},{},{}) id={} cara={}",
+                                                peer_addr,
+                                                px,
+                                                py,
+                                                pz,
+                                                use_item.block_runtime_id,
+                                                use_item.face
+                                            );
+                                        }
+                                        _ => {
+                                            log::info!(
+                                                "[Bedrock Action] UseItem {:?} en ({},{},{}) id={} held={} cara={}",
+                                                use_item.action_type,
+                                                pos.x,
+                                                pos.y,
+                                                pos.z,
+                                                use_item.block_runtime_id,
+                                                use_item.held_item.network_id,
+                                                use_item.face
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -5587,28 +5597,13 @@ mod tests {
     }
 
     #[test]
-    fn correct_player_move_prediction_encodes_for_sender() {
-        let correction = CorrectPlayerMovePrediction {
-            prediction_type: CorrectPlayerMovePredictionPredictionType::Player,
-            position: Vec3f {
-                x: 1.0,
-                y: 65.62,
-                z: 2.0,
-            },
-            delta: Vec3f {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-            },
-            rotation: Vec2f { x: 0.0, z: 0.0 },
-            angular_velocity: None,
-            on_ground: true,
-            tick: 42,
-        };
-        let mut buf = BytesMut::new();
-        encode_packet(&correction, &mut buf);
-        assert_eq!(buf[0], 0xa1, "debe ser CorrectPlayerMovePrediction (0xa1)");
-        assert!(buf.len() > 8);
+    fn face_offsets_match_bedrock_block_faces() {
+        assert_eq!(face_offset(0), (0, -1, 0));
+        assert_eq!(face_offset(1), (0, 1, 0));
+        assert_eq!(face_offset(2), (0, 0, -1));
+        assert_eq!(face_offset(3), (0, 0, 1));
+        assert_eq!(face_offset(4), (-1, 0, 0));
+        assert_eq!(face_offset(5), (1, 0, 0));
     }
 
     #[test]

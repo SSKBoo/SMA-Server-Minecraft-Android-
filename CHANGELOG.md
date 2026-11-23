@@ -2,6 +2,14 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.11.0-p1b — Ajustes según guías oficiales de Mojang 1.26.x
+
+- **Movimiento**: se elimina `CorrectPlayerMovePrediction`. La guía oficial permite aceptar ciegamente las posiciones predichas de `PlayerAuthInput`; nuestras correcciones Reiniciaban la simulación del cliente (salto bloqueado, `ClientMovementPredictionSync 0x142`). El cliente vuelve a predecir libremente.
+- **Rotura**: solo `InventoryTransaction/UseItem/BreakBlock` destruye bloques; `ClickBlock` ya no rompe (era lo que borraba el bloque al colocar encima).
+- **Colocación**: `ClickBlock` con ítem en mano y `block_runtime_id` válido coloca el bloque en la cara destino (`face_offset`) y difunde `UpdateBlock`.
+- **Documentación consultada**: `mojang.github.io/bedrock-protocol-docs/guides/player-movement-overview/`, `.../guides/block-breaking-overview/`, `.../guides/configuring-anti-cheat/` y el packet 322 `ClientMovementPredictionSync`.
+- **Tests**: `face_offsets_match_bedrock_block_faces`; 22 tests, 0 fallos, clippy limpio.
+
 ## v0.10.0-p1 — P1: inventario jugable, rotura por transacción y corrección de movimiento
 
 - **Inventario**: `CreativeContent` ya no se envía vacío: 12 ítems del registry vanilla 1.26.65 (stone=1, dirt=3, cobblestone=4, planks=5, bedrock=7, sand=12, log=17, glass=20, torch=50, stick=323, apple=883...), con hashes de bloque derivados por `block_state_hash_nbtx`.
