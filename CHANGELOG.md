@@ -2,6 +2,12 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.13.0-p1d — Revertir AvailableCommands (rompía la conexión)
+
+- **Revert**: dejar de enviar `AvailableCommands (0x4c)`. El cliente respondía con `PacketViolationWarning (0x9c)` y `InitialConnection-90` antes del spawn. La codificación generada por `acacia-proto` no es aceptada por el cliente 1.26.65; se revisará en una iteración separada.
+- Se mantienen la colocación por `held_item`, la rotura por `PredictDestroyBlock` y el log `[Bedrock Jump]`.
+- **Tests**: 23 tests, 0 fallos, clippy limpio.
+
 ## v0.12.0-p1c — Colocación por ítem, comandos visibles e instrumentación de salto
 
 - **Colocación**: `ClickBlock` usa el `held_item.network_id` del hotbar (resuelto contra `STARTER_ITEMS`) en vez del `block_runtime_id` del bloque apuntado. El log ahora muestra `held=` e `id=` por separado.

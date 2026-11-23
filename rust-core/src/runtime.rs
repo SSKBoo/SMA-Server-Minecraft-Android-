@@ -3483,7 +3483,6 @@ pub fn send_world_start_and_spawn(
                 let spawn_pos_bytes = build_v2225_set_spawn_position_packet_bytes(0, 64, 0, 0);
                 let difficulty_bytes = build_v2225_set_difficulty_packet_bytes(2);
                 let commands_bytes = build_v2225_set_commands_enabled_bytes(true);
-                let available_commands_bytes = build_v2225_available_commands_bytes();
                 let adventure_bytes = build_v2225_update_adventure_settings_bytes();
                 let abilities_bytes = build_v2225_update_abilities_bytes(1);
                 let gamerules_bytes = build_v2225_game_rules_changed_packet_bytes();
@@ -3498,7 +3497,6 @@ pub fn send_world_start_and_spawn(
                     spawn_pos_bytes,
                     difficulty_bytes,
                     commands_bytes,
-                    available_commands_bytes,
                     adventure_bytes,
                     abilities_bytes,
                     gamerules_bytes,
@@ -3512,7 +3510,7 @@ pub fn send_world_start_and_spawn(
                 }
                 progress.has_sent_world_registries = true;
                 log::info!(
-                    "[Bedrock Session] Entorno y registros 1.26.60 enviados a {}: JigsawStructureData (0x139), ItemRegistry (0xa2), SetSpawnPosition (0x2b), SetDifficulty (0x3c), SetCommandsEnabled (0x3b), AvailableCommands (0x4c), UpdateAdventureSettings (0xbc), UpdateAbilities (0xbb), GameRulesChanged (0x48), BiomeDefinitionList (0x7a), AvailableEntityIdentifiers (0x77), UpdateAttributes (0x1d), CreativeContent (0x91)",
+                    "[Bedrock Session] Entorno y registros 1.26.60 enviados a {}: JigsawStructureData (0x139), ItemRegistry (0xa2), SetSpawnPosition (0x2b), SetDifficulty (0x3c), SetCommandsEnabled (0x3b), UpdateAdventureSettings (0xbc), UpdateAbilities (0xbb), GameRulesChanged (0x48), BiomeDefinitionList (0x7a), AvailableEntityIdentifiers (0x77), UpdateAttributes (0x1d), CreativeContent (0x91)",
                     peer_addr
                 );
             }
