@@ -6,17 +6,18 @@ use acacia_nethernet::{
 };
 use acacia_session::proto::types::{
     Action, BlockCoordinates, ContainerSlotType, FullContainerName, GameMode, ItemV4, ItemV4Extra,
-    TransactionTransactionData, TransactionUseItemActionType, UpdateBlockFlags, WindowIDVarint,
+    TransactionTransactionData, TransactionUseItemActionType, UpdateBlockFlags, Vec2f, Vec3f,
+    WindowIDVarint,
 };
 use acacia_session::proto::{
     encode_packet, packet_name,
     packets::{
-        ClientCacheStatus, ClientToServerHandshake, CommandRequest, InventoryContent,
-        InventoryTransaction, Login, NetworkSettings, NetworkSettingsCompressionAlgorithm,
-        PlayStatus, PlayStatusStatus, PlayerAction, RequestChunkRadius, RequestNetworkSettings,
-        ResourcePackClientResponse, ResourcePackClientResponseResponseStatus,
-        ServerToClientHandshake, SetLocalPlayerAsInitialized, SetPlayerGameType, SetTime, Text,
-        TextContent, UpdateBlock,
+        ClientCacheStatus, ClientToServerHandshake, CommandRequest, CorrectPlayerMovePrediction,
+        CorrectPlayerMovePredictionPredictionType, InventoryContent, InventoryTransaction, Login,
+        NetworkSettings, NetworkSettingsCompressionAlgorithm, PlayStatus, PlayStatusStatus,
+        PlayerAction, RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse,
+        ResourcePackClientResponseResponseStatus, ServerToClientHandshake,
+        SetLocalPlayerAsInitialized, SetPlayerGameType, SetTime, Text, TextContent, UpdateBlock,
     },
     Packet, RawPacket,
 };
@@ -1902,6 +1903,8 @@ pub const INPUT_FLAG_START_JUMPING: i32 = 31;
 pub const INPUT_FLAG_PERFORM_ITEM_INTERACTION: i32 = 34;
 pub const INPUT_FLAG_PERFORM_BLOCK_ACTIONS: i32 = 35;
 pub const INPUT_FLAG_PERFORM_ITEM_STACK_REQUEST: i32 = 36;
+/// El cliente apoya verticalmente cuando reporta colisión vertical (gophertunnel).
+pub const INPUT_FLAG_VERTICAL_COLLISION: i32 = 50;
 /// Límite defensivo del número de flags (2225 define 70).
 pub const INPUT_FLAG_MAX: u32 = 128;
 
@@ -2469,17 +2472,104 @@ pub fn build_v2225_item_component_registry_bytes() -> Bytes {
         .clone()
 }
 
-/// Construye `CreativeContentPacket` (0x91 / 145) en formato `bedrock-rs` `V2225`.
+/// Ítems iniciales del registry vanilla 1.26.65: (nombre, id de red, es bloque).
+/// IDs extraídos de `VANILLA_ITEM_REGISTRY_ZLIB_B64` (i16 LE tras el nombre).
+pub const STARTER_ITEMS: &[(&str, i32, bool)] = &[
+    ("minecraft:stone", 1, true),
+    ("minecraft:grass_block", 2, true),
+    ("minecraft:dirt", 3, true),
+    ("minecraft:cobblestone", 4, true),
+    ("minecraft:oak_planks", 5, true),
+    ("minecraft:bedrock", 7, true),
+    ("minecraft:sand", 12, true),
+    ("minecraft:oak_log", 17, true),
+    ("minecraft:glass", 20, true),
+    ("minecraft:torch", 50, true),
+    ("minecraft:stick", 323, false),
+    ("minecraft:apple", 883, false),
+];
+
+/// 36 ranuras del inventario: hotbar con bloques iniciales y el resto vacío.
+fn build_starter_inventory_slots() -> Vec<ItemV4> {
+    let empty = ItemV4 {
+        network_id: 0,
+        count: 0,
+        metadata: 0,
+        has_stack_id: false,
+        stack_id: None,
+        block_runtime_id: 0,
+        extra: ItemV4Extra::Default(None),
+    };
+    let mut slots = vec![empty; 36];
+    slots[0] = starter_item_v4("minecraft:dirt", 3, true, 64);
+    slots[1] = starter_item_v4("minecraft:stone", 1, true, 64);
+    slots[2] = starter_item_v4("minecraft:cobblestone", 4, true, 64);
+    slots[3] = starter_item_v4("minecraft:oak_planks", 5, true, 64);
+    slots[4] = starter_item_v4("minecraft:torch", 50, true, 64);
+    slots
+}
+
+fn starter_item_v4(name: &str, id: i16, is_block: bool, count: u16) -> ItemV4 {
+    ItemV4 {
+        network_id: id,
+        count,
+        metadata: 0,
+        has_stack_id: false,
+        stack_id: None,
+        block_runtime_id: if is_block {
+            block_state_hash_nbtx(name)
+        } else {
+            0
+        },
+        extra: ItemV4Extra::Default(None),
+    }
+}
+
+#[cfg(feature = "protocol-core")]
+fn starter_item_descriptor(
+    name: &str,
+    id: i32,
+    is_block: bool,
+    count: u16,
+) -> bedrock::protocol::v2168::types::NetworkItemInstanceDescriptor {
+    bedrock::protocol::v2168::types::NetworkItemInstanceDescriptor {
+        id,
+        stack_size: count,
+        aux_value: 0,
+        block_runtime_id: if is_block {
+            block_state_hash_nbtx(name) as i32
+        } else {
+            0
+        },
+        user_data_buffer: Vec::new(),
+    }
+}
+
+/// Construye `CreativeContentPacket` (0x91 / 145) con ítems reales para que el
+/// inventario creativo del cliente no aparezca vacío.
 pub fn build_v2225_creative_content_bytes() -> Bytes {
     #[cfg(feature = "protocol-core")]
     {
-        use bedrock::protocol::v2168::packets::CreativeContentPacket;
+        use bedrock::protocol::v2168::packets::{
+            CreativeContentPacket, CreativeItemCategory, CreativeItemData, CreativeItemGroup,
+        };
         use bedrock::protocol::V2225;
 
-        let pkt = CreativeContentPacket::<V2225> {
-            groups: Vec::new(),
-            contents: Vec::new(),
-        };
+        let empty = starter_item_descriptor("minecraft:air", 0, false, 0);
+        let groups = vec![CreativeItemGroup::<V2225> {
+            category: CreativeItemCategory::Construction,
+            name: String::new(),
+            icon: empty,
+        }];
+        let contents = STARTER_ITEMS
+            .iter()
+            .map(|(name, id, is_block)| CreativeItemData::<V2225> {
+                creative_net_id: *id as u32,
+                item_instance: starter_item_descriptor(name, *id, *is_block, 1),
+                group_id: 0,
+            })
+            .collect();
+        let pkt = CreativeContentPacket::<V2225> { groups, contents };
         if let Ok(encoded) = encode_bedrock_v2225_packet(&pkt) {
             return encoded;
         }
@@ -2966,24 +3056,15 @@ pub fn send_spawn_finish_sequence(
         let health_batch = session.encode(&[health_bytes]);
         conn.send(health_batch, now);
 
-        // Fase 6: inventario vacío estándar para que el cliente abra el menú y pueda interactuar.
-        let empty_item = ItemV4 {
-            network_id: 0,
-            count: 0,
-            metadata: 0,
-            has_stack_id: false,
-            stack_id: None,
-            block_runtime_id: 0,
-            extra: ItemV4Extra::Default(None),
-        };
+        // P1: inventario inicial con un hotbar jugable (bloques y antorchas).
         let inventory = InventoryContent {
             window_id: WindowIDVarint::Inventory,
-            input: vec![empty_item.clone(); 36],
+            input: build_starter_inventory_slots(),
             container: FullContainerName {
                 container_id: ContainerSlotType::Inventory,
                 dynamic_container_id: None,
             },
-            storage_item: empty_item,
+            storage_item: starter_item_v4("minecraft:air", 0, false, 0),
         };
         let mut inv_buf = BytesMut::new();
         encode_packet(&inventory, &mut inv_buf);
@@ -3760,6 +3841,45 @@ pub fn handle_bedrock_session_data(
                             progress.movement_tick,
                         );
                         publish_to(BroadcastTarget::AllExcept(peer_addr), move_bytes);
+
+                        // P1: el cliente con movimiento server-authoritative espera una
+                        // corrección de predicción. Le devolvemos su propia posición (sin
+                        // desplazamiento) para que aplique la física vertical local.
+                        if progress.player_auth_input_count.is_multiple_of(10) {
+                            let extras = parse_player_auth_input_extras(&pkt.body).ok();
+                            let tick = extras
+                                .as_ref()
+                                .map(|e| e.client_tick)
+                                .unwrap_or(progress.movement_tick);
+                            let on_ground = extras
+                                .as_ref()
+                                .map(|e| e.has_flag(INPUT_FLAG_VERTICAL_COLLISION))
+                                .unwrap_or(true);
+                            let correction = CorrectPlayerMovePrediction {
+                                prediction_type: CorrectPlayerMovePredictionPredictionType::Player,
+                                position: Vec3f {
+                                    x: input.x,
+                                    y: input.y,
+                                    z: input.z,
+                                },
+                                delta: Vec3f {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    z: 0.0,
+                                },
+                                rotation: Vec2f {
+                                    x: input.pitch,
+                                    z: input.yaw,
+                                },
+                                angular_velocity: None,
+                                on_ground,
+                                tick,
+                            };
+                            let mut corr_buf = BytesMut::new();
+                            encode_packet(&correction, &mut corr_buf);
+                            publish_to(BroadcastTarget::Only(peer_addr), corr_buf.freeze());
+                        }
+
                         if progress.player_auth_input_count == 1
                             || progress.player_auth_input_count.is_multiple_of(40)
                         {
@@ -4031,17 +4151,36 @@ pub fn handle_bedrock_session_data(
                                     &tx.transaction.transaction_data
                                 {
                                     let pos = &use_item.block_position;
-                                    let new_id = match use_item.action_type {
-                                        TransactionUseItemActionType::BreakBlock => 0,
-                                        _ => use_item.block_runtime_id,
-                                    };
-                                    if let Ok(mut map) = overrides().lock() {
-                                        map.insert((pos.x, pos.y, pos.z), new_id);
+                                    // El cliente 1.26.65 usa UseItem (ClickBlock/BreakBlock)
+                                    // aunque StartGame anuncie rotura server-authoritative.
+                                    // Aplicamos la rotura en ambos para que responda al toque.
+                                    if matches!(
+                                        use_item.action_type,
+                                        TransactionUseItemActionType::BreakBlock
+                                            | TransactionUseItemActionType::ClickBlock
+                                    ) {
+                                        apply_block_break(pos.x, pos.y, pos.z);
+                                        progress.blocks_broken =
+                                            progress.blocks_broken.saturating_add(1);
+                                        log::info!(
+                                            "[Bedrock Break] {} rompió ({},{},{}) vía InventoryTransaction (accion={:?}, total={})",
+                                            peer_addr,
+                                            pos.x,
+                                            pos.y,
+                                            pos.z,
+                                            use_item.action_type,
+                                            progress.blocks_broken
+                                        );
+                                    } else {
+                                        log::info!(
+                                            "[Bedrock Action] UseItem {:?} en ({},{},{}) -> runtime_id={}",
+                                            use_item.action_type,
+                                            pos.x,
+                                            pos.y,
+                                            pos.z,
+                                            use_item.block_runtime_id
+                                        );
                                     }
-                                    log::info!(
-                                    "[Bedrock World] Override en ({},{},{}) -> block_runtime_id={} (accion={:?})",
-                                    pos.x, pos.y, pos.z, new_id, use_item.action_type
-                                );
                                 }
                             }
                             Err(e) => log::warn!(
@@ -5421,6 +5560,56 @@ pub fn send_ping_command(bedrock_port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creative_content_is_populated_with_starter_items() {
+        let bytes = build_v2225_creative_content_bytes();
+        assert_eq!(bytes[0], 0x91, "debe ser CreativeContent (0x91)");
+        assert!(
+            bytes.len() > 64,
+            "el creative no puede estar vacío ({} bytes)",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn starter_inventory_has_playable_hotbar() {
+        let slots = build_starter_inventory_slots();
+        assert_eq!(slots.len(), 36);
+        assert_eq!(slots[0].network_id, 3, "slot 0 debe ser dirt");
+        assert_eq!(slots[0].count, 64);
+        assert!(
+            slots[0].block_runtime_id > 0,
+            "dirt debe tener hash de bloque"
+        );
+        assert_eq!(slots[4].network_id, 50, "slot 4 debe ser antorcha");
+        assert_eq!(slots[5].count, 0, "el resto de slots quedan vacíos");
+    }
+
+    #[test]
+    fn correct_player_move_prediction_encodes_for_sender() {
+        let correction = CorrectPlayerMovePrediction {
+            prediction_type: CorrectPlayerMovePredictionPredictionType::Player,
+            position: Vec3f {
+                x: 1.0,
+                y: 65.62,
+                z: 2.0,
+            },
+            delta: Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            rotation: Vec2f { x: 0.0, z: 0.0 },
+            angular_velocity: None,
+            on_ground: true,
+            tick: 42,
+        };
+        let mut buf = BytesMut::new();
+        encode_packet(&correction, &mut buf);
+        assert_eq!(buf[0], 0xa1, "debe ser CorrectPlayerMovePrediction (0xa1)");
+        assert!(buf.len() > 8);
+    }
 
     #[test]
     fn motd_advertisement_matches_minecraft_bedrock_format() {

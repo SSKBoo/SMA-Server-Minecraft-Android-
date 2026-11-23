@@ -2,6 +2,14 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.10.0-p1 — P1: inventario jugable, rotura por transacción y corrección de movimiento
+
+- **Inventario**: `CreativeContent` ya no se envía vacío: 12 ítems del registry vanilla 1.26.65 (stone=1, dirt=3, cobblestone=4, planks=5, bedrock=7, sand=12, log=17, glass=20, torch=50, stick=323, apple=883...), con hashes de bloque derivados por `block_state_hash_nbtx`.
+- **Hotbar**: `InventoryContent` envía 5 stacks reales (dirt, stone, cobblestone, planks, torch) en los slots 0–4 en vez de 36 slots vacíos.
+- **Rotura de bloques**: `InventoryTransaction (0x1e)` con `UseItem/ClickBlock` o `BreakBlock` aplica `apply_block_break` (override + `UpdateBlock` difundido). El cliente 1.26.65 usaba esta ruta aunque `StartGame` anuncie rotura server-authoritative.
+- **Movimiento**: cada 10 `PlayerAuthInput` se envía `CorrectPlayerMovePrediction (0xa1)` al emisor con su propia posición, delta cero y `on_ground` desde el flag `VerticalCollision (50)`; experimento controlado para la gravedad/salto.
+- **Tests**: 3 nuevos (`creative_content_is_populated_with_starter_items`, `starter_inventory_has_playable_hotbar`, `correct_player_move_prediction_encodes_for_sender`); 22 tests, 0 fallos, clippy limpio.
+
 ## v0.9.0-gap-p0 — P0: Movimiento autoritativo, inventario y rotura server-auth
 
 - **Movimiento sin eco (solución a la gravedad/salto)**: `BroadcastTarget::AllExcept(peer_addr)` en `MovePlayer (0x13)` evita sobreescribir la física local del jugador con su propio eco. Asignación de `remote_entity_id` incremental único por jugador para vista entre clientes.
