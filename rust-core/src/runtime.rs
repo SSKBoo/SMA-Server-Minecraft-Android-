@@ -2612,6 +2612,33 @@ pub fn build_v2225_creative_content_bytes() -> Bytes {
     Bytes::from(raw)
 }
 
+/// Altura del suelo en el espacio de coordenadas que reporta el cliente, teniendo
+/// en cuenta los bloques modificados (override) en la columna `(x, z)`.
+pub fn solid_floor_y(base_y: f32, x: f32, z: f32) -> f32 {
+    let bx = x.floor() as i32;
+    let bz = z.floor() as i32;
+    let air = air_block_runtime_id();
+    let mut floor_top = 64.0f32;
+    if let Ok(map) = overrides().lock() {
+        if map
+            .get(&(bx, 63, bz))
+            .map(|id| *id == 0 || *id == air)
+            .unwrap_or(false)
+        {
+            floor_top = 63.0;
+        }
+        for ((ox, oy, oz), id) in map.iter() {
+            if *ox == bx && *oz == bz && *oy >= 63 && *id != 0 && *id != air {
+                let top = (*oy + 1) as f32;
+                if top > floor_top {
+                    floor_top = top;
+                }
+            }
+        }
+    }
+    base_y + (floor_top - 64.0)
+}
+
 /// Un paso de la simulación vertical del servidor (salto + gravedad simplificados).
 pub fn step_vertical_simulation(
     base_y: f32,
@@ -3908,11 +3935,13 @@ pub fn handle_bedrock_session_data(
                         progress.player_auth_input_count.saturating_add(1);
                     progress.movement_tick = progress.movement_tick.saturating_add(1);
                     if let Some(input) = parse_player_auth_input_packet(&pkt.body) {
+                        let prev_x = progress.last_position.0;
+                        let prev_z = progress.last_position.2;
                         progress.last_position = (input.x, input.y, input.z);
                         if progress.remote_entity_id == 0 {
                             progress.remote_entity_id = allocate_remote_entity_id();
                         }
-                        // Simulación vertical real del servidor: el cliente está en
+                        // Simulación vertical con colisión contra los overrides del mundo.
                         // modo server-authoritative y necesita que le corrijamos la
                         // predicción con el tick del input para aplicar gravedad/salto.
                         let extras = parse_player_auth_input_extras(&pkt.body).ok();
@@ -3929,8 +3958,24 @@ pub fn handle_bedrock_session_data(
                             progress.sim_y = input.y;
                             progress.sim_grounded = true;
                         }
+                        let target_floor = solid_floor_y(progress.sim_base_y, input.x, input.z);
+                        let (corr_x, corr_z, floor_y) = if target_floor > progress.sim_y + 0.6 {
+                            // Bloque demasiado alto: se corrige a la posición anterior.
+                            (
+                                prev_x,
+                                prev_z,
+                                solid_floor_y(progress.sim_base_y, prev_x, prev_z),
+                            )
+                        } else {
+                            (input.x, input.z, target_floor)
+                        };
+                        if progress.sim_y < floor_y {
+                            progress.sim_y = floor_y;
+                            progress.sim_vy = 0.0;
+                            progress.sim_grounded = true;
+                        }
                         let (sim_y, sim_vy, sim_grounded) = step_vertical_simulation(
-                            progress.sim_base_y,
+                            floor_y,
                             progress.sim_y,
                             progress.sim_vy,
                             progress.sim_grounded,
@@ -3943,13 +3988,16 @@ pub fn handle_bedrock_session_data(
                             .as_ref()
                             .map(|e| e.client_tick)
                             .unwrap_or(progress.movement_tick);
-                        if (progress.sim_y - input.y).abs() > 0.03 {
+                        if (progress.sim_y - input.y).abs() > 0.03
+                            || (corr_x - input.x).abs() > 0.01
+                            || (corr_z - input.z).abs() > 0.01
+                        {
                             let correction = CorrectPlayerMovePrediction {
                                 prediction_type: CorrectPlayerMovePredictionPredictionType::Player,
                                 position: Vec3f {
-                                    x: input.x,
+                                    x: corr_x,
                                     y: progress.sim_y,
-                                    z: input.z,
+                                    z: corr_z,
                                 },
                                 delta: Vec3f {
                                     x: 0.0,
@@ -5749,6 +5797,12 @@ mod tests {
         assert_eq!(face_offset(3), (0, 0, 1));
         assert_eq!(face_offset(4), (-1, 0, 0));
         assert_eq!(face_offset(5), (1, 0, 0));
+    }
+
+    #[test]
+    fn solid_floor_uses_base_when_no_overrides() {
+        let floor = solid_floor_y(65.62, 1000.0, 1000.0);
+        assert!((floor - 65.62).abs() < 0.001);
     }
 
     #[test]

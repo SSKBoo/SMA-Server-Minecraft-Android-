@@ -2,6 +2,13 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.17.0-p1h — Colisión con bloques en la simulación
+
+- **Suelo dinámico**: `solid_floor_y` consulta el mapa de overrides y calcula la altura de la columna `(x,z)`, incluyendo suelo roto (baja 1 bloque) y bloques colocados (suben 1 por bloque).
+- **Escalones**: si el suelo destino sube, el jugador se ajusta automáticamente; si baja, la gravedad lo lleva al nuevo nivel.
+- **Bloqueo horizontal**: si el bloque destino está a más de 0.6 bloques por encima del jugador, la corrección mantiene la posición anterior en vez de atravesarlo.
+- **Tests**: `solid_floor_uses_base_when_no_overrides`; simulación vertical y colisión; 25 tests, clippy limpio.
+
 ## v0.16.0-p1g — Simulación vertical del servidor con correcciones
 
 - **Movimiento**: se implementa la simulación vertical real (salto `v=0.42`, gravedad `0.08` por tick, suelo en la Y inicial) y se envía `CorrectPlayerMovePrediction (0xa1)` al jugador cuando su Y simulada difiere de la predicha (>0.03), con el `client_tick` del `PlayerAuthInput`. Esto sigue la guía oficial de rewind del cliente.
