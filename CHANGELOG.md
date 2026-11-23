@@ -2,6 +2,14 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.12.0-p1c — Colocación por ítem, comandos visibles e instrumentación de salto
+
+- **Colocación**: `ClickBlock` usa el `held_item.network_id` del hotbar (resuelto contra `STARTER_ITEMS`) en vez del `block_runtime_id` del bloque apuntado. El log ahora muestra `held=` e `id=` por separado.
+- **Comandos**: se envía `AvailableCommands (0x4c)` con `help, save, setblock, tp, time, gamemode, list` tras `SetCommandsEnabled`, para que el autocompletado del cliente no esté vacío.
+- **Diagnóstico de salto**: log `[Bedrock Jump]` con flags del `PlayerAuthInput` cuando aparecen `StartJumping (31)`, `Jumping (6)` o `JumpCurrentRaw (61)`, más `on_ground` (flag 50). Instrumentación temporal para el próximo playtest.
+- **Evidencia previa**: tras quitar las correcciones de movimiento, el cliente empezó a enviar `block_actions` reales (`PredictDestroyBlock=26`); la rotura server-authoritative ya funciona.
+- **Tests**: `available_commands_lists_server_commands`; 23 tests, 0 fallos, clippy limpio.
+
 ## v0.11.0-p1b — Ajustes según guías oficiales de Mojang 1.26.x
 
 - **Movimiento**: se elimina `CorrectPlayerMovePrediction`. La guía oficial permite aceptar ciegamente las posiciones predichas de `PlayerAuthInput`; nuestras correcciones Reiniciaban la simulación del cliente (salto bloqueado, `ClientMovementPredictionSync 0x142`). El cliente vuelve a predecir libremente.

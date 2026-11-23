@@ -11,12 +11,13 @@ use acacia_session::proto::types::{
 use acacia_session::proto::{
     encode_packet, packet_name,
     packets::{
-        ClientCacheStatus, ClientToServerHandshake, CommandRequest, InventoryContent,
-        InventoryTransaction, Login, NetworkSettings, NetworkSettingsCompressionAlgorithm,
-        PlayStatus, PlayStatusStatus, PlayerAction, RequestChunkRadius, RequestNetworkSettings,
-        ResourcePackClientResponse, ResourcePackClientResponseResponseStatus,
-        ServerToClientHandshake, SetLocalPlayerAsInitialized, SetPlayerGameType, SetTime, Text,
-        TextContent, UpdateBlock,
+        AvailableCommands, AvailableCommandsCommandDataItem,
+        AvailableCommandsCommandDataItemOverloadsItem, ClientCacheStatus, ClientToServerHandshake,
+        CommandRequest, InventoryContent, InventoryTransaction, Login, NetworkSettings,
+        NetworkSettingsCompressionAlgorithm, PlayStatus, PlayStatusStatus, PlayerAction,
+        RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse,
+        ResourcePackClientResponseResponseStatus, ServerToClientHandshake,
+        SetLocalPlayerAsInitialized, SetPlayerGameType, SetTime, Text, TextContent, UpdateBlock,
     },
     Packet, RawPacket,
 };
@@ -2867,6 +2868,40 @@ pub fn build_v2225_set_commands_enabled_bytes(enabled: bool) -> Bytes {
     Bytes::from(raw)
 }
 
+/// Comandos que el cliente debe mostrar en el autocompletado (`AvailableCommands`, ID 76).
+pub fn build_v2225_available_commands_bytes() -> Bytes {
+    let names = ["help", "save", "setblock", "tp", "time", "gamemode", "list"];
+    let command_data = names
+        .iter()
+        .map(|name| AvailableCommandsCommandDataItem {
+            name: (*name).to_string(),
+            description: format!("/{}", name),
+            flags: 0,
+            permission_level: "Member".to_string(),
+            alias: -1,
+            chained_subcommand_offsets: Vec::new(),
+            overloads: vec![AvailableCommandsCommandDataItemOverloadsItem {
+                chaining: false,
+                parameters: Vec::new(),
+            }],
+        })
+        .collect();
+    let pkt = AvailableCommands {
+        values_len: 0,
+        enum_values: Vec::new(),
+        chained_subcommand_values: Vec::new(),
+        suffixes: Vec::new(),
+        enums: Vec::new(),
+        chained_subcommands: Vec::new(),
+        command_data,
+        dynamic_enums: Vec::new(),
+        enum_constraints: Vec::new(),
+    };
+    let mut buf = BytesMut::new();
+    encode_packet(&pkt, &mut buf);
+    buf.freeze()
+}
+
 /// Construye `UpdateAdventureSettingsPacket` (ID 188 / 0xbc) en formato `bedrock-rs` `V2225`.
 pub fn build_v2225_update_adventure_settings_bytes() -> Bytes {
     #[cfg(feature = "protocol-core")]
@@ -3448,6 +3483,7 @@ pub fn send_world_start_and_spawn(
                 let spawn_pos_bytes = build_v2225_set_spawn_position_packet_bytes(0, 64, 0, 0);
                 let difficulty_bytes = build_v2225_set_difficulty_packet_bytes(2);
                 let commands_bytes = build_v2225_set_commands_enabled_bytes(true);
+                let available_commands_bytes = build_v2225_available_commands_bytes();
                 let adventure_bytes = build_v2225_update_adventure_settings_bytes();
                 let abilities_bytes = build_v2225_update_abilities_bytes(1);
                 let gamerules_bytes = build_v2225_game_rules_changed_packet_bytes();
@@ -3462,6 +3498,7 @@ pub fn send_world_start_and_spawn(
                     spawn_pos_bytes,
                     difficulty_bytes,
                     commands_bytes,
+                    available_commands_bytes,
                     adventure_bytes,
                     abilities_bytes,
                     gamerules_bytes,
@@ -3475,7 +3512,7 @@ pub fn send_world_start_and_spawn(
                 }
                 progress.has_sent_world_registries = true;
                 log::info!(
-                    "[Bedrock Session] Entorno y registros 1.26.60 enviados a {}: JigsawStructureData (0x139), ItemRegistry (0xa2), SetSpawnPosition (0x2b), SetDifficulty (0x3c), SetCommandsEnabled (0x3b), UpdateAdventureSettings (0xbc), UpdateAbilities (0xbb), GameRulesChanged (0x48), BiomeDefinitionList (0x7a), AvailableEntityIdentifiers (0x77), UpdateAttributes (0x1d), CreativeContent (0x91)",
+                    "[Bedrock Session] Entorno y registros 1.26.60 enviados a {}: JigsawStructureData (0x139), ItemRegistry (0xa2), SetSpawnPosition (0x2b), SetDifficulty (0x3c), SetCommandsEnabled (0x3b), AvailableCommands (0x4c), UpdateAdventureSettings (0xbc), UpdateAbilities (0xbb), GameRulesChanged (0x48), BiomeDefinitionList (0x7a), AvailableEntityIdentifiers (0x77), UpdateAttributes (0x1d), CreativeContent (0x91)",
                     peer_addr
                 );
             }
@@ -3882,6 +3919,22 @@ pub fn handle_bedrock_session_data(
                         );
                         }
                         handle_auth_input_block_actions(&pkt.body, progress, peer_addr);
+
+                        // Instrumentación temporal: ¿el cliente envía input de salto?
+                        if let Ok(extras) = parse_player_auth_input_extras(&pkt.body) {
+                            let jumping = extras.has_flag(INPUT_FLAG_START_JUMPING)
+                                || extras.has_flag(6)  // Jumping
+                                || extras.has_flag(61); // JumpCurrentRaw
+                            if jumping {
+                                log::warn!(
+                                    "[Bedrock Jump] {} tick={} flags={:?} on_ground={}",
+                                    peer_addr,
+                                    extras.client_tick,
+                                    extras.flags,
+                                    extras.has_flag(INPUT_FLAG_VERTICAL_COLLISION)
+                                );
+                            }
+                        }
                     } else {
                         log::warn!(
                             "[Bedrock Move] PlayerAuthInput (0x90) inválido ({} bytes) desde {}",
@@ -4157,26 +4210,33 @@ pub fn handle_bedrock_session_data(
                                             );
                                         }
                                         TransactionUseItemActionType::ClickBlock
-                                            if use_item.held_item.network_id != 0
-                                                && use_item.block_runtime_id != 0 =>
+                                            if use_item.held_item.network_id != 0 =>
                                         {
-                                            let (dx, dy, dz) = face_offset(use_item.face);
-                                            let (px, py, pz) = (pos.x + dx, pos.y + dy, pos.z + dz);
-                                            apply_block_place(
-                                                px,
-                                                py,
-                                                pz,
-                                                use_item.block_runtime_id,
-                                            );
-                                            log::info!(
-                                                "[Bedrock Place] {} colocó ({},{},{}) id={} cara={}",
-                                                peer_addr,
-                                                px,
-                                                py,
-                                                pz,
-                                                use_item.block_runtime_id,
-                                                use_item.face
-                                            );
+                                            // `block_runtime_id` es el bloque apuntado, no el
+                                            // seleccionado. Resolvemos el ítem por su id de red
+                                            // (el que enviamos en InventoryContent).
+                                            let held = use_item.held_item.network_id as i32;
+                                            let place_id = STARTER_ITEMS
+                                                .iter()
+                                                .find(|(_, id, is_block)| *id == held && *is_block)
+                                                .map(|(name, _, _)| block_state_hash_nbtx(name))
+                                                .unwrap_or(use_item.held_item.block_runtime_id);
+                                            if place_id != 0 {
+                                                let (dx, dy, dz) = face_offset(use_item.face);
+                                                let (px, py, pz) =
+                                                    (pos.x + dx, pos.y + dy, pos.z + dz);
+                                                apply_block_place(px, py, pz, place_id);
+                                                log::info!(
+                                                    "[Bedrock Place] {} colocó ({},{},{}) held={} id={} cara={}",
+                                                    peer_addr,
+                                                    px,
+                                                    py,
+                                                    pz,
+                                                    held,
+                                                    place_id,
+                                                    use_item.face
+                                                );
+                                            }
                                         }
                                         _ => {
                                             log::info!(
@@ -5594,6 +5654,16 @@ mod tests {
         );
         assert_eq!(slots[4].network_id, 50, "slot 4 debe ser antorcha");
         assert_eq!(slots[5].count, 0, "el resto de slots quedan vacíos");
+    }
+
+    #[test]
+    fn available_commands_lists_server_commands() {
+        let bytes = build_v2225_available_commands_bytes();
+        assert_eq!(bytes[0], 0x4c, "debe ser AvailableCommands (0x4c)");
+        assert!(
+            bytes.len() > 32,
+            "la lista de comandos no puede estar vacía"
+        );
     }
 
     #[test]
