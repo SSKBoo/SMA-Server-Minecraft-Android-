@@ -43,6 +43,18 @@ El AVD usa NAT: el cliente de PC no puede entrar por UDP directamente. Se necesi
 
 En el PC: Minecraft Bedrock → Servidores → Agregar servidor → `127.0.0.1:19132`.
 
+Para servir en LAN desde el emulador (NAT) hace falta un puente en el host:
+
+```powershell
+# PowerShell como administrador, con el emulador y la app ya corriendo
+powershell -ExecutionPolicy Bypass -File tools\lan-emulator.ps1
+```
+
+El script instala el `udpbridge` en el AVD, configura `adb forward` 19132/19133, abre
+UDP/TCP 19132 en el firewall y arranca `tools/bedrock_lan_relay.py` como tarea programada
+`BedrockDroidLanRelay` (se inicia sola al entrar). Imprime la IP LAN a usar, por ejemplo
+`192.168.3.55:19132`. requiere que el emulador siga encendido y la app con el servidor ACTIVO.
+
 ## Comandos del servidor
 
 | Comando | Efecto |
