@@ -2618,25 +2618,22 @@ pub fn solid_floor_y(base_y: f32, x: f32, z: f32) -> f32 {
     let bx = x.floor() as i32;
     let bz = z.floor() as i32;
     let air = air_block_runtime_id();
-    let mut floor_top = 64.0f32;
-    if let Ok(map) = overrides().lock() {
-        if map
-            .get(&(bx, 63, bz))
-            .map(|id| *id == 0 || *id == air)
-            .unwrap_or(false)
-        {
-            floor_top = 63.0;
-        }
-        for ((ox, oy, oz), id) in map.iter() {
-            if *ox == bx && *oz == bz && *oy >= 63 && *id != 0 && *id != air {
-                let top = (*oy + 1) as f32;
-                if top > floor_top {
-                    floor_top = top;
-                }
-            }
+    const SURFACE_Y: i32 = 63; // capa de dirt; el suelo base termina en y=64.0
+    const MIN_Y: i32 = -64;
+
+    let map = overrides().lock().ok();
+    // Buscamos el bloque sólido más alto de la columna. El terreno natural es
+    // sólido hasta SURFACE_Y; por debajo solo cuenta lo que no se haya roto.
+    for y in (MIN_Y..=320).rev() {
+        let solid = match map.as_ref().and_then(|m| m.get(&(bx, y, bz))) {
+            Some(id) => *id != 0 && *id != air,
+            None => y <= SURFACE_Y,
+        };
+        if solid {
+            return base_y + ((y + 1) as f32 - (SURFACE_Y + 1) as f32);
         }
     }
-    base_y + (floor_top - 64.0)
+    base_y - 4.0
 }
 
 /// Un paso de la simulación vertical del servidor (salto + gravedad simplificados).
@@ -2647,12 +2644,16 @@ pub fn step_vertical_simulation(
     grounded: bool,
     jumping: bool,
 ) -> (f32, f32, bool) {
+    const JUMP_VELOCITY: f32 = 0.42;
+    const GRAVITY: f32 = 0.06;
+    const TERMINAL_VELOCITY: f32 = -1.2;
     let (mut y, mut v, mut g) = (sim_y, vy, grounded);
     if jumping && g {
-        v = 0.42;
+        v = JUMP_VELOCITY;
         g = false;
     }
-    v -= 0.08;
+    v -= GRAVITY;
+    v = v.max(TERMINAL_VELOCITY);
     y += v;
     if y <= base_y {
         y = base_y;
@@ -3970,9 +3971,11 @@ pub fn handle_bedrock_session_data(
                             (input.x, input.z, target_floor)
                         };
                         if progress.sim_y < floor_y {
-                            progress.sim_y = floor_y;
+                            // Escalón suave en vez de salto instantáneo.
+                            let next = (progress.sim_y + 0.25).min(floor_y);
+                            progress.sim_grounded = (floor_y - next).abs() < 0.001;
+                            progress.sim_y = next;
                             progress.sim_vy = 0.0;
-                            progress.sim_grounded = true;
                         }
                         let (sim_y, sim_vy, sim_grounded) = step_vertical_simulation(
                             floor_y,

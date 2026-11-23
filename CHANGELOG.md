@@ -2,6 +2,13 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.18.0-p1i — Cuevas profundas y caída gradual
+
+- **Documentación oficial consultada**: [Build action simulation rate](https://mojang.github.io/bedrock-protocol-docs/guides/build-action-simulation-rate/) confirma **20 ticks/s** de simulación. Las guías de movimiento describen el rewind pero **no publican constantes de gravedad/salto**, así que se calibran empíricamente.
+- **Suelo**: `solid_floor_y` ahora busca el bloque sólido más alto de la columna de `y=-64` a `320`, respetando overrides (bloques rotos bajan el suelo, colocados lo suben). Antes solo miraba `y=63`, por eso no se podía bajar más de 1–2 bloques.
+- **Caída**: gravedad `0.06`/tick, velocidad terminal `-1.2`; el escalón hacia arriba se aplica `0.25`/tick en vez de instantáneo.
+- **Tests**: 25 tests, clippy limpio.
+
 ## v0.17.0-p1h — Colisión con bloques en la simulación
 
 - **Suelo dinámico**: `solid_floor_y` consulta el mapa de overrides y calcula la altura de la columna `(x,z)`, incluyendo suelo roto (baja 1 bloque) y bloques colocados (suben 1 por bloque).
