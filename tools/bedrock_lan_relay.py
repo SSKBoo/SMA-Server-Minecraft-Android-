@@ -57,8 +57,11 @@ def udp_to_tcp(udp):
     while running:
         try:
             data, addr = udp.recvfrom(65535)
-        except OSError:
-            break
+        except OSError as e:
+            # En Windows un ICMP port-unreachable de un cliente ya cerrado
+            # puede hacer fallar recvfrom; no debemos matar el relay por eso.
+            log(f"UDP recv fallo: {e}; continuando")
+            continue
         with clients_lock:
             clients.add(addr)
         log(f"UDP {addr[0]}:{addr[1]} -> TCP ({len(data)} B) head={data[:8].hex()}")
