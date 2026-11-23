@@ -2,6 +2,14 @@
 
 Todas las fases del plan siguen `docs/plan.md`. Cada fase termina con commit + tag.
 
+## v0.9.0-gap-p0 — P0: Movimiento autoritativo, inventario y rotura server-auth
+
+- **Movimiento sin eco (solución a la gravedad/salto)**: `BroadcastTarget::AllExcept(peer_addr)` en `MovePlayer (0x13)` evita sobreescribir la física local del jugador con su propio eco. Asignación de `remote_entity_id` incremental único por jugador para vista entre clientes.
+- **Apertura de inventario (`Interact 0x21`)**: manejo de acción `OpenInventory (6)` respondiendo con `ContainerOpen (0x2e, window=0, type=0xff)` protegido con guardia anti-duplicados y cierre con `ContainerClose (0x2f)`.
+- **Rotura server-authoritative**: parseo wire format 2225 de `PlayerAuthInput (0x90).block_actions` para acciones `PredictDestroyBlock (26)` y `CreativePlayerDestroyBlock (13)`.
+- **Bloques y overrides**: difusión inmediata de `UpdateBlock (0x15)` con hash real de `minecraft:air` (`air_block_runtime_id()`) a todos los clientes y actualización del mapa de overrides.
+- **Tests unitarios**: 3 nuevos tests en `runtime.rs` (`broadcast_target_filtering_works`, `interact_and_container_packets_wire_roundtrip`, `auth_input_extras_parses_block_actions_and_applies_break`) con 21 tests totales (19 ok, 2 ignorados en Windows). Verificado `cargo fmt` y `clippy -D warnings`.
+
 ## v0.8.0-dev-server — Iteración rápida en PC
 
 - `rust-core/src/bin/dev_server.rs`: binario NetherNet para probar el motor desde la PC sin Gradle/cargo-ndk.

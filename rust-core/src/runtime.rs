@@ -45,12 +45,51 @@ use tokio_util::sync::CancellationToken;
 
 /// Canal de broadcast Fase 3: los handlers publican paquetes crudos y el bucle principal
 /// los re-codifica con la sesión de cada peer (compresión/cifrado son por conexión).
-static BROADCAST_TX: OnceLock<tokio::sync::broadcast::Sender<Bytes>> = OnceLock::new();
+static BROADCAST_TX: OnceLock<tokio::sync::broadcast::Sender<BroadcastMsg>> = OnceLock::new();
+
+/// Destinatarios de un paquete publicado en el canal de broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastTarget {
+    /// Todos los peers conectados (chat, `/time`, `UpdateBlock`).
+    All,
+    /// Todos menos el emisor (movimiento: el cliente es autoritativo de su propia posición).
+    AllExcept(SocketAddr),
+    /// Solo un peer (respuestas a comandos que afectan al propio jugador: `/tp`, `/gamemode`).
+    Only(SocketAddr),
+}
+
+impl BroadcastTarget {
+    pub fn includes(&self, addr: SocketAddr) -> bool {
+        match self {
+            BroadcastTarget::All => true,
+            BroadcastTarget::AllExcept(ex) => *ex != addr,
+            BroadcastTarget::Only(only) => *only == addr,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BroadcastMsg {
+    pub target: BroadcastTarget,
+    pub raw: Bytes,
+}
+
+fn publish_to(target: BroadcastTarget, raw: Bytes) {
+    if let Some(tx) = BROADCAST_TX.get() {
+        let _ = tx.send(BroadcastMsg { target, raw });
+    }
+}
 
 fn publish_broadcast(raw: Bytes) {
-    if let Some(tx) = BROADCAST_TX.get() {
-        let _ = tx.send(raw);
-    }
+    publish_to(BroadcastTarget::All, raw);
+}
+
+/// Runtime IDs con los que los DEMÁS clientes ven a cada jugador. El propio jugador siempre es `1`
+/// (valor de `StartGame`), así que nunca se reenvía un `MovePlayer` con id 1 a otro peer.
+static NEXT_REMOTE_ENTITY_ID: AtomicU64 = AtomicU64::new(2);
+
+fn allocate_remote_entity_id() -> u64 {
+    NEXT_REMOTE_ENTITY_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Fase 4: bloques modificados (x, y, z) -> runtime_id. 0 = aire.
@@ -173,6 +212,12 @@ fn handle_world_command(message: &str, peer_addr: SocketAddr) -> bool {
                 if let Ok(mut map) = overrides().lock() {
                     map.insert((x, y, z), id);
                 }
+                publish_broadcast(build_v2225_update_block_bytes(
+                    x,
+                    y,
+                    z,
+                    normalize_override_runtime_id(id),
+                ));
                 let n = save_world_overrides(world_base);
                 log::info!(
                     "[Bedrock World] /setblock ({},{},{}) -> {} ejecutado por {} ({} overrides guardados)",
@@ -207,8 +252,8 @@ fn handle_world_command(message: &str, peer_addr: SocketAddr) -> bool {
                 parts[2].parse::<f32>(),
             ) {
                 let move_bytes =
-                    build_v2225_move_player_packet_bytes(1, x, y, z, 0.0, 0.0, 0.0, 0, true, 0);
-                publish_broadcast(move_bytes);
+                    build_v2225_move_player_packet_bytes(1, x, y, z, 0.0, 0.0, 0.0, 2, true, 0);
+                publish_to(BroadcastTarget::Only(peer_addr), move_bytes);
                 log::info!(
                     "[Bedrock Cmd] /tp ({},{},{}) ejecutado por {}",
                     x,
@@ -239,7 +284,7 @@ fn handle_world_command(message: &str, peer_addr: SocketAddr) -> bool {
         };
         let mut buf = BytesMut::new();
         encode_packet(&SetPlayerGameType { gamemode: mode }, &mut buf);
-        publish_broadcast(buf.freeze());
+        publish_to(BroadcastTarget::Only(peer_addr), buf.freeze());
         log::info!(
             "[Bedrock Cmd] /gamemode {:?} ejecutado por {}",
             mode,
@@ -310,6 +355,14 @@ pub struct SessionProgress {
     pub chunks_sent_count: usize,
     pub outbound_packets_sent: u64,
     pub outbound_bytes_sent: u64,
+    /// Guardia anti-duplicado de `ContainerOpen` (enviar dos veces cierra el cliente, ver dragonfly).
+    pub inventory_open: bool,
+    /// Runtime id con el que los demás clientes ven a este jugador (0 = sin asignar).
+    pub remote_entity_id: u64,
+    /// Bloques rotos vía `PlayerAuthInput.block_actions` (rotura server-authoritative).
+    pub blocks_broken: u64,
+    /// Última posición conocida del jugador (ojos), para `ContainerOpen`.
+    pub last_position: (f32, f32, f32),
 }
 
 struct PeerSession {
@@ -1839,6 +1892,309 @@ pub fn parse_player_auth_input_packet(body: &[u8]) -> Option<ParsedPlayerAuthInp
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Prototipo P0 (docs/gap-analysis-bds-1.26.66.md): inventario, rotura server-auth y movimiento.
+// Wire format 2225 reimplementado a partir de gophertunnel (MIT) y Mojang/bedrock-protocol-docs.
+// ---------------------------------------------------------------------------------------------
+
+/// Flags de `PlayerAuthInput` relevantes (índices de `InputFlag*` en gophertunnel, protocolo 2225).
+pub const INPUT_FLAG_START_JUMPING: i32 = 31;
+pub const INPUT_FLAG_PERFORM_ITEM_INTERACTION: i32 = 34;
+pub const INPUT_FLAG_PERFORM_BLOCK_ACTIONS: i32 = 35;
+pub const INPUT_FLAG_PERFORM_ITEM_STACK_REQUEST: i32 = 36;
+/// Límite defensivo del número de flags (2225 define 70).
+pub const INPUT_FLAG_MAX: u32 = 128;
+
+/// `PlayerActionType` (gophertunnel `PlayerAction*`).
+pub const PLAYER_ACTION_START_BREAK: i32 = 0;
+pub const PLAYER_ACTION_ABORT_BREAK: i32 = 1;
+pub const PLAYER_ACTION_STOP_BREAK: i32 = 2;
+pub const PLAYER_ACTION_CREATIVE_DESTROY_BLOCK: i32 = 13;
+pub const PLAYER_ACTION_CRACK_BREAK: i32 = 18;
+pub const PLAYER_ACTION_PREDICT_DESTROY_BLOCK: i32 = 26;
+pub const PLAYER_ACTION_CONTINUE_DESTROY_BLOCK: i32 = 27;
+
+/// Acción de `Interact (0x21)` que pide abrir el inventario del jugador.
+pub const INTERACT_ACTION_OPEN_INVENTORY: u8 = 6;
+/// `ContainerType` del inventario del jugador (-1 como u8).
+pub const CONTAINER_TYPE_INVENTORY: u8 = 0xff;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerBlockAction {
+    pub action: i32,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub face: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AuthInputExtras {
+    pub flags: Vec<i32>,
+    pub client_tick: u64,
+    pub block_actions: Vec<PlayerBlockAction>,
+    /// `true` si había `block_actions` pero no se pudieron alcanzar (precedidas por item interaction /
+    /// item stack request, cuyo formato aún no parseamos).
+    pub block_actions_skipped: bool,
+}
+
+impl AuthInputExtras {
+    pub fn has_flag(&self, flag: i32) -> bool {
+        self.flags.contains(&flag)
+    }
+}
+
+/// Lector mínimo de primitivas Bedrock (LE floats, varints con zigzag).
+struct WireReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> WireReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        let b = *self
+            .buf
+            .get(self.pos)
+            .ok_or_else(|| format!("EOF leyendo u8 en {}", self.pos))?;
+        self.pos += 1;
+        Ok(b)
+    }
+    fn bool(&mut self) -> Result<bool, String> {
+        Ok(self.u8()? != 0)
+    }
+    fn skip(&mut self, n: usize) -> Result<(), String> {
+        if self.pos + n > self.buf.len() {
+            return Err(format!("EOF saltando {} bytes en {}", n, self.pos));
+        }
+        self.pos += n;
+        Ok(())
+    }
+    fn varu64(&mut self) -> Result<u64, String> {
+        let mut value = 0u64;
+        for shift in (0..70).step_by(7) {
+            let b = self.u8()?;
+            value |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err("varint demasiado largo".to_string())
+    }
+    fn varu32(&mut self) -> Result<u32, String> {
+        let v = self.varu64()?;
+        u32::try_from(v).map_err(|_| format!("varuint32 fuera de rango: {}", v))
+    }
+    fn vari32(&mut self) -> Result<i32, String> {
+        let v = self.varu32()?;
+        Ok(((v >> 1) as i32) ^ -((v & 1) as i32))
+    }
+}
+
+/// Parsea la parte de `PlayerAuthInput (0x90)` 2225 posterior a la posición: flags, tick y
+/// `block_actions`. Orden (gophertunnel `PlayerAuthInput.Marshal`): pitch, yaw, pos(3), move(2),
+/// head_yaw, InputFlagList, input_mode, play_mode, interaction_model, interact_pitch/yaw, tick,
+/// delta(3), Optional(item_interaction), Optional(item_stack_request), Optional(block_actions), ...
+pub fn parse_player_auth_input_extras(body: &[u8]) -> Result<AuthInputExtras, String> {
+    let mut r = WireReader::new(body);
+    r.skip(4 * 8)?; // pitch, yaw, pos x/y/z, move x/y, head_yaw
+    let count = r.varu32()?;
+    if count > INPUT_FLAG_MAX {
+        return Err(format!("demasiados flags: {}", count));
+    }
+    let mut flags = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        flags.push(r.vari32()?);
+    }
+    let _input_mode = r.varu32()?;
+    let _play_mode = r.varu32()?;
+    let _interaction_model = r.vari32()?;
+    r.skip(4 * 2)?; // interact pitch/yaw
+    let client_tick = r.varu64()?;
+    r.skip(4 * 3)?; // delta
+    let mut extras = AuthInputExtras {
+        flags,
+        client_tick,
+        ..Default::default()
+    };
+
+    let has_item_interaction = r.bool()?;
+    if has_item_interaction {
+        extras.block_actions_skipped = extras.has_flag(INPUT_FLAG_PERFORM_BLOCK_ACTIONS);
+        return Ok(extras);
+    }
+    let has_item_stack_request = r.bool()?;
+    if has_item_stack_request {
+        extras.block_actions_skipped = extras.has_flag(INPUT_FLAG_PERFORM_BLOCK_ACTIONS);
+        return Ok(extras);
+    }
+    if r.bool()? {
+        let n = r.varu32()?;
+        if n > 64 {
+            return Err(format!("demasiadas block actions: {}", n));
+        }
+        for _ in 0..n {
+            let action = r.vari32()?;
+            let x = r.vari32()?;
+            let y = r.vari32()?;
+            let z = r.vari32()?;
+            let face = r.vari32()?;
+            extras.block_actions.push(PlayerBlockAction {
+                action,
+                x,
+                y,
+                z,
+                face,
+            });
+        }
+    }
+    Ok(extras)
+}
+
+/// Acciones que destruyen el bloque en modo `server_authoritative_block_breaking` (dragonfly:
+/// `PredictDestroyBlock`; creativo: `CreativePlayerDestroyBlock`).
+pub fn is_block_destroy_action(action: i32) -> bool {
+    matches!(
+        action,
+        PLAYER_ACTION_PREDICT_DESTROY_BLOCK | PLAYER_ACTION_CREATIVE_DESTROY_BLOCK
+    )
+}
+
+/// Parsea `Interact (0x21)`: action u8, target runtime id varuint64, Optional<Vec3>.
+pub fn parse_interact_packet(body: &[u8]) -> Result<(u8, u64), String> {
+    let mut r = WireReader::new(body);
+    let action = r.u8()?;
+    let target = r.varu64()?;
+    Ok((action, target))
+}
+
+/// Parsea `ContainerClose (0x2f)`: window u8, type u8, server_side bool.
+pub fn parse_container_close_packet(body: &[u8]) -> Result<(u8, u8, bool), String> {
+    let mut r = WireReader::new(body);
+    Ok((r.u8()?, r.u8()?, r.bool()?))
+}
+
+fn encode_varint32(value: i32, out: &mut Vec<u8>) {
+    encode_varuint32(zigzag32(value), out);
+}
+
+/// `ContainerOpen (0x2e)` para el inventario del jugador: window 0, type 0xff, BlockPos, entity -1.
+pub fn build_v2225_container_open_inventory_bytes(x: i32, y: i32, z: i32) -> Bytes {
+    let mut raw = Vec::with_capacity(16);
+    encode_varuint32(0x2e, &mut raw);
+    raw.push(0); // WindowID
+    raw.push(CONTAINER_TYPE_INVENTORY);
+    encode_varint32(x, &mut raw);
+    encode_varint32(y, &mut raw);
+    encode_varint32(z, &mut raw);
+    encode_varuint64(zigzag64(-1), &mut raw); // ContainerEntityUniqueID
+    Bytes::from(raw)
+}
+
+/// `ContainerClose (0x2f)`: confirma el cierre que pidió el cliente.
+pub fn build_v2225_container_close_bytes(
+    window_id: u8,
+    container_type: u8,
+    server_side: bool,
+) -> Bytes {
+    Bytes::from(vec![0x2f, window_id, container_type, u8::from(server_side)])
+}
+
+/// Runtime id de red de `minecraft:air` (con `block-network-ids-are-hashes` no es 0).
+pub fn air_block_runtime_id() -> u32 {
+    static AIR: OnceLock<u32> = OnceLock::new();
+    *AIR.get_or_init(|| block_state_hash_nbtx("minecraft:air"))
+}
+
+/// Normaliza ids guardados: `0` (convención histórica de `/setblock` y overrides.txt) = aire.
+pub fn normalize_override_runtime_id(id: u32) -> u32 {
+    if id == 0 {
+        air_block_runtime_id()
+    } else {
+        id
+    }
+}
+
+/// Registra la rotura de un bloque en los overrides y la difunde a todos los peers.
+pub fn apply_block_break(x: i32, y: i32, z: i32) {
+    if let Ok(mut map) = overrides().lock() {
+        map.insert((x, y, z), 0);
+    }
+    publish_broadcast(build_v2225_update_block_bytes(
+        x,
+        y,
+        z,
+        air_block_runtime_id(),
+    ));
+}
+
+/// Procesa `block_actions` de `PlayerAuthInput` (rotura server-authoritative). Devuelve las
+/// posiciones destruidas.
+pub fn handle_auth_input_block_actions(
+    body: &[u8],
+    progress: &mut SessionProgress,
+    peer_addr: SocketAddr,
+) -> Vec<(i32, i32, i32)> {
+    let mut broken = Vec::new();
+    match parse_player_auth_input_extras(body) {
+        Ok(extras) => {
+            if extras.block_actions_skipped {
+                log::warn!(
+                    "[Bedrock Break] block_actions de {} no alcanzables (item interaction/stack request en el mismo tick, tick={})",
+                    peer_addr,
+                    extras.client_tick
+                );
+            }
+            for a in &extras.block_actions {
+                if is_block_destroy_action(a.action) {
+                    apply_block_break(a.x, a.y, a.z);
+                    progress.blocks_broken = progress.blocks_broken.saturating_add(1);
+                    broken.push((a.x, a.y, a.z));
+                    log::info!(
+                        "[Bedrock Break] {} rompió ({},{},{}) acción={} cara={} -> aire (total={})",
+                        peer_addr,
+                        a.x,
+                        a.y,
+                        a.z,
+                        a.action,
+                        a.face,
+                        progress.blocks_broken
+                    );
+                } else if a.action == PLAYER_ACTION_START_BREAK {
+                    log::debug!(
+                        "[Bedrock Break] {} empezó a romper ({},{},{})",
+                        peer_addr,
+                        a.x,
+                        a.y,
+                        a.z
+                    );
+                }
+            }
+        }
+        Err(e) => log::debug!(
+            "[Bedrock Break] PlayerAuthInput extras no parseables desde {}: {}",
+            peer_addr,
+            e
+        ),
+    }
+    broken
+}
+
+/// `UpdateBlock (0x15)`: BlockPos, runtime id, flags (3 = vecinos + red), layer 0.
+pub fn build_v2225_update_block_bytes(x: i32, y: i32, z: i32, block_runtime_id: u32) -> Bytes {
+    let mut raw = Vec::with_capacity(20);
+    encode_varuint32(0x15, &mut raw);
+    encode_varint32(x, &mut raw);
+    encode_varint32(y, &mut raw);
+    encode_varint32(z, &mut raw);
+    encode_varuint32(block_runtime_id, &mut raw);
+    encode_varuint32(3, &mut raw);
+    encode_varuint32(0, &mut raw);
+    Bytes::from(raw)
+}
+
 /// Construye `MovePlayerPacket` (0x13 / 19) en formato wire `bedrock-rs` `V2225` (incluye `teleport_data: Option`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_v2225_move_player_packet_bytes(
@@ -2648,7 +3004,7 @@ pub fn send_spawn_finish_sequence(
                             y: *y,
                             z: *z,
                         },
-                        block_runtime_id: *block_id,
+                        block_runtime_id: normalize_override_runtime_id(*block_id),
                         flags: UpdateBlockFlags(3),
                         layer: 0,
                     };
@@ -3384,35 +3740,41 @@ pub fn handle_bedrock_session_data(
                         progress.player_auth_input_count.saturating_add(1);
                     progress.movement_tick = progress.movement_tick.saturating_add(1);
                     if let Some(input) = parse_player_auth_input_packet(&pkt.body) {
-                        let safe_y = clamp_player_auth_y(input.y);
+                        progress.last_position = (input.x, input.y, input.z);
+                        if progress.remote_entity_id == 0 {
+                            progress.remote_entity_id = allocate_remote_entity_id();
+                        }
+                        // El cliente es autoritativo de su propio movimiento: NO se le devuelve su
+                        // MovePlayer (eso causaba el "salto sin bajar" por on_ground=true). Solo los
+                        // demás peers lo reciben, con el runtime id remoto de este jugador.
                         let move_bytes = build_v2225_move_player_packet_bytes(
-                            1,
+                            progress.remote_entity_id,
                             input.x,
-                            safe_y,
+                            input.y,
                             input.z,
                             input.pitch,
                             input.yaw,
                             input.head_yaw,
                             0,
-                            true,
+                            false,
                             progress.movement_tick,
                         );
-                        let _ = session.encode(std::slice::from_ref(&move_bytes));
-                        publish_broadcast(move_bytes.clone());
+                        publish_to(BroadcastTarget::AllExcept(peer_addr), move_bytes);
                         if progress.player_auth_input_count == 1
                             || progress.player_auth_input_count.is_multiple_of(40)
                         {
                             log::info!(
-                            "[Bedrock Move] PlayerAuthInput (0x90) #{} de {} (raw_y={:.2}, pos={:.2},{:.2},{:.2}, client_init={}) -> MovePlayerPacket (0x13) enviado",
+                            "[Bedrock Move] PlayerAuthInput (0x90) #{} de {} (pos={:.2},{:.2},{:.2}, client_init={}) -> MovePlayer (0x13, rid={}) a los demás peers",
                             progress.player_auth_input_count,
                             peer_addr,
-                            input.y,
                             input.x,
-                            safe_y,
+                            input.y,
                             input.z,
-                            progress.client_sent_local_player_init
+                            progress.client_sent_local_player_init,
+                            progress.remote_entity_id
                         );
                         }
+                        handle_auth_input_block_actions(&pkt.body, progress, peer_addr);
                     } else {
                         log::warn!(
                             "[Bedrock Move] PlayerAuthInput (0x90) inválido ({} bytes) desde {}",
@@ -3575,6 +3937,70 @@ pub fn handle_bedrock_session_data(
                     }
                 }
 
+                // P0: Interact (0x21) OpenInventory -> ContainerOpen (0x2e) (dragonfly handler_interact.go).
+                0x21 => {
+                    progress.last_packet_name = "Interact".to_string();
+                    match parse_interact_packet(&pkt.body) {
+                        Ok((INTERACT_ACTION_OPEN_INVENTORY, _)) => {
+                            if progress.inventory_open {
+                                log::info!(
+                                    "[Bedrock Inventory] OpenInventory duplicado de {} ignorado (ContainerOpen ya enviado)",
+                                    peer_addr
+                                );
+                            } else {
+                                progress.inventory_open = true;
+                                let (x, y, z) = progress.last_position;
+                                let open = build_v2225_container_open_inventory_bytes(
+                                    x.floor() as i32,
+                                    y.floor() as i32,
+                                    z.floor() as i32,
+                                );
+                                let batch = session.encode(&[open]);
+                                conn.send(batch, now);
+                                log::info!(
+                                    "[Bedrock Inventory] Interact OpenInventory de {} -> ContainerOpen (0x2e, window=0, type=0xff)",
+                                    peer_addr
+                                );
+                            }
+                        }
+                        Ok((action, target)) => log::info!(
+                            "[Bedrock Inventory] Interact acción={} target={} de {} (sin manejar)",
+                            action,
+                            target,
+                            peer_addr
+                        ),
+                        Err(e) => log::warn!(
+                            "[Bedrock Inventory] Interact no decodificable desde {}: {}",
+                            peer_addr,
+                            e
+                        ),
+                    }
+                }
+
+                // P0: ContainerClose (0x2f) del cliente -> confirmación y reset de la guardia.
+                0x2f => {
+                    progress.last_packet_name = "ContainerClose".to_string();
+                    match parse_container_close_packet(&pkt.body) {
+                        Ok((window, ctype, _)) => {
+                            progress.inventory_open = false;
+                            let close = build_v2225_container_close_bytes(window, ctype, false);
+                            let batch = session.encode(&[close]);
+                            conn.send(batch, now);
+                            log::info!(
+                                "[Bedrock Inventory] ContainerClose (window={}, type=0x{:02x}) de {} -> confirmado",
+                                window,
+                                ctype,
+                                peer_addr
+                            );
+                        }
+                        Err(e) => log::warn!(
+                            "[Bedrock Inventory] ContainerClose no decodificable desde {}: {}",
+                            peer_addr,
+                            e
+                        ),
+                    }
+                }
+
                 // Fase 3.3: acciones sobre bloques: parseo/registro, sin modificar el mundo aún.
                 id @ (0x1e | 0x24) => {
                     let label = if id == 0x1e {
@@ -3628,17 +4054,13 @@ pub fn handle_bedrock_session_data(
                             Ok(action) => {
                                 let is_break = matches!(
                                     action.action,
-                                    Action::StartBreak
-                                        | Action::CrackBreak
-                                        | Action::StopBreak
+                                    Action::StopBreak
                                         | Action::CreativePlayerDestroyBlock
                                         | Action::PredictBreak
                                 );
                                 if is_break {
                                     let pos = &action.position;
-                                    if let Ok(mut map) = overrides().lock() {
-                                        map.insert((pos.x, pos.y, pos.z), 0);
-                                    }
+                                    apply_block_break(pos.x, pos.y, pos.z);
                                     log::info!(
                                         "[Bedrock World] Override por PlayerAction ({:?}) en ({},{},{}) -> aire",
                                         action.action, pos.x, pos.y, pos.z
@@ -4569,7 +4991,7 @@ pub fn start_async_engine(
         };
 
         // Bucle principal: acepta señalización HTTP (/v1/join), recibe datagramas UDP WebRTC y despacha Event
-        let (bcast_tx, mut bcast_rx) = tokio::sync::broadcast::channel::<Bytes>(512);
+        let (bcast_tx, mut bcast_rx) = tokio::sync::broadcast::channel::<BroadcastMsg>(512);
         let _ = BROADCAST_TX.set(bcast_tx);
         let mut udp_buf = [0u8; 65535];
         let mut rtc_tick = tokio::time::interval(Duration::from_millis(20));
@@ -4859,12 +5281,15 @@ pub fn start_async_engine(
                     save_world_overrides(&world_base);
                 }
                 bcast_res = bcast_rx.recv() => {
-                    if let Ok(raw) = bcast_res {
+                    if let Ok(msg) = bcast_res {
                         let now = Instant::now();
                         let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
                         if let Ok(mut guard) = peers.lock() {
                             for peer in guard.values_mut() {
-                                let batch = peer.session.encode(std::slice::from_ref(&raw));
+                                if !msg.target.includes(peer.remote_addr) {
+                                    continue;
+                                }
+                                let batch = peer.session.encode(std::slice::from_ref(&msg.raw));
                                 peer.conn.send(batch, now);
                                 while let Some(tx) = peer.conn.poll_transmit() {
                                     peer.progress.outbound_packets_sent =
@@ -5663,5 +6088,120 @@ mod tests {
         assert!(summary.contains("unknown_pkts=12"));
         assert!(summary.contains("unknown_top=[0x2c:7, 0x1e:3, 0x21:2]"));
         assert!(summary.contains("PlayerAuthInput (0x90)"));
+    }
+
+    #[test]
+    fn broadcast_target_filtering_works() {
+        let addr1: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+
+        assert!(BroadcastTarget::All.includes(addr1));
+        assert!(BroadcastTarget::All.includes(addr2));
+
+        assert!(!BroadcastTarget::AllExcept(addr1).includes(addr1));
+        assert!(BroadcastTarget::AllExcept(addr1).includes(addr2));
+
+        assert!(BroadcastTarget::Only(addr1).includes(addr1));
+        assert!(!BroadcastTarget::Only(addr1).includes(addr2));
+    }
+
+    #[test]
+    fn interact_and_container_packets_wire_roundtrip() {
+        // Test parse_interact_packet
+        let mut interact_bytes = Vec::new();
+        interact_bytes.push(INTERACT_ACTION_OPEN_INVENTORY); // action = 6
+        encode_varuint64(12345, &mut interact_bytes); // target_entity_runtime_id
+        let (action, target) = parse_interact_packet(&interact_bytes).expect("parse interact");
+        assert_eq!(action, INTERACT_ACTION_OPEN_INVENTORY);
+        assert_eq!(target, 12345);
+
+        // Test build_v2225_container_open_inventory_bytes
+        let open_bytes = build_v2225_container_open_inventory_bytes(10, 64, -20);
+        assert_eq!(open_bytes[0], 0x2e); // Packet ID
+        assert_eq!(open_bytes[1], 0); // Window ID 0
+        assert_eq!(open_bytes[2], CONTAINER_TYPE_INVENTORY); // Type 0xff
+
+        // Test parse_container_close_packet
+        let close_raw = [0, CONTAINER_TYPE_INVENTORY, 0]; // window=0, type=0xff, server_side=false
+        let (win, ctype, server_side) =
+            parse_container_close_packet(&close_raw).expect("parse close");
+        assert_eq!(win, 0);
+        assert_eq!(ctype, CONTAINER_TYPE_INVENTORY);
+        assert!(!server_side);
+    }
+
+    #[test]
+    fn auth_input_extras_parses_block_actions_and_applies_break() {
+        let mut body = Vec::new();
+        // 8 floats: pitch, yaw, x, y, z, move_x, move_y, head_yaw
+        for _ in 0..8 {
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        // InputFlagList: 1 flag (INPUT_FLAG_PERFORM_BLOCK_ACTIONS = 35)
+        encode_varuint32(1, &mut body);
+        encode_varint32(INPUT_FLAG_PERFORM_BLOCK_ACTIONS, &mut body);
+
+        // input_mode, play_mode, interaction_model
+        encode_varuint32(1, &mut body);
+        encode_varuint32(0, &mut body);
+        encode_varint32(0, &mut body);
+
+        // interact pitch/yaw (2 floats)
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+
+        // client_tick
+        encode_varuint64(105, &mut body);
+
+        // delta (3 floats)
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+        body.extend_from_slice(&0.0f32.to_le_bytes());
+
+        // Optional item_interaction = false
+        body.push(0);
+        // Optional item_stack_request = false
+        body.push(0);
+        // Optional block_actions = true
+        body.push(1);
+
+        // 1 block action: PredictDestroyBlock (26) en (15, 64, -30)
+        encode_varuint32(1, &mut body);
+        encode_varint32(PLAYER_ACTION_PREDICT_DESTROY_BLOCK, &mut body);
+        encode_varint32(15, &mut body);
+        encode_varint32(64, &mut body);
+        encode_varint32(-30, &mut body);
+        encode_varint32(1, &mut body); // face
+
+        let extras = parse_player_auth_input_extras(&body).expect("parse extras");
+        assert_eq!(extras.client_tick, 105);
+        assert!(extras.has_flag(INPUT_FLAG_PERFORM_BLOCK_ACTIONS));
+        assert_eq!(extras.block_actions.len(), 1);
+        assert_eq!(
+            extras.block_actions[0].action,
+            PLAYER_ACTION_PREDICT_DESTROY_BLOCK
+        );
+        assert_eq!(extras.block_actions[0].x, 15);
+        assert_eq!(extras.block_actions[0].y, 64);
+        assert_eq!(extras.block_actions[0].z, -30);
+        assert!(is_block_destroy_action(extras.block_actions[0].action));
+
+        // Test handle_auth_input_block_actions
+        let mut progress = SessionProgress::default();
+        let peer_addr = "127.0.0.1:44444".parse().unwrap();
+        let broken = handle_auth_input_block_actions(&body, &mut progress, peer_addr);
+        assert_eq!(broken, vec![(15, 64, -30)]);
+        assert_eq!(progress.blocks_broken, 1);
+
+        // Verify override is in place
+        if let Ok(map) = overrides().lock() {
+            assert_eq!(map.get(&(15, 64, -30)), Some(&0));
+        }
+
+        // Verify air block runtime id
+        let air_id = air_block_runtime_id();
+        assert_ne!(air_id, 0);
+        assert_eq!(normalize_override_runtime_id(0), air_id);
+        assert_eq!(normalize_override_runtime_id(1234), 1234);
     }
 }

@@ -20,6 +20,7 @@
 
 ## Pendientes conocidos
 
-- Menú de inventario no abre (posible `InventorySlot`/`ContainerOpen` o contenedor distinto en 1.26.65).
-- Gravedad: el jugador salta pero no baja (observado en Fase 1); el servidor hace eco de `MovePlayer` sin simular físicas.
-- Persistencia por rotura real del cliente no validada de extremo a extremo.
+- Menú de inventario: **Resuelto en v0.9.0-gap-p0** con `Interact (0x21)` -> `ContainerOpen (0x2e)` y `ContainerClose (0x2f)`.
+- Gravedad / salto sin bajar: **Resuelto en v0.9.0-gap-p0** eliminando el eco de `MovePlayer` al propio emisor (`BroadcastTarget::AllExcept`).
+- Persistencia por rotura real: **Implementado en v0.9.0-gap-p0** mediante `PlayerAuthInput.block_actions` (actions 26 y 13) y test unitario con fixture sintética verificado.
+- Siguiente iteración (P1): `PlayerList (0x3f)` + `AddPlayer (0x0c)` completo para visualización multi-jugador en el mundo, crafteo/recetas y carga de chunks LevelDB.
